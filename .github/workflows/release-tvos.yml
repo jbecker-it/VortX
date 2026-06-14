@@ -120,7 +120,7 @@ jobs:
           # a drag-to-install .dmg holding the app plus an /Applications symlink. We can't notarize
           # without an Apple Developer ID, so a downloaded build is still quarantined; the release notes
           # give the one-time right-click-Open / xattr fix.
-          MAC_APP="app/build/ci-mac/Build/Products/Release/StremioXMac.app"
+          MAC_APP="app/build/ci-mac/Build/Products/Release/StremioX.app"
           codesign --force --deep --sign - "$MAC_APP"
           codesign -dv "$MAC_APP" 2>&1 | sed -n '1,3p' || true
           DMG_STAGE="$(mktemp -d)"
