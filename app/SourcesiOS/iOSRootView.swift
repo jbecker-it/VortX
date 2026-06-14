@@ -557,7 +557,7 @@ struct iOSDiscoverView: View {
                             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0,
                                      background: $0.background, description: $0.description,
                                      releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating, genres: $0.genres)
-                        }, onTap: handleTap)
+                        }, onTap: handleTap, onReachEnd: { core.loadDiscoverNextPage() })
                     } else if account.isSignedIn {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 100)
                     } else {
@@ -910,6 +910,9 @@ private struct PosterGrid: View {
     /// Which long-press context menu each card shows on this surface (#14). `.none` for surfaces
     /// where no engine action applies.
     var menu: iOSPosterMenu = .none
+    /// Called when the LAST card appears — the infinite-scroll hook for paginated grids (Discover).
+    /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
+    var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     // Center the adaptive tracks so the cards distribute evenly across the available width instead of
     // packing to the leading edge. Min track matches the 120pt card + a little breathing room.
@@ -926,6 +929,10 @@ private struct PosterGrid: View {
                 .accessibilityLabel(item.name)
                 .accessibilityHint("Opens details")
                 .accessibilityValue(item.progress > 0 ? "\(Int(item.progress * 100)) percent watched" : "")
+                // Infinite scroll: when the last card materializes (LazyVGrid only builds visible
+                // cells), ask the caller to load the next page. The engine + CoreBridge guards make
+                // this a no-op at the end or while a page is already in flight.
+                .onAppear { if item.id == items.last?.id { onReachEnd?() } }
             }
         }
         .frame(maxWidth: .infinity)

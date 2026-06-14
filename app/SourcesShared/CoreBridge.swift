@@ -239,6 +239,22 @@ final class CoreBridge: ObservableObject {
                  field: "discover")
     }
 
+    /// True when the current Discover catalog has another page to load (engine skip-pagination).
+    var discoverHasNextPage: Bool { discover?.selectable.nextPage != nil }
+    /// Set while a next-page load is dispatched, cleared when `discover` re-emits, so a burst of
+    /// last-item onAppear events from the grid can't fire duplicate page loads.
+    private var discoverPageInFlight = false
+
+    /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
+    /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
+    /// is already in flight. Previously missing entirely — the catalog stopped at its first page, which
+    /// add-on authors saw as "next page / next catalog not loading."
+    func loadDiscoverNextPage() {
+        guard discoverHasNextPage, !discoverPageInFlight else { return }
+        discoverPageInFlight = true
+        dispatch(action: ["action": "CatalogWithFilters", "args": ["action": "LoadNextPage"]], field: "discover")
+    }
+
     /// Load the Library (all types, most-recent first). Auto-refreshes on library changes.
     func loadLibrary() {
         dispatch(action: ["action": "Load",
@@ -865,7 +881,10 @@ final class CoreBridge: ObservableObject {
         }
         if fields.contains("discover") {
             let value = decode(CoreDiscover.self, field: "discover")
-            DispatchQueue.main.async { [weak self] in self?.discover = value }
+            DispatchQueue.main.async { [weak self] in
+                self?.discover = value
+                self?.discoverPageInFlight = false   // a next-page load (or any discover change) settled
+            }
             // A null first load derives the default catalog before the selectable is refreshed from
             // addons, so it can land with catalogs available but nothing selected (Discover stuck on
             // the spinner). If so, load the first catalog to unstick it.

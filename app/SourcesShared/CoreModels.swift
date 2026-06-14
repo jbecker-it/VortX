@@ -440,6 +440,19 @@ struct CoreDiscoverSelectable: Decodable {
     let types: [CoreSelectableType]
     let catalogs: [CoreSelectableCatalog]
     let extra: [CoreSelectableExtra]
+    /// Present when the current catalog has another page (the engine's skip-based pagination); nil at
+    /// the end. Drives Discover's infinite scroll via `CoreBridge.loadDiscoverNextPage()`.
+    let nextPage: CoreSelectablePage?
+
+    enum CodingKeys: String, CodingKey {
+        case types, catalogs, extra
+        case nextPage = "next_page"
+    }
+}
+
+/// The engine's `SelectablePage` (catalog_with_filters): carries the request for the next page.
+struct CoreSelectablePage: Decodable {
+    let request: CoreRequest
 }
 
 struct CoreSelectableType: Decodable, Identifiable {
