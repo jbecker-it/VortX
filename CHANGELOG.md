@@ -6,15 +6,11 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## 0.3.0 beta 12 (prerelease) - 2026-06-14
 
-### Changed
-- **The streaming server now follows the Performance setting.** Its torrent cache is sized off the same Auto/Full/Reduced switch the rest of the app uses (Settings > Performance), so the lighter server isn't limited to auto-detected low-memory hardware — you can force the lean 256 MB server on any device by choosing Reduced. This also applies to memory-tight iPhones, not just the Apple TV.
-
-## 0.3.0 beta 11 (prerelease) - 2026-06-14
-
-Priority fix for the Apple TV streaming-server death (issue #56).
+The real fix for the streaming server dying, plus Continue Watching metadata.
 
 ### Fixed
-- **The Apple TV streaming server no longer dies after one torrent.** On a 2 GB Apple TV HD, the in-process server ran the full configuration (including a second HTTPS server it never uses) and capped its torrent cache at 512 MB, so loading one torrent pushed the app past the device's memory budget and tvOS killed the server, with no in-process restart. The Apple TV now runs the same lean configuration as the iPhone build (no unused HTTPS/transcode subsystems), and the torrent cache is sized to the device (256 MB on 2 GB hardware, 512 MB on 3 GB+), keeping it under budget. This also relieves the memory pressure behind the playback stutter. *Please re-test on the Apple TV HD; if stutter remains, the player read-ahead is the next lever.*
+- **The streaming server no longer dies seconds after launch (issue #56).** This was a crash, not a memory problem: it happened on an 8 GB iPhone with the torrent cache barely touched. Our embedded server starts a small reverse proxy on port 11471 so the older web UI can load over a loopback origin, and that proxy's listen() raised an unhandled EADDRINUSE error event when a previous instance still held the port (a fast relaunch, or force quit then reopen), which crashed the whole node runtime and took the streaming server down with it. The native iPhone, iPad, and Apple TV apps have no web UI, so they no longer start that proxy at all, and it now handles the error where it does run. The server otherwise runs the same configuration Stremio runs (an earlier attempt to disable its HTTPS and transcode subsystems was the wrong lead and has been reverted).
+- **Continue Watching titles now show their details in the featured hero.** A title carried in from Continue Watching used to appear in the rotating hero with just its name and a Play button, no rating, year, genres, or synopsis. The hero now fetches that metadata up front, so it is ready before the title rotates into view.
 
 ## 0.3.0 beta 10 (prerelease) - 2026-06-14
 

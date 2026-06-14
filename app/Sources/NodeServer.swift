@@ -68,17 +68,12 @@ enum NodeServer {
         // all share the libuv threadpool (default 4). Many dead trackers resolving slowly
         // can saturate it and stall the engine. 16 threads relieves that contention. Cheap
         // and harmless; the heartbeat in the preload tells us if the loop still freezes.
-        // ALL embedded-server platforms (iPhone, iPad, AND Apple TV): drop the secondary :12470 HTTPS
-        // server + local.strem.io cert subsystem (NO_HTTPS_SERVER) and HLSv2. The in-process node server
-        // shares ONE tight per-app memory budget with the Rust core + libmpv + SwiftUI, and these unused
-        // subsystems inflate the footprint. This was iOS-only on the wrong assumption that "tvOS has a
-        // larger budget" — but the Apple TV HD has just 2 GB (LESS than a modern iPhone), and its server
-        // was dying after one torrent allocated the cache (issue #56, beta5). The footprint cut + the
-        // device-aware cache cap (StremioServer.applyServerConfig) together keep it under budget.
-        // Discrete flags, NOT IOS_APP (which would try `_linkedBinding("apple_bridge")`, not linked here
-        // and could throw). The simulator has no jetsam, so this only reproduced on device.
-        setenv("NO_HTTPS_SERVER", "1", 1)
-        setenv("HLS_V2_DISABLED", "1", 1)
+        // NOTE: we deliberately do NOT set NO_HTTPS_SERVER or HLS_V2_DISABLED. They were tried as a fix
+        // for the "server dies" reports, but that was the wrong cause: the death was an unhandled
+        // EADDRINUSE error event on our own 11471 proxy (now fixed in the preload), not the server's
+        // :12470 HTTPS endpoint or its HLS transcoder, which Stremio runs fine. Leave the server in the
+        // configuration Stremio itself runs; CASTING_DISABLED above is the only flag we set, and that one
+        // is a genuine fix for the SSDP/casting error flood in the embedded runtime.
         #if STREMIOX_WEB_HOST
         // Only the WKWebView web-host target needs the 11471 reverse-proxy of web.stremio.com (so the
         // webview can load the UI from a loopback origin). The native iOS/tvOS apps have no webview, so
