@@ -4,6 +4,20 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
+## 0.3.0 beta 13 (prerelease) - 2026-06-14
+
+The build that fixes "no sources", plus the macOS player and the featured hero.
+
+### Fixed
+- **Titles find their sources again, on iPhone, iPad, and Mac.** This was the big one: opening an episode (or a movie) often showed "no sources" even with stream add-ons installed and working, because the app was never actually asking the add-ons. When a series was already loaded, tapping an episode skipped the stream request entirely, and movies leaned on a fragile auto-guess. Both now request the right streams every time, so a title that has sources shows them. Game of Thrones S1E1 went from nothing to over 1,800 sources across every installed add-on.
+- **The macOS player works.** It crashed the instant you pressed Play (a missing internal dependency once the player was lifted to fill the window), and the "play a link" dialog drew on top of it. The player now opens full-window inside the app, plays, and closes cleanly without resizing the window, with the same controls and engine as Apple TV.
+- **The featured hero shows the whole backdrop.** On a wide Mac window the hero art was either zoomed into a sliver or boxed in by bars. It now shows the full still over a soft blurred fill, so nothing important is cut off, and the detail page got a taller, less-cropped band.
+- **Shows display their logo as the title.** Where logo artwork exists, the hero uses the show's logo (Game of Thrones and friends) instead of plain text, and it appears right away.
+- **"No sources" explains itself.** When nothing loads, the screen now says whether each add-on returned nothing, errored, or whether no stream add-on responded at all, and what to check, instead of a generic dead end.
+
+### Notes
+- Still sequenced for upcoming builds: the hero reading ratings and logos for every title from the engine, a translucent top bar so the backdrop flows under it, in-player next/previous episode, an HTTP/HLS quality selector, and the rest of the 100+ item audit (docs/REVIEW-WORKLIST.md).
+
 ## 0.3.0 beta 12 (prerelease) - 2026-06-14
 
 The real fix for the streaming server dying, plus Continue Watching metadata.
