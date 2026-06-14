@@ -97,8 +97,20 @@ struct CoreMeta: Decodable, Identifiable {
     let background: String?
     let description: String?
     let releaseInfo: String?
-    let imdbRating: String?
-    let genres: [String]?
+    /// Rating + genres live in `links` in the engine's catalog-preview serialization (category "imdb"
+    /// carries the rating in its name; category "Genres" carries each genre), NOT as top-level fields.
+    /// The engine never emits a top-level `imdbRating`/`genres` for a preview, so the old stored
+    /// properties decoded nil every time and the featured hero never showed a rating. Read them from
+    /// `links` instead — the same place CoreMetaItem (the full detail meta) reads them.
+    let links: [CoreLink]?
+
+    var imdbRating: String? {
+        (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
+    }
+    var genres: [String]? {
+        let g = (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
+        return g.isEmpty ? nil : g
+    }
 }
 
 struct CoreLocalSearchState: Decodable {
@@ -240,7 +252,9 @@ struct CoreMetaItem: Decodable {
     let behaviorHints: CoreMetaBehaviorHints?
 
     var genres: [String] {
-        (links ?? []).filter { $0.category.caseInsensitiveCompare("Genre") == .orderedSame }.map(\.name)
+        // The engine emits the genres link category as "Genres" (PLURAL); the old "Genre" (singular)
+        // filter matched nothing, so detail + episode headers always showed empty genres. Accept both.
+        (links ?? []).filter { ["genre", "genres"].contains($0.category.lowercased()) }.map(\.name)
     }
     var imdbRating: String? {
         (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name
