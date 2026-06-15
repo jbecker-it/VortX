@@ -27,20 +27,25 @@ struct HLSPlayerView: View {
             Color.black.ignoresSafeArea()
             Controller(url: url, headers: headers, resumeSeconds: resumeSeconds, onProgress: onProgress)
                 .ignoresSafeArea()
-            // An embedded AVPlayerViewController has no Done button (that only appears when AVKit presents
-            // it modally), so add our own. tvOS users also get the Menu button via the controller.
+            // iOS: an embedded AVPlayerViewController has no Done button (that only appears when AVKit
+            // presents it modally), so add our own. tvOS deliberately omits it: a focusable overlay button
+            // would fight AVPlayerViewController for the Siri-remote focus, so there we close on Menu via
+            // onExitCommand below and the controller owns the screen.
+            #if os(iOS)
             Button { onClose() } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
                     .padding(12).background(.black.opacity(0.55), in: Circle())
             }
             .buttonStyle(.plain)
-            #if os(iOS)
             .keyboardShortcut(.cancelAction)
             .padding(.top, 12).padding(.leading, 16)
-            #endif
             .accessibilityLabel("Close player")
+            #endif
         }
+        #if os(tvOS)
+        .onExitCommand { onClose() }   // Siri-remote Menu leaves the HLS player (the tvOS dismiss idiom)
+        #endif
     }
 
     /// Wraps AVPlayerViewController with native transport controls, ABR, resume, and progress reporting.

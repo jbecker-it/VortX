@@ -33,6 +33,43 @@ final class PlayerPresenter: ObservableObject {
     }
 }
 
+/// Native AVPlayer route for an adaptive-HLS stream on tvOS, presented INSTEAD of the libmpv TVPlayerView
+/// so the RemoteCatcher's focus-lock never competes with AVPlayerViewController for the Siri remote. It
+/// reuses the same engine plumbing TVPlayerView uses: it resolves the resume point from the engine (or the
+/// account fallback) before showing the player, and reports progress back so Continue Watching stays in
+/// sync. Leaving is the tvOS Menu press (HLSPlayerView's onExitCommand).
+private struct TVHLSPlayer: View {
+    let request: PlaybackRequest
+    let onClose: () -> Void
+    @EnvironmentObject private var core: CoreBridge
+    @EnvironmentObject private var account: StremioAccount
+    @State private var resumeSeconds: Double = 0
+    @State private var ready = false
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if ready {
+                HLSPlayerView(
+                    url: request.url, headers: request.headers, resumeSeconds: resumeSeconds,
+                    onProgress: { pos, dur in
+                        guard let m = request.meta else { return }
+                        core.reportProgress(timeSeconds: pos, durationSeconds: dur)
+                        Task { [weak account] in await account?.saveProgress(for: m, positionSeconds: pos, durationSeconds: dur) }
+                    },
+                    onClose: onClose)
+            }
+        }
+        .task {
+            if let m = request.meta {
+                if let engine = core.engineResumeSeconds(for: m) { resumeSeconds = engine }
+                else { resumeSeconds = await account.resumeOffset(for: m) }
+            }
+            ready = true   // resume resolved (or no meta) -> mount the player so it seeks to the right spot
+        }
+    }
+}
+
 /// App root, three focus rules learned the hard way:
 ///  - The shell (and its UITabBarController) is mounted ONCE and never torn down. Conditionally
 ///    recreating the TabView (the 0.2.9 "root replacement" picker) made UIKit initialize the tab
@@ -59,11 +96,19 @@ struct RootView: View {
                 .opacity(shellVisible ? 1 : 0)
                 .disabled(!shellVisible)
             if let req = presenter.request {
-                TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
-                             sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
-                             headers: req.headers,
-                             onClose: { presenter.request = nil })
-                    .id(req.id)   // clean player teardown per request
+                if !req.torrent, HLSPlayerView.handles(req.url) {
+                    // Adaptive-HLS stream: play it natively in AVPlayer (true ABR, vs libmpv locking one
+                    // rendition) on its own, BYPASSING TVPlayerView so the RemoteCatcher's focus-lock never
+                    // fights AVPlayerViewController for the Siri remote.
+                    TVHLSPlayer(request: req, onClose: { presenter.request = nil })
+                        .id(req.id)
+                } else {
+                    TVPlayerView(url: req.url, title: req.title, meta: req.meta, episodes: req.episodes,
+                                 sourceHint: req.sourceHint, torrent: req.torrent, bingeGroup: req.bingeGroup,
+                                 headers: req.headers,
+                                 onClose: { presenter.request = nil })
+                        .id(req.id)   // clean player teardown per request
+                }
             }
             // The launch splash sits above everything for its ~2 seconds. It has no
             // focusable content, so the focus engine settles on the shell underneath
