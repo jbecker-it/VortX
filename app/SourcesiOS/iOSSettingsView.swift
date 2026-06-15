@@ -1,4 +1,5 @@
 import SwiftUI
+import UserNotifications
 
 /// Touch Settings at full parity with the tvOS Settings screen: profiles, account, playback,
 /// stream-source ranking, the embedded streaming server, appearance, audio & subtitle preferences,
@@ -43,6 +44,7 @@ struct iOSSettingsView: View {
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
     @AppStorage(ExternalPlayer.defaultKey) private var defaultExternalPlayer = ""
     @AppStorage("stremiox.seekStep") private var seekStep = 10   // skip-button step in seconds
+    @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = false
 
     var body: some View {
         NavigationStack {
@@ -55,6 +57,7 @@ struct iOSSettingsView: View {
                 profilesSection.listRowBackground(Theme.Palette.surface1)
                 accountSection.listRowBackground(Theme.Palette.surface1)
                 playbackSection.listRowBackground(Theme.Palette.surface1)
+                notificationsSection.listRowBackground(Theme.Palette.surface1)
                 streamsSection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
@@ -240,6 +243,26 @@ struct iOSSettingsView: View {
 
     /// Direct Links Only writes the flat key; turning it OFF cold-starts the embedded server so
     /// torrents work again without a relaunch (guarded out of the Lite build that ships no server).
+    /// Toggling new-episode alerts: enabling asks the system for permission, and `setEnabled` writes the
+    /// stored key (which this @AppStorage mirrors), so the switch settles to the real authorization state.
+    private var notifyNewEpisodesBinding: Binding<Bool> {
+        Binding(
+            get: { notifyNewEpisodes },
+            set: { value in Task { await NewEpisodeNotifications.setEnabled(value) } }
+        )
+    }
+
+    @ViewBuilder private var notificationsSection: some View {
+        Section {
+            Toggle("New episode alerts", isOn: notifyNewEpisodesBinding)
+                .tint(Theme.Palette.accent)
+        } header: {
+            Text("Notifications")
+        } footer: {
+            Text("Get a notification when a new episode of a series you open is about to air. Scheduled on-device for upcoming episodes, so no background tracking is needed.")
+        }
+    }
+
     private var directLinksOnlyBinding: Binding<Bool> {
         Binding(
             get: { directLinksOnly },
@@ -701,3 +724,50 @@ private struct ServerLogView: View {
     }
 }
 #endif
+
+/// New-episode alerts (F5). Schedules a one-shot local notification at the air time of each upcoming
+/// episode of a series the user opens, so a show they follow pings the moment its next episode drops,
+/// with no polling and no background task (the system delivers scheduled local notifications on its own).
+/// Keyed by episode id, so re-opening a show refreshes its alerts instead of duplicating them. Our own
+/// native take on Stremio's library-notification idea, built on Apple's local notification scheduling.
+enum NewEpisodeNotifications {
+    static let enabledKey = "stremiox.notifyNewEpisodes"
+    static var isEnabled: Bool { UserDefaults.standard.bool(forKey: enabledKey) }
+
+    /// Turn alerts on or off. Enabling asks the system for permission; a denial flips the stored flag back
+    /// off so the toggle reflects the real authorization. Disabling clears every pending alert. Returns the
+    /// effective state so a caller's toggle can settle to the truth.
+    @discardableResult
+    @MainActor static func setEnabled(_ on: Bool) async -> Bool {
+        guard on else {
+            UserDefaults.standard.set(false, forKey: enabledKey)
+            UNUserNotificationCenter.current().removeAllPendingNotificationRequests()
+            return false
+        }
+        let granted = (try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge])) ?? false
+        UserDefaults.standard.set(granted, forKey: enabledKey)
+        return granted
+    }
+
+    /// Schedule an alert at the air time of every not-yet-released episode of `series` within the next
+    /// 45 days. No-op when alerts are off. iOS keeps at most 64 pending requests, so the near horizon plus
+    /// the per-episode-id key (which de-dupes re-opens) keeps us comfortably under that ceiling.
+    static func scheduleUpcoming(seriesName: String, videos: [CoreVideo]) {
+        guard isEnabled else { return }
+        let now = Date()
+        let horizon = now.addingTimeInterval(45 * 86_400)
+        let center = UNUserNotificationCenter.current()
+        for v in videos {
+            guard let air = v.releasedDate, air > now, air < horizon else { continue }
+            let content = UNMutableNotificationContent()
+            content.title = seriesName
+            let epLabel = v.season.map { "S\($0)E\(v.episodeNumber)" } ?? "Episode \(v.episodeNumber)"
+            content.body = "New episode is out: \(epLabel)"
+            content.sound = .default
+            let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: air)
+            let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+            center.add(UNNotificationRequest(identifier: "stremiox.ep.\(v.id)", content: content, trigger: trigger))
+        }
+    }
+}

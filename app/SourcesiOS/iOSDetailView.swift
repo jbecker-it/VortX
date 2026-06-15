@@ -273,6 +273,11 @@ struct iOSDetailView: View {
         // AFTER the meta loads — so dispatch the streams here, once the meta arrives. (movieStreamId).
         .onChange(of: core.metaDetails?.meta?.id) { _ in
             if type != "series" { loadMovieStreamsIfNeeded() }
+            else if let m = meta, let videos = m.videos {
+                // F5: opening a series schedules alerts for its upcoming episodes (no-op unless the user
+                // turned alerts on). Keyed by episode id, so revisiting refreshes rather than duplicates.
+                NewEpisodeNotifications.scheduleUpcoming(seriesName: m.name, videos: videos)
+            }
         }
         // Do NOT unloadMeta here. On iOS, pushing the per-episode page (iOSEpisodeStreams) fires THIS
         // detail page's onDisappear AFTER the episode page has already loaded its streams — so calling
