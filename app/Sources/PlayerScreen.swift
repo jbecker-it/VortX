@@ -873,6 +873,14 @@ struct PlayerScreen: View {
         return episodes[i + 1].label
     }
 
+    /// Wall-clock time the title will finish ("Ends 10:45 PM"), from the remaining runtime. Tracks the
+    /// scrub position while scrubbing. nil for live / before the duration is known.
+    private var endsAtClock: String? {
+        guard duration > 0 else { return nil }
+        let remaining = max(0, duration - (scrubbing ? scrubTarget : currentTime))
+        return "Ends \(Date().addingTimeInterval(remaining).formatted(date: .omitted, time: .shortened))"
+    }
+
     /// The end-of-episode Up Next card: next-episode title, a countdown to auto-advance, and Play Now /
     /// Watch Credits. Shown bottom-trailing in the final stretch; touch/click, so no focus wiring needed.
     private var upNextBand: some View {
@@ -1192,7 +1200,12 @@ struct PlayerScreen: View {
                     }
                     .frame(height: 24)
                     .animation(.easeOut(duration: 0.12), value: scrubThumbnails.image != nil)
-                    Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                    VStack(alignment: .trailing, spacing: 1) {
+                        Text(timeString(duration)).font(.caption.monospacedDigit()).foregroundStyle(.white)
+                        if let ends = endsAtClock {
+                            Text(ends).font(.caption2.monospacedDigit()).foregroundStyle(.white.opacity(0.55))
+                        }
+                    }
                 }
             }
 

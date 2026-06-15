@@ -1631,6 +1631,14 @@ struct TVPlayerView: View {
         return "E\(e.episodeNumber) · \(e.episodeTitle)"
     }
 
+    /// Wall-clock time the title will finish ("Ends 10:45 PM"), from the remaining runtime. Tracks the
+    /// scrub position while scrubbing. nil for live / before the duration is known.
+    private var endsAtClock: String? {
+        guard duration > 0 else { return nil }
+        let remaining = max(0, duration - (scrubbing ? scrubTarget : currentTime))
+        return "Ends \(Date().addingTimeInterval(remaining).formatted(date: .omitted, time: .shortened))"
+    }
+
     /// Auto-advance when an episode ends: next episode if there is one, otherwise leave the player.
     private func autoAdvance() {
         if upNextSuppressed {
@@ -2030,9 +2038,15 @@ struct TVPlayerView: View {
                         .foregroundStyle(scrubbing ? Theme.Palette.accent : Theme.Palette.textPrimary)
                         .frame(width: sideWidth, alignment: .leading)
                     scrubber
-                    Text(timeString(duration)).font(.callout.monospacedDigit())
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                        .frame(width: sideWidth, alignment: .trailing)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(timeString(duration)).font(.callout.monospacedDigit())
+                            .foregroundStyle(Theme.Palette.textSecondary)
+                        if let ends = endsAtClock {
+                            Text(ends).font(.caption.monospacedDigit())
+                                .foregroundStyle(Theme.Palette.textTertiary)
+                        }
+                    }
+                    .frame(width: sideWidth, alignment: .trailing)
                 }
                 .frame(maxHeight: .infinity, alignment: .bottom)
             }
