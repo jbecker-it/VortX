@@ -166,6 +166,7 @@ struct PlayerScreen: View {
     @State private var sleepDeadline: Date? = nil       // when the timed pause fires (for the countdown label)
     @State private var sleepTask: Task<Void, Never>?
     @State private var showExternalChooser = false   // "Play in another app" sheet
+    @State private var externalLinkDead = false      // pre-flight probe found the stream URL dead before handoff
     @State private var showShare = false             // system share sheet
     // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
     // every Next/Prev/list switch so progress, the watched marker, Continue-Watching, skip timestamps,
@@ -374,9 +375,15 @@ struct PlayerScreen: View {
                             titleVisibility: .visible) {
             ForEach(ExternalPlayer.installed) { target in
                 Button(target.name) {
-                    // Handed off, stop local playback so the stream isn't decoded twice.
-                    if ExternalPlayer.open(target, stream: curURL ?? url), !isPaused {
-                        coordinator.player?.togglePause()
+                    // Pre-flight the link before handing off, so a dead debrid / CDN URL is caught here
+                    // (we keep playing in the built-in player and say so) instead of bouncing the user
+                    // into Infuse / VLC's own load error. Loopback torrents probe as alive instantly.
+                    Task { @MainActor in
+                        guard await ExternalPlayer.probeAlive(curURL ?? url) else { externalLinkDead = true; return }
+                        // Handed off, stop local playback so the stream isn't decoded twice.
+                        if ExternalPlayer.open(target, stream: curURL ?? url), !isPaused {
+                            coordinator.player?.togglePause()
+                        }
                     }
                 }
             }
@@ -388,9 +395,23 @@ struct PlayerScreen: View {
                 NSPasteboard.general.clearContents(); NSPasteboard.general.setString((curURL ?? url).absoluteString, forType: .string)
                 #endif
             }
+            if let magnet = magnetLink {
+                Button("Copy magnet link") {
+                    #if canImport(UIKit)
+                    UIPasteboard.general.string = magnet.absoluteString
+                    #elseif canImport(AppKit)
+                    NSPasteboard.general.clearContents(); NSPasteboard.general.setString(magnet.absoluteString, forType: .string)
+                    #endif
+                }
+            }
             Button("Cancel", role: .cancel) { scheduleHide() }
         } message: {
             Text(externalChooserMessage)
+        }
+        .alert("Stream unavailable", isPresented: $externalLinkDead) {
+            Button("OK", role: .cancel) { scheduleHide() }
+        } message: {
+            Text("That link is not responding right now. Try a different source.")
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
     }
@@ -1697,6 +1718,22 @@ struct PlayerScreen: View {
     /// direct link with no matching loaded source.
     private var currentStream: CoreStream? {
         currentSourceGroups.flatMap(\.streams).first { $0.playableURL == curURL }
+    }
+
+    /// A magnet link for the current torrent, rebuilt from its info hash plus the trackers the add-on
+    /// supplied, so it can be copied and opened elsewhere. Nil for non-torrent streams (their loopback
+    /// server URL is useless to paste). The plain "Copy stream link" still covers direct and debrid URLs.
+    private var magnetLink: URL? {
+        guard recordIsTorrent, let hash = currentStream?.infoHash, !hash.isEmpty else { return nil }
+        var s = "magnet:?xt=urn:btih:\(hash)"
+        if let name = curTitle.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed), !name.isEmpty {
+            s += "&dn=\(name)"
+        }
+        for tr in (currentStream?.sources ?? []) where tr.hasPrefix("tracker:") || tr.contains("://") {
+            let raw = tr.hasPrefix("tracker:") ? String(tr.dropFirst("tracker:".count)) : tr
+            if let e = raw.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) { s += "&tr=\(e)" }
+        }
+        return URL(string: s)
     }
 
     /// More than one distinct resolution is available for the current title, so the Quality picker is worth

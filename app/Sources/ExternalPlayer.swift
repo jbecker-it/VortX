@@ -82,6 +82,20 @@ enum ExternalPlayer {
         return true
     }
 
+    /// HEAD-probe a stream URL before handing it to an external app, so a dead debrid / CDN link is caught
+    /// here (we stay in the built-in player) instead of dumping the user into the other app's own error.
+    /// Any answer counts as alive (even 403 / 405, the host responded); only a transport failure or a
+    /// 404 / 410 gone counts as dead. Loopback (torrent) URLs are always treated as alive.
+    static func probeAlive(_ url: URL) async -> Bool {
+        guard let host = url.host, host != "127.0.0.1", host != "localhost" else { return true }
+        var req = URLRequest(url: url)
+        req.httpMethod = "HEAD"
+        req.timeoutInterval = 5
+        guard let (_, resp) = try? await URLSession.shared.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode != 404 && http.statusCode != 410
+    }
+
     /// Percent-encode a whole URL so it can be embedded as the `url=` value of an x-callback link.
     /// `.alphanumerics` is intentionally aggressive (encodes `:/?&=`) so the inner URL can't break
     /// out of the outer query.
