@@ -29,6 +29,5 @@
   </g>
 
   <!-- Wordmark: VORT in warm white, X in gold -->
-  <text x="330" y="152" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="104" font-weight="800" letter-spacing="2" fill="#FDF6E3">VORT<tspan fill="url(#gold)">X</tspan></text>
-  <text x="334" y="196" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="22" font-weight="600" letter-spacing="7" fill="#C4A882">NATIVE FOR APPLE</text>
+  <text x="330" y="162" font-family="'Helvetica Neue', Helvetica, Arial, sans-serif" font-size="104" font-weight="800" letter-spacing="2" fill="#FDF6E3">VORT<tspan fill="url(#gold)">X</tspan></text>
 </svg>

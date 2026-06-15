@@ -2,6 +2,11 @@
   <img src="docs/vortx-logo.svg" width="560" alt="VortX">
 </p>
 
+<p align="center">
+  <strong>Everything. VortXed.</strong><br>
+  Video, Audio, Live TV. Native on every screen.
+</p>
+
 # VortX
 
 The native streaming client for Apple devices, **formerly StremioX**. Fully native apps for Apple TV, iPhone, iPad, and Mac, built on stremio-core and the libmpv player, with no web wrapper. Android, Windows, Linux, and more are on the way.
