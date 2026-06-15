@@ -49,6 +49,21 @@ enum ExternalPlayer {
                make: { stream in
                    encoded(stream).flatMap { URL(string: "outplayer://play?url=\($0)") }
                }),
+        Target(id: "senplayer", name: "Sen Player", icon: "play.rectangle.fill",
+               probe: URL(string: "senplayer://")!,
+               make: { stream in
+                   encoded(stream).flatMap { URL(string: "senplayer://x-callback-url/play?url=\($0)") }
+               }),
+        Target(id: "nplayer", name: "nPlayer", icon: "play.square.fill",
+               probe: URL(string: "nplayer-stremiox://")!,
+               make: { stream in
+                   encoded(stream).flatMap { URL(string: "nplayer-stremiox://weblink?action=addotgo&url=\($0)") }
+               }),
+        Target(id: "mxplayer", name: "MX Player", icon: "play.fill",
+               probe: URL(string: "mxplayer://")!,
+               make: { stream in
+                   encoded(stream).flatMap { URL(string: "mxplayer://\($0)") }
+               }),
     ]
 
     /// Only the targets actually installed on this device, what the chooser should offer.
