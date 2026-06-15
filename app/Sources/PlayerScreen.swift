@@ -84,12 +84,12 @@ struct PlayerScreen: View {
     // MARK: Panels
 
     private enum Panel: Identifiable, Equatable {
-        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep
+        case speed, subtitles, subtitleSettings, audio, audioSettings, video, sources, episodes, info, playerSettings, sleep, quality
         var id: Int {
             switch self {
             case .speed: 0; case .subtitles: 1; case .subtitleSettings: 2; case .audio: 3
             case .audioSettings: 4; case .video: 5; case .sources: 6; case .info: 7
-            case .playerSettings: 8; case .sleep: 9; case .episodes: 10
+            case .playerSettings: 8; case .sleep: 9; case .episodes: 10; case .quality: 11
             }
         }
         var title: String {
@@ -98,7 +98,7 @@ struct PlayerScreen: View {
             case .subtitleSettings: "Subtitle Settings"; case .audio: "Audio"
             case .audioSettings: "Audio Settings"; case .video: "Aspect Ratio"
             case .sources: "Sources"; case .info: "Playback Info"; case .playerSettings: "Player Settings"
-            case .sleep: "Sleep Timer"; case .episodes: "Episodes"
+            case .sleep: "Sleep Timer"; case .episodes: "Episodes"; case .quality: "Quality"
             }
         }
     }
@@ -1120,6 +1120,10 @@ struct PlayerScreen: View {
                 }
                 Spacer()
                 controlButton("aspectratio", "Aspect") { openPanel(.video) }
+                if hasMultipleQualities {
+                    Spacer()
+                    controlButton("4k.tv", "Quality") { openPanel(.quality) }
+                }
                 if hasAlternateSources {
                     Spacer()
                     controlButton("rectangle.stack", "Sources") { openPanel(.sources) }
@@ -1429,6 +1433,18 @@ struct PlayerScreen: View {
                 })
             }
             return rs
+        case .quality:
+            // Best stream per resolution (4K / 1080p / 720p / …); picking one hot-swaps the source at the
+            // current position via switchStream — the in-player quality picker. The full per-add-on list
+            // stays under Sources.
+            let opts = StreamRanking.resolutionOptions(currentSourceGroups)
+            if opts.isEmpty { return [Row(label: "No alternate qualities", isHeader: true)] }
+            return opts.map { opt in
+                Row(label: opt.label, detail: StreamRanking.sizeText(opt.stream) ?? "",
+                    selected: opt.stream.playableURL == curURL) {
+                    if let url = opt.stream.playableURL { switchStream(to: opt.stream, url: url, userInitiated: true) }
+                }
+            }
         case .sources:
             return sourceRows()
         case .info:
@@ -1493,6 +1509,12 @@ struct PlayerScreen: View {
     /// True when more than one playable source is loaded for the current title / episode.
     private var hasAlternateSources: Bool {
         currentSourceGroups.reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count } > 1
+    }
+
+    /// More than one distinct resolution is available for the current title, so the Quality picker is worth
+    /// showing (one tap to drop 4K -> 1080p -> 720p, or climb back up, at the current position).
+    private var hasMultipleQualities: Bool {
+        StreamRanking.resolutionOptions(currentSourceGroups).count > 1
     }
 
     /// Up to a capped number of loaded sources, grouped by add-on in their existing priority order, so
