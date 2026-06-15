@@ -138,3 +138,23 @@ enum SkipSegments {
         return isBoundary(before) && isBoundary(after)
     }
 }
+
+/// Pure helper for drawing chapter boundary ticks on the seek bar (both players share it). Lives beside
+/// `MPVChapter` and is side-effect-free so it unit-tests like the skip logic above.
+enum ChapterMarks {
+    /// Chapter start times as fractions of the runtime (0...1), for tick marks along the scrubber. Drops
+    /// the implicit leading chapter (start < 1s) and any marker within 5s of the end (cosmetic noise),
+    /// then collapses fractions that round to the same 0.1% position so a `ForEach(id: \.self)` over the
+    /// result is always stable (no duplicate ids, no crash).
+    static func fractions(chapters: [MPVChapter], duration: Double) -> [Double] {
+        guard duration > 0 else { return [] }
+        var seen = Set<Int>()
+        var out: [Double] = []
+        for start in chapters.map(\.start).sorted() where start > 1 && start < duration - 5 {
+            let key = Int(((start / duration) * 1000).rounded())
+            guard key > 0, key < 1000, seen.insert(key).inserted else { continue }
+            out.append(Double(key) / 1000)
+        }
+        return out
+    }
+}

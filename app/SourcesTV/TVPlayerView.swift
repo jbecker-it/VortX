@@ -89,6 +89,7 @@ struct TVPlayerView: View {
     @State private var recoveryDeadline: Task<Void, Never>?
     private let maxRecoverySeconds: Double = 150
     @State private var skipSegments: [SkipSegment] = []   // resolved skip spans (chapters + crowd timestamps)
+    @State private var chapterFractions: [Double] = []    // chapter boundary positions (0...1) for scrubber ticks
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
     @State private var skipFetchTask: Task<Void, Never>?
@@ -602,6 +603,10 @@ struct TVPlayerView: View {
             ZStack(alignment: .leading) {
                 Capsule().fill(Theme.Palette.textPrimary.opacity(0.22)).frame(height: barH)
                 Capsule().fill(Theme.Palette.accent).frame(width: max(0, w * frac), height: barH)
+                // Chapter boundary ticks along the bar (decorative; the knob still reads over them).
+                ForEach(chapterFractions, id: \.self) { f in
+                    Capsule().fill(.white.opacity(0.5)).frame(width: 2, height: barH).offset(x: w * f)
+                }
                 Circle().fill(Theme.Palette.accent).frame(width: knob, height: knob)
                     .overlay(Circle().stroke(Theme.Palette.canvas, lineWidth: focused ? 3 : 0))
                     .shadow(color: Theme.Palette.accent.opacity(0.6), radius: focused ? 10 : 6)
@@ -1445,9 +1450,10 @@ struct TVPlayerView: View {
     /// Re-resolve skip spans from every available layer (named chapters + crowd timestamps), once the
     /// file's duration is known. The resolver's sanity guards keep any one bad span from mis-skipping.
     private func refreshSkipSegments() {
-        let chapterCandidates = SkipSegments.chapterCandidates(chapters: coordinator.player?.chapters() ?? [],
-                                                               duration: duration)
+        let chapters = coordinator.player?.chapters() ?? []
+        let chapterCandidates = SkipSegments.chapterCandidates(chapters: chapters, duration: duration)
         skipSegments = SegmentResolver.resolve(chapterCandidates + apiSkipCandidates, duration: duration)
+        chapterFractions = ChapterMarks.fractions(chapters: chapters, duration: duration)
         updateCurrentSkip(at: currentTime)
     }
 

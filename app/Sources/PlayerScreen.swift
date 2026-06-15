@@ -222,6 +222,7 @@ struct PlayerScreen: View {
 
     // Skip intro / outro (chapter-derived + crowd-sourced timings), shown as a pill while controls hide.
     @State private var skipSegments: [SkipSegment] = []
+    @State private var chapterFractions: [Double] = []   // chapter boundary positions (0...1) for scrubber ticks
     @State private var apiSkipCandidates: [SegmentCandidate] = []
     @State private var currentSkip: SkipSegment?
     @State private var skipFetchKey = ""
@@ -1105,6 +1106,16 @@ struct PlayerScreen: View {
                             }
                         }
                         #endif
+                        // Chapter boundary ticks along the track (purely decorative, never intercept the
+                        // Slider's own drag). Positioned within the same inset the Slider track uses.
+                        .overlay {
+                            ForEach(chapterFractions, id: \.self) { f in
+                                Capsule().fill(.white.opacity(0.55))
+                                    .frame(width: 2, height: 8)
+                                    .position(x: sliderInset + CGFloat(f) * trackWidth, y: geo.size.height / 2)
+                            }
+                            .allowsHitTesting(false)
+                        }
                         // bottomLeading alignment: popup bottom anchors at slider bottom, grows upward.
                         // y: -28 lifts it 4 pt above the slider top (slider is 24 pt tall).
                         .overlay(alignment: .bottomLeading) {
@@ -1225,9 +1236,10 @@ struct PlayerScreen: View {
         }
     }
     private func refreshSkipSegments() {
-        let chapterCandidates = SkipSegments.chapterCandidates(chapters: coordinator.player?.chapters() ?? [],
-                                                               duration: duration)
+        let chapters = coordinator.player?.chapters() ?? []
+        let chapterCandidates = SkipSegments.chapterCandidates(chapters: chapters, duration: duration)
         skipSegments = SegmentResolver.resolve(chapterCandidates + apiSkipCandidates, duration: duration)
+        chapterFractions = ChapterMarks.fractions(chapters: chapters, duration: duration)
         updateCurrentSkip(at: currentTime)
     }
     private func fetchSkipTimestamps() {
