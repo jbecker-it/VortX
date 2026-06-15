@@ -90,6 +90,8 @@ struct TVPlayerView: View {
     private let maxRecoverySeconds: Double = 150
     @State private var skipSegments: [SkipSegment] = []   // resolved skip spans (chapters + crowd timestamps)
     @State private var chapterFractions: [Double] = []    // chapter boundary positions (0...1) for scrubber ticks
+    @State private var upNextSuppressed = false           // user chose Watch Credits: hide band + don't auto-advance this episode
+    @State private var upNextWantsCredits = false         // which band button is focused (false = Play Now, true = Watch Credits)
     @State private var apiSkipCandidates: [SegmentCandidate] = []   // crowd-sourced spans for the current title
     @State private var skipFetchKey = ""                   // imdb:S:E the crowd spans belong to
     @State private var skipFetchTask: Task<Void, Never>?
@@ -241,8 +243,9 @@ struct TVPlayerView: View {
             if showInfo && !showOptions && !loadFailed { controlBar }
             if showOptions { optionsPanel }
             if loadFailed { loadErrorOverlay }
-            if controlsHidden, let seg = currentSkip { skipPill(seg) }
+            if controlsHidden, let seg = currentSkip, upNextRemaining == nil { skipPill(seg) }
             if controlsHidden, let d = hiddenSeekDelta { hiddenSeekPill(d) }
+            if controlsHidden, upNextRemaining != nil { upNextBand }
             if showStats, !loadFailed { statsOverlay }
             if showStreamQR, let link = shareLink {
                 StreamLinkQRView(title: isTorrentPlayback ? "Magnet link" : "Stream link", link: link)
@@ -344,6 +347,20 @@ struct TVPlayerView: View {
             return
         }
         if controlsHidden {
+            // Up Next band visible: it owns Left/Right/Select/Down (pick + activate + dismiss) so they
+            // never fall through to the seek-while-hidden nudge below. Menu (exit), Play/Pause, and Up
+            // still behave normally, so the band never traps the remote.
+            if upNextRemaining != nil {
+                switch type {
+                case .leftArrow:  upNextWantsCredits = false; return   // focus Play Now
+                case .rightArrow: upNextWantsCredits = true;  return   // focus Watch Credits
+                case .select:
+                    if upNextWantsCredits { upNextSuppressed = true } else { playNext() }
+                    return
+                case .downArrow:  upNextSuppressed = true; return      // dismiss, keep watching
+                default: break                                        // menu / playPause / up fall through
+                }
+            }
             switch type {
             case .menu: saveProgress(at: currentTime); leavePlayback()
             case .playPause: toggle()
@@ -1542,6 +1559,52 @@ struct TVPlayerView: View {
         .transition(.opacity)
     }
 
+    /// End-of-episode Up Next card (controls hidden): next episode + countdown + Play Now / Watch Credits.
+    /// The remote drives it directly via handlePress (Left/Right pick, Select activates), so there is no
+    /// SwiftUI @FocusState here — `upNextWantsCredits` is the highlighted button.
+    private var upNextBand: some View {
+        VStack {
+            Spacer()
+            HStack {
+                Spacer()
+                HStack(spacing: 28) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("UP NEXT").font(.caption.weight(.bold)).tracking(2)
+                            .foregroundStyle(Theme.Palette.textTertiary)
+                        if let label = nextEpisodeLabel {
+                            Text(label).font(.title3.weight(.semibold))
+                                .foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
+                        }
+                        if let r = upNextRemaining {
+                            Text("Playing in \(r)s").font(.callout).foregroundStyle(Theme.Palette.textSecondary)
+                        }
+                    }
+                    upNextButton("Play Now", systemImage: "play.fill", highlighted: !upNextWantsCredits)
+                    upNextButton("Watch Credits", systemImage: nil, highlighted: upNextWantsCredits)
+                }
+                .padding(.horizontal, 32).padding(.vertical, 22)
+                .frame(maxWidth: 820, alignment: .leading)
+                .background(.black.opacity(0.74), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+                .padding(Theme.Space.screenEdge * 1.5)
+            }
+        }
+        .transition(.move(edge: .bottom).combined(with: .opacity))
+        .animation(.easeOut(duration: 0.15), value: upNextWantsCredits)
+    }
+
+    private func upNextButton(_ title: String, systemImage: String?, highlighted: Bool) -> some View {
+        HStack(spacing: 8) {
+            if let img = systemImage { Image(systemName: img) }
+            Text(title)
+        }
+        .font(.headline.weight(.semibold))
+        .foregroundStyle(highlighted ? Theme.Palette.onAccent : Theme.Palette.textPrimary)
+        .padding(.horizontal, 24).padding(.vertical, 13)
+        .background(highlighted ? AnyShapeStyle(Theme.Palette.accent) : AnyShapeStyle(.white.opacity(0.16)), in: Capsule())
+        .overlay(Capsule().stroke(Theme.Palette.canvas, lineWidth: highlighted ? 3 : 0))
+        .scaleEffect(highlighted ? 1.06 : 1.0)
+    }
+
     // MARK: - Episode navigation (series only; `episodes` is the season's ordered list)
 
     private var allEpisodes: [CoreVideo] { episodes.isEmpty ? loadedEpisodes : episodes }
@@ -1553,8 +1616,30 @@ struct TVPlayerView: View {
     private func playNext() { if let i = episodeIndex, i + 1 < allEpisodes.count { play(episode: allEpisodes[i + 1]) } }
     private func playPrevious() { if let i = episodeIndex, i > 0 { play(episode: allEpisodes[i - 1]) } }
 
+    /// Seconds left until auto-advance, when the Up Next band should be on screen: a next episode queued,
+    /// a real runtime, the play head in the final stretch, and the user hasn't chosen to watch the credits.
+    private var upNextRemaining: Int? {
+        guard hasNextEpisode, !upNextSuppressed, duration > 60, currentTime > 0 else { return nil }
+        let remaining = duration - currentTime
+        guard remaining > 0, remaining <= 20 else { return nil }
+        return Int(remaining.rounded(.up))
+    }
+    /// Label of the episode that plays next, for the Up Next band.
+    private var nextEpisodeLabel: String? {
+        guard let i = episodeIndex, i + 1 < allEpisodes.count else { return nil }
+        let e = allEpisodes[i + 1]
+        return "E\(e.episodeNumber) · \(e.episodeTitle)"
+    }
+
     /// Auto-advance when an episode ends: next episode if there is one, otherwise leave the player.
     private func autoAdvance() {
+        if upNextSuppressed {
+            // User chose Watch Credits: play through to the end, then stop here instead of auto-jumping.
+            // The episode is marked watched, so Continue Watching rolls forward on its own.
+            saveProgress(at: currentTime)
+            leavePlayback()
+            return
+        }
         if hasNextEpisode { playNext(); return }
         // Finished (a movie, or the last episode): record the final position, then rewind the title out of
         // Continue Watching. The engine keeps any item with time_offset > 0 in the rail, so without this a
@@ -1592,6 +1677,7 @@ struct TVPlayerView: View {
         // `!markedWatched` guard, so only the session's first episode ever marks watched (the "watched
         // episodes don't tick" regression; iOS PlayerScreen.goToEpisode already resets it).
         markedWatched = false
+        upNextSuppressed = false; upNextWantsCredits = false   // re-arm the Up Next band for the new episode
         sourceHops = 0; exhaustedURLs = []   // fresh episode, fresh failover budget
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
         let newMeta = PlaybackMeta(libraryId: m.libraryId, videoId: v.id, type: "series",
