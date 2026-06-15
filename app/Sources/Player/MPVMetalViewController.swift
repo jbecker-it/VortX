@@ -782,11 +782,46 @@ final class MPVMetalViewController: PlatformViewController {
     func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
     func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
 
-    /// Load an external subtitle (an add-on URL) and select it. mpv fetches the file itself
-    /// and the new track joins track-list, so the subtitles panel lists it like any embedded
-    /// one from then on; `title`/`lang` label it there.
-    func addExternalSubtitle(url: String, title: String, lang: String) {
-        command("sub-add", args: [url, "select", title, lang])
+    /// Load an external subtitle from a (possibly slow) add-on URL WITHOUT blocking the caller, then
+    /// select it. The old form ran `sub-add <remoteURL>` straight through `mpv_command`, which downloads
+    /// the file INLINE on the calling thread; called from the subtitles panel on the main thread, a slow
+    /// or hanging subtitle endpoint (an on-demand generator like Submaker, or a laggy provider) froze the
+    /// whole app for the entire fetch. Instead we download the file ourselves on a background queue with a
+    /// timeout, then `sub-add` the LOCAL file on the mpv queue (no network, instant). `completion` runs on
+    /// the main thread with whether the subtitle loaded, so the UI can show progress and surface failures.
+    func addExternalSubtitle(url: String, title: String, lang: String,
+                             timeout: TimeInterval = 20, completion: ((Bool) -> Void)? = nil) {
+        guard let remote = URL(string: url) else { completion?(false); return }
+        let finish: (Bool) -> Void = { ok in DispatchQueue.main.async { completion?(ok) } }
+        var request = URLRequest(url: remote)
+        request.timeoutInterval = timeout
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+            guard let self else { return }
+            let statusOK = (response as? HTTPURLResponse).map { (200 ..< 400).contains($0.statusCode) } ?? true
+            guard statusOK, let data, !data.isEmpty else { finish(false); return }
+            let ext = Self.subtitleExtension(for: remote,
+                                             contentType: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type"))
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("stremiox-sub-\(UUID().uuidString).\(ext)")
+            guard (try? data.write(to: tmp)) != nil else { finish(false); return }
+            self.queue.async {
+                self.command("sub-add", args: [tmp.path, "select", title, lang])   // local file: no network, off-main
+                finish(true)
+            }
+        }.resume()
+    }
+
+    /// Best-effort subtitle file extension so mpv parses the downloaded bytes (it sniffs format too, but a
+    /// correct extension is the reliable hint). Prefer the URL's own extension, then the content type, else srt.
+    private static func subtitleExtension(for url: URL, contentType: String?) -> String {
+        let known = ["srt", "vtt", "ass", "ssa", "sub", "smi"]
+        let ext = url.pathExtension.lowercased()
+        if known.contains(ext) { return ext }
+        if let ct = contentType?.lowercased() {
+            if ct.contains("vtt") { return "vtt" }
+            if ct.contains("ass") || ct.contains("ssa") { return "ass" }
+        }
+        return "srt"
     }
 
     /// Manual subtitle sync, in seconds (positive = subtitles appear later). Maps to mpv `sub-delay`.

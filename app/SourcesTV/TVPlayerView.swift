@@ -42,6 +42,7 @@ struct TVPlayerView: View {
     // which it lives in the normal track list; addedSubURLs hides its add-on row.
     @State private var addonSubs: [AddonSubtitle] = []
     @State private var addedSubURLs: Set<String> = []
+    @State private var subtitleLoadingURL: String?     // an add-on subtitle is downloading (shows Loading… in its row)
     @State private var addonSubsKey = ""               // type:videoId the fetched list belongs to
     @State private var showOptions = false             // options panel (audio / subtitles / aspect / episodes)
     @State private var panelKind: PanelKind = .audio   // which list the options panel shows
@@ -723,12 +724,20 @@ struct TVPlayerView: View {
             if !available.isEmpty {
                 rows.append(OptionRow(label: "From add-ons", isHeader: true))
                 for sub in available.prefix(30) {
-                    rows.append(OptionRow(label: langName(sub.lang), detail: sub.addonName) {
-                        coordinator.player?.addExternalSubtitle(url: sub.url,
-                                                                title: sub.addonName,
-                                                                lang: sub.lang)
-                        addedSubURLs.insert(sub.url)
+                    let loading = subtitleLoadingURL == sub.url
+                    rows.append(OptionRow(label: langName(sub.lang),
+                                          detail: loading ? "Loading…" : sub.addonName) {
+                        // Non-blocking: download + sub-add happen off the main thread with a timeout, so a
+                        // slow / hanging subtitle endpoint can't freeze the player. The row shows Loading…
+                        // until the track arrives (then it moves into the embedded list above).
+                        guard subtitleLoadingURL == nil else { return }
+                        subtitleLoadingURL = sub.url
                         refreshTracksSoon()
+                        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                            subtitleLoadingURL = nil
+                            if ok { addedSubURLs.insert(sub.url) }
+                            refreshTracksSoon()
+                        }
                     })
                 }
             }

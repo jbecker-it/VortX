@@ -185,6 +185,7 @@ struct PlayerScreen: View {
     @State private var sleepTask: Task<Void, Never>?
     @State private var showExternalChooser = false   // "Play in another app" sheet
     @State private var externalLinkDead = false      // pre-flight probe found the stream URL dead before handoff
+    @State private var subtitleLoadFailed = false    // an add-on subtitle download timed out / failed
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var showShare = false             // system share sheet
     // Current-episode tracking for in-place episode switching: seeded from the launch values, updated on
@@ -433,6 +434,11 @@ struct PlayerScreen: View {
             Button("OK", role: .cancel) { scheduleHide() }
         } message: {
             Text("That link is not responding right now. Try a different source.")
+        }
+        .alert("Subtitle unavailable", isPresented: $subtitleLoadFailed) {
+            Button("OK", role: .cancel) { scheduleHide() }
+        } message: {
+            Text("That subtitle source did not respond in time. Try another one.")
         }
         .sheet(isPresented: $showShare) { ShareSheet(items: [curURL ?? url]) }
     }
@@ -1626,8 +1632,12 @@ struct PlayerScreen: View {
                 rs.append(Row(label: "From add-ons", isHeader: true))
                 for sub in available.prefix(30) {
                     rs.append(Row(label: langName(sub.lang), detail: sub.addonName) {
-                        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang)
-                        addedSubURLs.insert(sub.url)
+                        // Non-blocking: the download + sub-add happen off the main thread with a timeout, so a
+                        // slow or hanging subtitle endpoint can't freeze the player. The panel closes right
+                        // away; the track appears when it loads, or an alert surfaces if it never arrives.
+                        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                            if ok { addedSubURLs.insert(sub.url) } else { subtitleLoadFailed = true }
+                        }
                     })
                 }
             }
