@@ -4,15 +4,34 @@ All notable changes to StremioX, newest first. StremioX is Apple TV first, with 
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/mamaclapper/StremioX/discussions) or [open an issue](https://github.com/mamaclapper/StremioX/issues).
 
-## 0.3.2 (prerelease) - 2026-06-15
+## 0.3.3 - 2026-06-15
 
-A small player update. The larger player and browse features are landing in 0.3.3.
+The big player and browse update on top of 0.3.1, across iPhone, iPad, Mac, and Apple TV. A new in-player quality picker, native adaptive-stream playback, a default external-player engine, new-episode alerts, smarter HDR, a full set of source filters, and a long list of on-device fixes (the subtitle freeze and blank posters among them).
 
 ### Added
-- **Seek-while-hidden on Apple TV.** With the controls hidden, Left/Right now seek backward/forward 10 seconds directly, with a brief time pill, instead of revealing the whole control bar. Up/Down still reveal the controls.
+- **An in-player Quality picker.** One tap swaps the resolution (4K to 1080p to 720p and back) at your current position, without reopening the source list.
+- **Adaptive streams now play in AVPlayer on iPhone, iPad, and Apple TV.** An OK.ru-style HLS source ramps to the best quality your connection holds, instead of getting stuck at the lowest rendition.
+- **A default external-player engine.** Pick Infuse, VLC, Outplayer, Sen Player, nPlayer, or MX Player, and direct and debrid streams open straight there. A pre-flight check catches a dead link before the hand-off, and you can copy a torrent's magnet link from the same menu.
+- **New-episode alerts.** Get notified when a show in your library has a new episode airing. On by default, scheduled on-device, no background tracking.
+- **An Up Next band with a countdown** at the end of an episode on every platform, plus next-episode preload on iPhone, iPad, and Mac so the next one starts fast.
+- **Smarter HDR and Dolby Vision.** An Auto / On / Off tone-mapping control that checks whether your display actually handles HDR, plus a Dolby Vision profile-7 to profile-8 fallback so more 4K remuxes play instead of failing.
+- **Source filters and sorting.** Keyword include and exclude, a safety filter, and new toggles for Instant sources only, Hide dead torrents, HDR only, Hide AV1, and a Max quality cap. Sort the Sources list by Best, Size, or Seeders, and it remembers your choice.
+- **A Chapters navigator** in the player with chapter ticks on the seek bar, an "Ends at" clock, and a configurable skip step (10, 15, or 30 seconds).
+- **Lock Screen and Control Center controls** on iPhone and iPad (play, pause, skip, scrub, title and artwork), and **keyboard controls in the macOS player** (Space and arrows).
+- **Auto-landscape on iPhone and iPad.** The player rotates to landscape the moment a stream opens, even with rotation lock on (with a toggle to turn it off).
+- **A richer Playback Info sheet** (what is playing, the add-on it came from, the full release name and filename), a **Cast, Director, and Writer row** on the detail page, and **IMDb rating badges on catalog posters**.
+- **Home catalog pagination**, so a large set of catalogs keeps loading as you scroll instead of stopping at the first batch, and **a more prominent update banner** on iPhone and Mac.
+- **Seek-while-hidden on Apple TV.** With the controls hidden, Left/Right seek 10 seconds directly with a brief time pill. The options panel also closes after a one-shot pick so you land back on the video, and the Apple TV player buttons gained a frosted Liquid Glass look.
 
-### Landing next in 0.3.3
-An in-player quality picker, a default external-player engine (Infuse/VLC), an Up Next autoplay band with a countdown, new-episode notifications, Mac keyboard navigation, Dolby Vision DV7 colour fix, and more.
+### Fixed
+- **Add-on subtitles no longer freeze the app.** A slow or on-demand subtitle source (Submaker, or a laggy OpenSubtitles) used to lock the player while it downloaded. The download now runs in the background with a timeout.
+- **Catalog posters no longer go blank.** Tiles that scrolled offscreen and back dropped their image with no retry; they now cache and reload reliably, on Apple TV too.
+- **Plain-http custom streaming servers work,** including a server reached over a Tailscale address, which the network layer used to block.
+- **The iPhone streaming server stays alive when the screen locks,** so audio keeps playing and the stream survives.
+- **Add-on posters that are not 2:3 no longer look squished** on Home, and the Discover grid no longer drops cells when a catalog repeats a title across pages.
+
+### Notes
+- Landing next: an A/B loop, a frame grab to Photos, sharing a title, copy-all-source-links, a What's New sheet, and haptics.
 
 ## 0.3.1 - 2026-06-15
 
