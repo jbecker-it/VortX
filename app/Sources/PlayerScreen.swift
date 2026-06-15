@@ -109,6 +109,16 @@ struct PlayerScreen: View {
             case .chapters: "Chapters"
             }
         }
+        /// Panels where picking a row is an unambiguous one-shot choice (a track, quality, source, or
+        /// chapter): the panel closes after the tap so the user lands back on the video. Speed and aspect
+        /// stay open (people flip between values to compare), as do the adjustment panels (sync / size /
+        /// colour steppers, output mode, player settings, sleep) and the browse panels (info, episodes).
+        var dismissesAfterPick: Bool {
+            switch self {
+            case .subtitles, .audio, .quality, .sources, .chapters: true
+            default: false
+            }
+        }
     }
     /// A panel row: a section header (`isHeader`, not tappable), a selectable choice (with optional
     /// right-aligned `detail`), or a drill-in. Mirrors tvOS `OptionRow`.
@@ -1497,9 +1507,15 @@ struct PlayerScreen: View {
             Button {
                 row.apply()
                 refreshSoon()
-                // Selection / value may have changed (sync, size, tracks, sources) — recompute in place
-                // so checkmarks + readouts stay honest; panels that should dismiss call close() in apply.
-                if let openPanel = panel { panelRows = rows(for: openPanel) }
+                // After a one-shot pick (a track, quality, source, chapter, speed, aspect) close the
+                // panel so the user lands back on the video. Otherwise recompute the open panel's rows
+                // in place so checkmarks + readouts stay honest. apply() may have navigated into a
+                // sub-panel via a "›" row, in which case `panel` is now that sub-panel and we refresh it.
+                if row.detail != "›", let open = panel, open.dismissesAfterPick {
+                    close()
+                } else if let open = panel {
+                    panelRows = rows(for: open)
+                }
             } label: {
                 HStack {
                     Text(row.label).foregroundStyle(.white).lineLimit(1)
