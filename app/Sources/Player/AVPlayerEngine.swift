@@ -70,9 +70,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         let options = (headers?.isEmpty ?? true) ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers!]
         let newItem = AVPlayerItem(asset: AVURLAsset(url: url, options: options))
         item = newItem
+        // START PROMPTLY. With the default (true), AVPlayer waits to build a stall-proof buffer before it
+        // begins; for a large 4K / Dolby Vision debrid stream that wait can outlast any reasonable start
+        // deadline, so the player mounts, shows the chrome, and never produces a frame (no item .failed, no
+        // timePos) -> on tvOS that read as "AVPlayer plays nothing" and tripped the libmpv fallback for every
+        // stream. We drive our own start watchdog + stall handling, so let playback begin at the first samples.
+        player.automaticallyWaitsToMinimizeStalling = false
         player.replaceCurrentItem(with: newItem)
         player.allowsExternalPlayback = true   // AirPlay
+        DiagnosticsLog.log("avplayer", "load host=\(url.host ?? "?") scheme=\(url.scheme ?? "?") ext=\(url.pathExtension) headers=\(headers?.count ?? 0) live=\(live)")
         observe(newItem)
+        // Drive the current status now: the KVO below uses [.initial, .new], but an item that is already
+        // readyToPlay at attach time still benefits from an explicit kick so play() is never skipped.
+        if newItem.status != .unknown { handleStatus(newItem) }
     }
 
     func play() { player.rate = requestedRate }   // rate > 0 starts playback at the chosen speed
@@ -250,7 +260,7 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     // MARK: Observation -> MPVProperty events
 
     private func observe(_ item: AVPlayerItem) {
-        observations.append(item.observe(\.status, options: [.new]) { [weak self] item, _ in
+        observations.append(item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
             Task { @MainActor in self?.handleStatus(item) }
         })
         observations.append(item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] item, _ in
@@ -260,7 +270,12 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             Task { @MainActor in if item.isPlaybackLikelyToKeepUp { self?.emit(MPVProperty.pausedForCache, false) } }
         })
         observations.append(player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            Task { @MainActor in self?.emit(MPVProperty.pause, player.timeControlStatus == .paused) }
+            Task { @MainActor in
+                // Diagnostic: a player stuck at .waitingToPlayAtSpecifiedRate (2) with a buffering wait-reason
+                // is the "mounts but never plays" signature; logging the reason pinpoints it in one test.
+                DiagnosticsLog.log("avplayer", "timeControlStatus=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                self?.emit(MPVProperty.pause, player.timeControlStatus == .paused)
+            }
         })
         // ~4 Hz, matching the libmpv controller's coalesced time-pos cadence. Delivered on .main, so it runs
         // synchronously on the main actor (no extra Task hop that could fire after teardown nils the observer).
@@ -293,8 +308,18 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 pendingSeek = nil
                 player.seek(to: CMTime(seconds: max(target, 0), preferredTimescale: 600))
             }
-            if !didStart { didStart = true; player.rate = requestedRate }
+            if !didStart {
+                didStart = true
+                // Explicit play() then pin the rate. With automaticallyWaitsToMinimizeStalling = false this
+                // begins at the first samples instead of waiting on a buffer heuristic that never settles.
+                player.play()
+                player.rate = requestedRate
+                DiagnosticsLog.log("avplayer", "readyToPlay -> play() rate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+            }
         case .failed:
+            let ns = item.error as NSError?
+            let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
+            DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
             emit(MPVProperty.endFileError, item.error?.localizedDescription ?? "Playback failed")
         default:
             break

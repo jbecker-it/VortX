@@ -89,12 +89,13 @@ struct TVPlayerView: View {
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
     // AVPlayer-only START watchdog: AVPlayer can mount, show the chrome, and silently never produce a
-    // playable frame (no item error, no timePos tick), e.g. a debrid Dolby Vision MP4 it can't decode.
-    // Without this, the only guard was the shared 30s loadTimeout, so the owner saw ~30s of dead chrome
-    // before libmpv took over. This fires after avStartWatchdogSeconds and routes to the SAME libmpv
-    // fallback the .failed case uses. AVPlayer-only: libmpv torrents legitimately warm up far longer.
+    // playable frame (no item error, no timePos tick). The real fix is in AVPlayerEngineController
+    // (automaticallyWaitsToMinimizeStalling = false + explicit play() + the [.initial,.new] status race fix),
+    // so a working stream now starts within a second or two; this watchdog is only the SAFETY NET for a
+    // genuinely stuck stream, set generously so a slow 4K / Dolby Vision start is never killed mid-buffer. It
+    // routes to the SAME libmpv fallback the .failed case uses. AVPlayer-only: libmpv torrents warm up longer.
     @State private var avStartWatchdog: Task<Void, Never>?
-    private let avStartWatchdogSeconds: Double = 6
+    private let avStartWatchdogSeconds: Double = 12
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
