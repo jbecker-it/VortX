@@ -10,18 +10,28 @@ import SwiftUI
 /// Unlike the per-image XRDB transformer, ERDB is the only one of our art providers that also serves a
 /// rating-baked LOGO by id, which is exactly what add-on authors asked for.
 enum ERDB {
-    static let enabledKey = "stremiox.erdb.enabled"   // absent = on (only takes effect once a token is set)
+    static let enabledKey = "stremiox.erdb.enabled"   // absent = OFF (opt-in: it replaces every poster)
     static let tokenKey = "stremiox.erdb.token"
     static let baseKey = "stremiox.erdb.baseURL"
+    static let fanartPostersKey = "stremiox.erdb.fanartPosters"   // absent = off
     static let defaultBase = "https://erdb.vortx.tv"
 
     static var token: String {
         (UserDefaults.standard.string(forKey: tokenKey) ?? "").trimmingCharacters(in: .whitespaces)
     }
 
-    /// ERDB drives artwork only when the toggle is on AND a token is set (no token = nothing to resolve).
+    /// ERDB drives artwork whenever the toggle is on. The hosted erdb.vortx.tv is KEYLESS, so no token is
+    /// required: a tokenless request ({base}/{type}/{id}.jpg) returns VortX-styled, rating-baked art. A token
+    /// is only for a custom self-hosted instance that carries the user's own providers/layout. Opt-in
+    /// (default off) because turning it on replaces every poster, backdrop, and logo with a baked render.
     static var isActive: Bool {
-        (UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true) && !token.isEmpty
+        UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? false
+    }
+
+    /// Opt-in: request fanart.tv posters from the image service (it appends ?art=fanart, using the user's own
+    /// fanart key when set, else the VortX service key). Posters only; backdrops and logos are unaffected.
+    static var fanartPosters: Bool {
+        UserDefaults.standard.bool(forKey: fanartPostersKey)
     }
 
     /// The renderer URL for a title, or the `fallback` art when inactive or the id is not renderable. `type`
@@ -29,7 +39,16 @@ enum ERDB {
     /// `tmdb:movie:603` / `tt0944947:1:1` directly in the path), so it is inserted raw.
     static func imageURL(_ type: String, id: String, fallback: String?) -> String? {
         guard isActive, let rid = renderableID(id) else { return fallback }
-        return "\(normalizedBase())/\(token)/\(type)/\(rid).jpg"
+        let tk = token
+        let tokenSeg = tk.isEmpty ? "" : "\(tk)/"   // tokenless self-host form when no token is set
+        var u = "\(normalizedBase())/\(tokenSeg)\(type)/\(rid).jpg"
+        if type == "poster", fanartPosters {
+            u += "?art=fanart"
+            if let fk = ApiKeys.fanartKey(), let enc = fk.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                u += "&fk=\(enc)"
+            }
+        }
+        return u
     }
 
     /// ERDB resolves IMDb, TMDB, TVDB, and the anime id schemes. A custom add-on id it cannot map keeps its

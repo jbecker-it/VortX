@@ -60,9 +60,10 @@ struct XRDBSettingsView: View {
     @AppStorage(XRDB.enabledKey) private var enabled = true
     @AppStorage(XRDB.baseKey) private var baseURL = ""
     @AppStorage(XRDB.aliasKey) private var alias = ""
-    @AppStorage(ERDB.enabledKey) private var erdbEnabled = true
+    @AppStorage(ERDB.enabledKey) private var erdbEnabled = false
     @AppStorage(ERDB.tokenKey) private var erdbToken = ""
     @AppStorage(ERDB.baseKey) private var erdbBase = ""
+    @AppStorage(ERDB.fanartPostersKey) private var erdbFanartPosters = false
 
     var body: some View {
         ScrollView {
@@ -87,7 +88,7 @@ struct XRDBSettingsView: View {
                 Text("ERDB (posters + logos)")
                     .font(Theme.Typography.sectionTitle)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                Text("ERDB (easyratingsdb.com) renders posters, backdrops, and rating-baked LOGOS from a single token, and overrides the VortX poster service above when a token is set. Paste your Tk- token from the ERDB configurator. The base URL is only for a self-hosted ERDB instance.")
+                Text("ERDB renders posters, backdrops, and rating-baked LOGOS and overrides the VortX poster service above when on. It uses VortX's own keyless service, so no token is needed, just turn it on. Advanced: add a Tk- token (or a self-hosted base URL) to use your own ERDB configuration instead.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
                 Toggle(isOn: $erdbEnabled) {
@@ -100,7 +101,20 @@ struct XRDBSettingsView: View {
                 .padding(Theme.Space.md)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-                field("ERDB token", text: $erdbToken, hint: "Your Tk-… token from the ERDB configurator. Stored on this device and synced, encrypted, to your VortX account.", url: false)
+                Toggle(isOn: $erdbFanartPosters) {
+                    Text("Use fanart posters")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                Text("Pull posters from fanart.tv instead of the default source (requires ERDB on). Uses your fanart key from Metadata keys if you set one, otherwise VortX's own key.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                field("ERDB token (optional)", text: $erdbToken, hint: "Not required: ERDB works keyless. Only for your own ERDB configurator profile. Stored on this device and synced, encrypted, to your VortX account.", url: false)
                 field("ERDB base URL (optional)", text: $erdbBase, hint: "Leave blank to use easyratingsdb.com. Or set a self-hosted ERDB instance.", url: true)
             }
             .padding(.horizontal, Theme.Space.screenInset)
