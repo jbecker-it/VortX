@@ -4,6 +4,34 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.8 Beta 9 - 2026-06-25 (pre-release)
+
+The account and playback release. Two big steps land here. First, your VortX account now genuinely owns your add-ons, library, and sources, so the app loads them straight from your account and no longer goes empty or traps you when your Stremio session is logged out or slow. Second, Apple TV gets a first-class AVPlayer with the full player chrome, so true Dolby Vision, AirPlay, and Picture-in-Picture play through it on Auto, with the built-in player as a true fallback. Plus trailers play again on iPhone, iPad, and Mac, an Apple TV in-hero trailer on the detail page, posters now served by our own art service, and a batch of fixes. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+
+### Added
+
+- **Your account owns your add-ons, library, and sources.** The app now hydrates them from your VortX account into the engine, so a logged-out or degraded Stremio session no longer shows zero sources and add-ons, and it no longer blocks you from logging out. Your full add-on list is held in your encrypted account, and the first time you import from Stremio it takes a snapshot. New per-category "Mirror from Stremio" toggles let you choose whether your add-ons, library, and Continue Watching stay in step with Stremio; they default off, so VortX keeps its own copy.
+- **A first-class player on Apple TV.** The same player that runs on the other platforms now runs on Apple TV under the full player chrome. On Auto, Dolby Vision and HLS play through it with AirPlay, Picture-in-Picture, and true Dolby Vision, and the built-in player steps in only as a last resort. The old bare Apple TV playback path is gone.
+- **A trailer on the Apple TV detail page.** The detail page now plays a muted trailer in the hero, so you get a moving preview while you decide. (#44)
+- **Posters from our own art service.** The optional poster, backdrop, and logo art now comes from VortX's own service at erdb.vortx.tv instead of a third party. It stays opt-in and you set it up the same way.
+- **A fanart.tv key.** You can add a fanart.tv API key in Settings for richer artwork; it syncs across your devices alongside your TMDB and MDBList keys.
+
+### Fixed
+
+- **Trailers play again on iPhone, iPad, and Mac.** YouTube began requiring a real referrer in July 2025, which silently broke embedded trailers. VortX now serves the embed so a proper referrer reaches YouTube, and trailers play again. Apple TV was never affected.
+- **Your synced TMDB key no longer disappears.** Signing in on another device could blank out the TMDB key you had saved. Synced keys are now merged in rather than overwritten, so the key sticks.
+- **Profile deletes stick across devices.** Deleting a profile could see it reappear after a sync from another device. Deletes are now durable tombstones that survive the merge, so a deleted profile stays gone. Your main account profile is never removed.
+- **A saved magnet reopens the right file.** A saved magnet or playlist now reopens the exact file you saved, instead of fuzzy-matching and landing on the wrong show. (#81)
+- **Apple TV stays audible under Dolby Atmos, and never freezes.** Multichannel audio is now driven by what your output device reports, with a safety net so the video never freezes if an audio route cannot open. A diagnostic log is in place to pin down the precise Atmos fix from an on-device capture. (#78)
+- **Discover keeps paginating past a tricky catalog.** A catalog whose cursor went empty partway through a list (for example MyTraktSync) could stop loading more in Discover; it now keeps paginating. (#95)
+
+### What we're working on now
+
+- The remaining Apple TV audio work: a precise fix for Dolby Atmos that needs an on-device log capture.
+- Carrying the account-owns-everything work the rest of the way, so the library is complete on the account and the same model reaches the dashboard, Android, and desktop.
+- A home-screen hero trailer on Apple TV, and per-rail "load more" on the home screen.
+- More of the in-app player and discovery experience landing on the web and desktop apps.
+
 ## 0.3.8 Beta 8 - 2026-06-25 (pre-release)
 
 The Beta 7 cleanup release. Beta 7 shipped a big playback and discovery wave, and with it a batch of bugs. This release fixes them: the Mac crash, Apple TV playback, the add-on store, the duplicate "Main" profile, the language setting, the invisible buttons, and the trailer. It also makes the seek-bar styles actually come alive and brings the player-engine choice to Apple TV and Mac. In-place update, nothing resets.
