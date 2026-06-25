@@ -11,8 +11,12 @@ import AppKit
 //     `TrailerEmbedCover` below — the same mechanism the official Stremio client uses.
 // The earlier embed attempt (YouTubeWebView / AutoplayTrailerWebView) was removed because it navigated
 // the WKWebView straight TO `youtube.com/embed/<id>` as a top-level document with no controllable
-// origin/Referer, which YouTube rejected with "Error 153". `YouTubeEmbedView` fixes that by hosting the
-// IFrame player via `loadHTMLString(baseURL:)` with a real embedding origin (see that file's header).
+// origin/Referer, which YouTube rejected with "Error 153". A later attempt hosted the IFrame player via
+// `loadHTMLString(baseURL:)`; that also broke once YouTube's July-2025 enforcement began REQUIRING a real
+// network `Referer` (every trailer showed "Error code: 152-4"), because loadHTMLString never sends a
+// Referer for the cross-origin iframe_api/player requests (WebKit bug 169846). `YouTubeEmbedView` now
+// serves the player HTML from a real loaded document via a `WKURLSchemeHandler` and loads it with
+// `webView.load(URLRequest)`, so a youtube.com Referer reaches YouTube (see that file's header).
 // `TrailerOpener` remains the last-resort external hand-off. tvOS keeps the native mpv `/yt` path
 // (no WKWebView there).
 
