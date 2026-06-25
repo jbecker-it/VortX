@@ -165,6 +165,12 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
+        // Back/Menu floor: from any non-Home tab at its root, Menu returns to Home first; only Menu from the
+        // Home root exits to tvOS. A pushed page (DetailView, a Settings sub-screen) has a deeper responder
+        // that consumes Menu and pops one level, so this handler never fires there, preserving per-level pop.
+        // Passing nil on Home removes the handler so the system default (suspend to tvOS) runs; on every other
+        // tab the closure consumes Menu and routes to Home (the .onChange below then resets the tab we left).
+        .onExitCommand(perform: selection == 0 ? nil : { selection = 0 })
         // Automatic update popup on the shell (never over the player, which replaces this view). Appears once
         // per launch when a newer build exists, and again when the hourly re-check finds a still-newer one.
         .sheet(item: $updates.prompt) { release in
