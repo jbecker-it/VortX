@@ -1736,14 +1736,14 @@ private struct PosterCardiOS: View {
                 // retries, the blank-poster cause). scaledToFill inside CachedPosterImage keeps the source
                 // proportions and CROPS to the card, so non-2:3 add-on posters fill cleanly (F37), and a
                 // missing poster falls back to the title's backdrop before a plain film placeholder.
-                CachedPosterImage(url: XRDB.imageURL(id: id, fallback: poster ?? fallbackArt))
+                CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: poster ?? fallbackArt))
                     .frame(width: 120, height: 180)
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                     .overlay(alignment: .topTrailing) {
-                        // When the poster service is on, the rating is baked into the image, so skip the
-                        // native overlay to avoid a double badge.
-                        if let rating = imdbRating, !rating.isEmpty, !XRDB.isEnabled {
+                        // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
+                        // the native overlay to avoid a double badge.
+                        if let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))

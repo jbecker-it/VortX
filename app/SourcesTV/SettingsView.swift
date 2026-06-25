@@ -184,7 +184,7 @@ struct SettingsView: View {
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { XRDBSettingsView() } label: {
-                    Label("Ratings on posters (XRDB)", systemImage: "star.circle")
+                    Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
             }

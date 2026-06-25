@@ -499,7 +499,8 @@ struct iOSDetailView: View {
     /// The title block: the addon-provided logo when present (the editorial signature on the tvOS hero),
     /// otherwise the serif hero type.
     @ViewBuilder private var titleOrLogo: some View {
-        if let logo = meta?.logo, let url = URL(string: logo), !logo.isEmpty {
+        // ERDB serves a rating-baked logo by id when configured; otherwise the add-on's own meta.logo.
+        if let logo = PosterArtwork.logo(id: meta?.id, fallback: meta?.logo), let url = URL(string: logo), !logo.isEmpty {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let img):
@@ -1291,7 +1292,7 @@ struct iOSDetailView: View {
 
     private func moreLikeThisCard(_ item: MetaPreview) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            CachedPosterImage(url: XRDB.imageURL(id: item.id, fallback: item.poster))
+            CachedPosterImage(url: PosterArtwork.poster(id: item.id, fallback: item.poster))
                 .frame(width: 100, height: 150)
                 .clipped()
                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))

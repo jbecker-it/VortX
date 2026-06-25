@@ -60,11 +60,14 @@ struct XRDBSettingsView: View {
     @AppStorage(XRDB.enabledKey) private var enabled = true
     @AppStorage(XRDB.baseKey) private var baseURL = ""
     @AppStorage(XRDB.aliasKey) private var alias = ""
+    @AppStorage(ERDB.enabledKey) private var erdbEnabled = true
+    @AppStorage(ERDB.tokenKey) private var erdbToken = ""
+    @AppStorage(ERDB.baseKey) private var erdbBase = ""
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                Text("Ratings on posters").screenTitleStyle()
+                Text("Poster artwork & ratings").screenTitleStyle()
                 Text("VortX bakes the rating onto your posters using its own service, no setup and no key needed. It is on by default. Advanced: point at your own XRDB-compatible instance (and profile alias) to use richer multi-source artwork instead. Unrelated to debrid.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
@@ -75,6 +78,20 @@ struct XRDBSettingsView: View {
                     .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                 field("Custom instance URL (optional)", text: $baseURL, hint: "Leave blank to use VortX's own service. Or set your own XRDB-compatible endpoint.", url: true)
                 field("Profile alias (optional)", text: $alias, hint: "Only used with a custom instance: the config profile alias from its Configurator.", url: false)
+
+                Text("ERDB (posters + logos)")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("ERDB (easyratingsdb.com) renders posters, backdrops, and rating-baked LOGOS from a single token, and overrides the VortX poster service above when a token is set. Paste your Tk- token from the ERDB configurator. The base URL is only for a self-hosted ERDB instance.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                Toggle("Use ERDB (overrides the above)", isOn: $erdbEnabled)
+                    .tint(Theme.Palette.accent)
+                    .padding(Theme.Space.md)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                field("ERDB token", text: $erdbToken, hint: "Your Tk-… token from the ERDB configurator. Stored on this device and synced, encrypted, to your VortX account.", url: false)
+                field("ERDB base URL (optional)", text: $erdbBase, hint: "Leave blank to use easyratingsdb.com. Or set a self-hosted ERDB instance.", url: true)
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)

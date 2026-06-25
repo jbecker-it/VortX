@@ -228,11 +228,7 @@ struct DetailView: View {
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
                         Spacer().frame(height: 380)
                         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                            Text(m.name)
-                                .font(Theme.Typography.hero).tracking(-1.5)
-                                .foregroundStyle(Theme.Palette.textPrimary)
-                                .lineLimit(2).minimumScaleFactor(0.6)
-                                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                            titleOrLogo(m)
                             metaRow(m)
                             ratingsRow()
                             if let d = m.description, !d.isEmpty {
@@ -257,6 +253,34 @@ struct DetailView: View {
                 .padding(.bottom, Theme.Space.xl)
             }
         }
+    }
+
+    /// The title block: an ERDB rating-baked logo (or the add-on's clearart logo) by id when available,
+    /// otherwise the serif hero title text. Mirrors iOS `iOSDetailView.titleOrLogo`.
+    @ViewBuilder private func titleOrLogo(_ m: CoreMetaItem) -> some View {
+        if let logo = PosterArtwork.logo(id: m.id, fallback: m.logo), let url = URL(string: logo), !logo.isEmpty {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case .success(let img):
+                    img.resizable().aspectRatio(contentMode: .fit)
+                        .frame(maxWidth: 640, maxHeight: 200, alignment: .leading)
+                        .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                        .accessibilityLabel(m.name)
+                default:
+                    heroTitleText(m)
+                }
+            }
+        } else {
+            heroTitleText(m)
+        }
+    }
+
+    private func heroTitleText(_ m: CoreMetaItem) -> some View {
+        Text(m.name)
+            .font(Theme.Typography.hero).tracking(-1.5)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .lineLimit(2).minimumScaleFactor(0.6)
+            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
     }
 
     /// Live channel page: the same full-bleed cinematic backdrop as a movie, but stripped of VOD chrome —

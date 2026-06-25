@@ -215,7 +215,8 @@ struct FeaturedHeroView: View {
     /// The add-on logo when enrichment surfaced one (the editorial signature), else the serif hero
     /// type — mirrors `iOSDetailView.titleOrLogo`.
     @ViewBuilder private func titleOrLogo(_ hero: FeaturedHeroItem) -> some View {
-        if let logo = hero.logo, let url = URL(string: logo), !logo.isEmpty {
+        // ERDB serves a rating-baked logo by id when configured; otherwise the enrichment logo (meta/metahub).
+        if let logo = PosterArtwork.logo(id: hero.id, fallback: hero.logo), let url = URL(string: logo), !logo.isEmpty {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let img):

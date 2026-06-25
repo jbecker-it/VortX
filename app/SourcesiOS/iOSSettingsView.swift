@@ -337,7 +337,7 @@ struct iOSSettingsView: View {
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
-            NavigationLink("Ratings on posters (XRDB)") { XRDBSettingsView() }
+            NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
         }
     }
 
