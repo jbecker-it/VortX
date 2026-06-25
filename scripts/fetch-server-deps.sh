@@ -81,3 +81,9 @@ else
 fi
 
 echo "Done. NodeMobile + server.js + fonts ready. Next: scripts/build-core-xcframework.sh, then 'xcodegen generate' in app/."
+
+# 4) Patch server.js so the /yt/:id trailer route resolves against current
+#    YouTube (the vendored ytdl-core 4.9.0 is dead). Runs AFTER the SHA256
+#    verification above so the upstream-integrity check still validates the
+#    original download. Idempotent: a fresh fetch has no marker so it re-patches.
+bash scripts/patch-server-yt.sh
