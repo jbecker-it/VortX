@@ -50,6 +50,12 @@ struct StremioTVApp: App {
                     UpdateChecker.shared.checkIfStale()
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
+                        // Account-owns-everything: if the engine is degraded (no stream add-on), hydrate the
+                        // VortX account's owned add-ons + library so the lists never read zero on foreground.
+                        // Idempotent + never-zero guarded inside the sync manager.
+                        if CoreBridge.shared.hasNoStreamAddon {
+                            await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        }
                         VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open
                     }
                     VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
@@ -71,6 +77,20 @@ struct StremioTVApp: App {
                 // cold start for the first seconds on device.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                     ProfileStore.shared.bootstrapSync()
+                }
+                // Account-owns-everything launch wiring (additive, fail-soft): hydrate the engine from the
+                // VortX account's owned add-ons when it boots degraded (no stream add-on) so a logged-out /
+                // post-update Apple TV never shows zero, and snapshot-on-import ONCE on an already-synced
+                // device that has add-ons but never anchored ownership (addonsOwnedAt unset). Both no-op
+                // when signed out / unreachable (never-zero guarded inside the manager).
+                Task { @MainActor in
+                    if CoreBridge.shared.hasNoStreamAddon {
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    }
+                    if !CoreBridge.shared.addons.isEmpty,
+                       await VortXSyncManager.shared.ownedAddonsNeverSnapshotted() {
+                        await VortXSyncManager.shared.snapshotOwnedFromEngine()
+                    }
                 }
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }

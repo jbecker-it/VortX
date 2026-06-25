@@ -34,6 +34,11 @@ struct SettingsView: View {
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
+    // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
+    // ON = VortX tracks Stremio (adds and removes) for that category.
+    @AppStorage(MirrorSettings.addonsKey) private var mirrorAddons = false
+    @AppStorage(MirrorSettings.libraryKey) private var mirrorLibrary = false
+    @AppStorage(MirrorSettings.continueWatchingKey) private var mirrorCW = false
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
 
     var body: some View {
@@ -43,6 +48,7 @@ struct SettingsView: View {
                     Text("Settings").screenTitleStyle()
                     profilesSection
                     accountSection
+                    stremioMirrorSection
                     playbackSection
                     streamsSection
                     serverSection
@@ -187,6 +193,29 @@ struct SettingsView: View {
                     Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
+        }
+    }
+
+    // MARK: Stremio mirror
+
+    /// Per-category control of whether VortX mirrors a connected Stremio account. Off (the default) keeps
+    /// a VortX copy of each category so a Stremio removal never removes it from VortX; On makes VortX
+    /// track Stremio (adds and removes) for that category. Hydration always keeps the VortX-owned set
+    /// alive even when signed out of Stremio, independent of these.
+    @ViewBuilder private var stremioMirrorSection: some View {
+        section("Stremio mirror") {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                choiceRow("Mirror add-ons from Stremio", [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorAddons ? "1" : "0" }, set: { mirrorAddons = ($0 == "1") }))
+                choiceRow("Mirror library from Stremio", [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
+                choiceRow("Mirror Continue Watching from Stremio", [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
+                Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()

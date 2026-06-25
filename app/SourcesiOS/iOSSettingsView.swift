@@ -58,6 +58,11 @@ struct iOSSettingsView: View {
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
     @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = true
     @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
+    // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category
+    // and a Stremio removal never removes it from VortX; ON = VortX tracks Stremio for that category.
+    @AppStorage(MirrorSettings.addonsKey) private var mirrorAddons = false
+    @AppStorage(MirrorSettings.libraryKey) private var mirrorLibrary = false
+    @AppStorage(MirrorSettings.continueWatchingKey) private var mirrorCW = false
     /// App-language override ("system" = follow the device). Applied via AppLanguage; needs a relaunch.
     @State private var langSelection: String = AppLanguage.current ?? "system"
     /// Shown after a language pick to offer the relaunch that actually applies it (the localized bundle is
@@ -86,6 +91,7 @@ struct iOSSettingsView: View {
                 profilesSection.listRowBackground(Theme.Palette.surface1)
                 languageSection.listRowBackground(Theme.Palette.surface1)
                 accountSection.listRowBackground(Theme.Palette.surface1)
+                stremioMirrorSection.listRowBackground(Theme.Palette.surface1)
                 playbackSection.listRowBackground(Theme.Palette.surface1)
                 notificationsSection.listRowBackground(Theme.Palette.surface1)
                 streamsSection.listRowBackground(Theme.Palette.surface1)
@@ -338,6 +344,23 @@ struct iOSSettingsView: View {
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
             NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
+        }
+    }
+
+    // MARK: Stremio mirror
+
+    /// Per-category control of whether VortX mirrors a connected Stremio account. Default OFF for all
+    /// three = VortX owns its own add-ons / library / Continue Watching: Stremio removals never remove
+    /// them from VortX. Turn one ON to make VortX track Stremio for that category (adds and removes).
+    @ViewBuilder private var stremioMirrorSection: some View {
+        Section {
+            Toggle("Mirror add-ons from Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
+            Toggle("Mirror library from Stremio", isOn: $mirrorLibrary).tint(Theme.Palette.accent)
+            Toggle("Mirror Continue Watching from Stremio", isOn: $mirrorCW).tint(Theme.Palette.accent)
+        } header: {
+            Text("Stremio mirror")
+        } footer: {
+            Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
         }
     }
 

@@ -134,6 +134,41 @@ final class CoreBridge: ObservableObject {
         }
     }
 
+    /// True when the engine has NO stream-capable add-on installed (every title would report "no
+    /// sources"). The account-owns-everything hydration targets exactly this condition. Extracted from
+    /// `scheduleSessionRepair`'s inline test so launch / scenePhase / sync can share it.
+    var hasNoStreamAddon: Bool { !addons.contains { $0.providesStreams } }
+
+    /// The raw installed add-on descriptors the engine currently holds (the exact `{transportUrl,
+    /// manifest, flags}` objects kept for round-tripping), so the sync layer can snapshot the full
+    /// descriptor set into the VortX account doc for network-free re-hydration. Account/engine add-on
+    /// set only; never a per-profile overlay.
+    func rawAddonDescriptors() -> [[String: Any]] {
+        Array(rawAddonsByUrl.values)
+    }
+
+    /// Install the VortX account's owned add-ons back INTO the engine, but ONLY descriptors the engine
+    /// lacks (idempotent). This is the load-bearing "account owns everything" capability: it lets a
+    /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
+    ///
+    /// Uses the EXACT `InstallAddon` descriptor shape `installAddon` sends (`{transportUrl, manifest,
+    /// flags}`, camelCase) — the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
+    /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
+    /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
+    /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
+    func hydrateAddonsFromAccount(_ owned: [VortXOwnedAddon]) {
+        guard !owned.isEmpty else { return }
+        let installed = Set(addons.map(\.transportUrl)) .union(rawAddonsByUrl.keys)
+        var installedCount = 0
+        for addon in owned where !installed.contains(addon.transportUrl) {
+            dispatchCtx(["action": "InstallAddon", "args": addon.installDescriptor])
+            installedCount += 1
+        }
+        if installedCount > 0 {
+            NSLog("[CoreBridge] hydrated \(installedCount) account-owned add-on(s) into the engine (no Stremio session needed)")
+        }
+    }
+
     /// stremio-core's storage schema version, a smoke check that the FFI is wired end-to-end.
     var schemaVersion: UInt32 { stremiox_core_schema_version() }
 
@@ -151,6 +186,15 @@ final class CoreBridge: ObservableObject {
         }
         guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
             NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
+            // Account-owns-everything: with no Stremio session, hydrate the VortX account's owned add-ons
+            // back into the engine BEFORE loading the board, so a logged-out device shows the account's
+            // add-ons + sources instead of only Cinemeta. Idempotent + never-zero guarded inside the sync
+            // manager (a failed/empty account pull does nothing). loadBoard runs once hydration kicks the
+            // ctx event, and again here so a no-account-doc device still gets the default browsable Home.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                self.loadBoard()
+            }
             // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
             // profile) so a signed-out Home is a real, browsable landing screen — backdrop hero + rails
             // — not an empty "please sign in" page. Discover already loads signed-out; Home should too.
@@ -176,14 +220,32 @@ final class CoreBridge: ObservableObject {
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-            guard let self, !self.switchInFlight, !self.awaitingAuthMigration,
-                  let key = Keychain.string(self.activeTokenAccount), !key.isEmpty else { return }
+            guard let self, !self.switchInFlight, !self.awaitingAuthMigration else { return }
             let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
             let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
-            let noStreamAddon = !self.addons.contains { $0.providesStreams }
+            let noStreamAddon = self.hasNoStreamAddon
             guard noAccountData || noStreamAddon else { return }
-            NSLog("[CoreBridge] signed in but \(noStreamAddon ? "engine has no stream add-on" : "no account data arrived") — re-authenticating with the stored token to re-pull add-ons + library")
-            self.switchAccount(token: key)
+            let key = Keychain.string(self.activeTokenAccount)
+            let hasStremioToken = (key?.isEmpty == false)
+            // Account-owns-everything: hydrate the VortX account's owned add-ons + recover the owner
+            // library FIRST, regardless of whether a Stremio token exists. Idempotent + never-zero
+            // guarded inside the sync manager (a failed/empty account pull does nothing), so it can
+            // never make things worse. This is what fixes "post-update: 0 sources / 0 add-ons" on a
+            // genuinely-logged-out or degraded device.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                // When a Stremio token still exists, also re-establish that session so the live Stremio
+                // pull reconciles on top of the hydrated floor (no zero window: the doc hydrated first).
+                // When there is NO usable token (genuinely logged out), the doc hydration is the whole
+                // recovery — never call switchAccount with an empty token.
+                if hasStremioToken, let key {
+                    NSLog("[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                    self.switchAccount(token: key)
+                } else {
+                    NSLog("[CoreBridge] degraded session with no Stremio token — recovered from the VortX account doc")
+                    self.loadBoard()
+                }
+            }
         }
     }
 

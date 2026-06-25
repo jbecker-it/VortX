@@ -584,3 +584,69 @@ struct CoreLibraryRequest: Codable, Hashable {
     let sort: String
     let page: Int
 }
+
+// MARK: - VortX account-owned add-on (sync doc)
+
+/// A full add-on descriptor the VortX account OWNS, stored plaintext in `doc.vortx.addons` so the
+/// engine can be re-hydrated network-free when a Stremio session is absent/degraded (the "0 sources /
+/// 0 add-ons" fix). The shape mirrors the engine's `InstallAddon` descriptor (`{transportUrl, manifest,
+/// flags}`) so a re-dispatch is byte-shape-exact, plus `name` for the dashboard. `manifest`/`flags`
+/// are kept as opaque JSON passthrough so the descriptor round-trips into the engine unchanged without
+/// this layer needing to model the whole Stremio manifest schema. Only descriptors enter the doc (the
+/// Stremio token stays Keychain-only); these already ride `doc.addons` + `apiKeys` E2E today.
+struct VortXOwnedAddon {
+    let transportUrl: String
+    let name: String
+    let manifest: [String: Any]   // opaque passthrough, re-dispatched verbatim to the engine
+    let flags: [String: Any]?
+
+    /// Build from one `doc.vortx.addons` (or `doc.addons`) entry. Tolerates the legacy
+    /// `{transportUrl,name}`-only shape (manifest absent) by skipping it: without a manifest the engine
+    /// cannot InstallAddon, so it is not hydratable and is dropped rather than dispatched as a no-op.
+    init?(json: [String: Any]) {
+        guard let url = json["transportUrl"] as? String, !url.isEmpty,
+              let manifest = json["manifest"] as? [String: Any] else { return nil }
+        self.transportUrl = url
+        self.manifest = manifest
+        self.flags = json["flags"] as? [String: Any]
+        self.name = (json["name"] as? String) ?? (manifest["name"] as? String) ?? url
+    }
+
+    /// The exact `InstallAddon` descriptor the engine expects (`installAddon` sends the same shape).
+    /// Keys are camelCase to match the engine's serde contract; a lowercase-key mismatch silently
+    /// no-ops in the engine, so this MUST stay aligned with CoreBridge.installAddon.
+    var installDescriptor: [String: Any] {
+        var d: [String: Any] = ["transportUrl": transportUrl, "manifest": manifest]
+        d["flags"] = flags ?? ["official": false, "protected": false]
+        return d
+    }
+}
+
+// MARK: - Stremio mirror settings (owner-requested per-category control)
+
+/// Per-category control of whether VortX mirrors a live Stremio account.
+///
+/// DEFAULT OFF for every category = the FLOOR: VortX owns the category. Snapshot-on-import seeds it
+/// once, hydrate-from-doc keeps it alive, and a Stremio removal NEVER removes it from VortX.
+///
+/// ON = EXACT MIRROR for that category: on a SUCCESSFUL Stremio reconcile the VortX-owned set for the
+/// category is replaced to match the live Stremio set (adds AND removes tracked).
+///
+/// The never-zero guard is independent of these toggles: a failed/absent/empty Stremio pull is ignored
+/// and never zeroes a category. Hydrate-from-doc is also NOT gated by the toggles. The toggles only
+/// control the snapshot/mirror DIRECTION (Stremio -> VortX) and whether Stremio removals propagate.
+///
+/// Stored in UserDefaults so the flags ride the SettingsBackup blob (doc.settings) and sync across
+/// devices.
+enum MirrorSettings {
+    static let addonsKey = "stremiox.sync.mirror.addons"
+    static let libraryKey = "stremiox.sync.mirror.library"
+    static let continueWatchingKey = "stremiox.sync.mirror.cw"
+
+    /// Mirror add-ons from Stremio (default OFF = VortX keeps its own add-on set).
+    static var mirrorAddons: Bool { UserDefaults.standard.bool(forKey: addonsKey) }
+    /// Mirror library from Stremio (default OFF = VortX keeps its own library).
+    static var mirrorLibrary: Bool { UserDefaults.standard.bool(forKey: libraryKey) }
+    /// Mirror Continue Watching from Stremio (default OFF = VortX keeps its own CW).
+    static var mirrorContinueWatching: Bool { UserDefaults.standard.bool(forKey: continueWatchingKey) }
+}

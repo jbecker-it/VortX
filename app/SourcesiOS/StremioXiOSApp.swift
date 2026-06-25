@@ -56,6 +56,12 @@ struct StremioXiOSApp: App {
                         UpdateChecker.shared.checkIfStale()
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
+                            // Account-owns-everything: if the engine is degraded (no stream add-on),
+                            // hydrate the VortX account's owned add-ons + library so the lists never read
+                            // zero on foreground. Idempotent + never-zero guarded inside the sync manager.
+                            if CoreBridge.shared.hasNoStreamAddon {
+                                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                            }
                             VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open, not only on background
                         }
                         VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
@@ -70,6 +76,21 @@ struct StremioXiOSApp: App {
                         ProfileStore.shared.bootstrapSync()
                     }
                     if core.library == nil { core.loadLibrary() }   // so the F5 sweep below has data to work with
+                    // Account-owns-everything launch wiring (additive, fail-soft):
+                    //  - hydrate the engine from the VortX account's owned add-ons when it boots degraded
+                    //    (no stream add-on), so a logged-out / post-update device never shows zero;
+                    //  - snapshot-on-import ONCE on an already-synced device that has add-ons but has never
+                    //    anchored ownership (addonsOwnedAt unset), so existing users get auto-migrated.
+                    // Both are no-ops when signed out / unreachable (never-zero guarded inside the manager).
+                    Task { @MainActor in
+                        if CoreBridge.shared.hasNoStreamAddon {
+                            await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        }
+                        if !CoreBridge.shared.addons.isEmpty,
+                           await VortXSyncManager.shared.ownedAddonsNeverSnapshotted() {
+                            await VortXSyncManager.shared.snapshotOwnedFromEngine()
+                        }
+                    }
                 }
                 .task(id: core.library?.catalog.count ?? 0) {
                     // F5 library-wide sweep: once the library is loaded, schedule the next-episode alert for

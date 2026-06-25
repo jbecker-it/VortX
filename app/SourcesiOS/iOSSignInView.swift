@@ -60,6 +60,14 @@ struct iOSSignInView: View {
             guard signedIn, !didHandleSignIn else { return }
             didHandleSignIn = true
             core.signedInWithLegacyAuthKey()
+            // Account-owns-everything snapshot-on-import: once the engine has finished pulling this
+            // Stremio account's add-ons, snapshot the full descriptor set into the VortX account doc so
+            // the account OWNS them (and they hydrate later even with no live Stremio session). Delayed so
+            // the engine's PullAddonsFromAPI has landed; no-op (never-zero guarded) if the engine is still
+            // empty or the VortX account is signed out / unreachable.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                Task { @MainActor in await VortXSyncManager.shared.snapshotOwnedFromEngine() }
+            }
             dismiss()
         }
     }

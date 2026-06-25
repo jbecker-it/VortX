@@ -249,7 +249,11 @@ final class VortXSyncManager: ObservableObject {
 
     /// A small JSON view of local state the website dashboard can read (the binary-plist `settings`
     /// blob is opaque to a browser). Profiles let the dashboard show the family roster + the real count.
-    private func vortxSummary() -> [String: Any] {
+    /// `existingVortx` is the `doc["vortx"]` just pulled from the account (nil on a fresh/empty doc). It
+    /// is used for the READ-SIDE UNION GUARD: a momentarily-degraded engine (no add-ons / empty library)
+    /// must never SHRINK the account-owned set on push. Mirrors the existing roster-union and apiKeys
+    /// read-merge guards.
+    private func vortxSummary(existingVortx: [String: Any]? = nil) -> [String: Any] {
         let store = ProfileStore.shared
         let profiles: [[String: Any]] = store.profiles.map { p in
             // pinHash is the salted SHA-256 (salt = the profile id, already here), never the raw PIN,
@@ -300,22 +304,78 @@ final class VortXSyncManager: ObservableObject {
         // from the dashboard, which only received the byProfile overlay libraries above. Emit it as
         // vortx.library from the engine's account library so the dashboard's main-profile Library is
         // populated (excluding removed/temp, which are not "in the library"). Safe here: this type is
-        // @MainActor, so reading CoreBridge's @Published state is on the main actor.
-        let ownerLibrary: [[String: Any]] = (CoreBridge.shared.library?.catalog ?? [])
+        // @MainActor, so reading CoreBridge's @Published state is on the main actor. Enriched with
+        // `lastWatched`+`videoId` (Step 4) so another device can rebuild CW resume, not just membership.
+        let engineLibrary: [[String: Any]] = (CoreBridge.shared.library?.catalog ?? [])
             .filter { !($0.removed ?? false) && !($0.temp ?? false) }
             .map { item in
                 ["id": item.id, "name": item.name, "type": item.type, "poster": item.poster ?? "",
-                 "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000)]
+                 "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000),
+                 "v": item.state.videoId ?? ""]
             }
-        // Installed add-ons, so the dashboard Add-ons page is populated: it reads vortx.addons (and the
-        // web Stremio import under doc.addons), neither of which the app emitted before.
-        let addonList: [[String: Any]] = CoreBridge.shared.addons.map { desc in
-            ["transportUrl": desc.transportUrl, "name": desc.manifest.name]
+        // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle (same
+        // shape as the add-on guard). FLOOR (OFF, default) = UNION the account's already-owned
+        // `doc.vortx.library` with the engine library, so a Stremio removal never removes from VortX and
+        // an empty/degraded engine can never SHRINK it. The `mirror CW` toggle, when OFF, is what keeps a
+        // prior in-progress item's t/d from being zeroed by a Stremio drop (the union preserves it).
+        // MIRROR (ON) = REPLACE: the engine (live Stremio set) is authoritative so removals propagate.
+        // NEVER-ZERO: REPLACE only when the engine library is non-empty; otherwise fall back to UNION.
+        var libraryByID: [String: [String: Any]] = [:]
+        let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty
+        if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
+            for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
+        for entry in engineLibrary { if let id = entry["id"] as? String { libraryByID[id] = entry } }
+        let ownerLibrary = Array(libraryByID.values)
+        // Installed add-ons, so the dashboard Add-ons page is populated AND the account can re-hydrate
+        // the engine network-free. We now emit the FULL descriptor `{transportUrl, name, manifest,
+        // flags}` (Step 2) instead of the old `{transportUrl, name}`: hydration needs the manifest +
+        // flags to InstallAddon without a fetch. dash-ui keeps reading transportUrl/name (extra keys are
+        // additive and ignored). The Stremio token never enters this; only descriptors do (they already
+        // ride doc.addons + apiKeys E2E today).
+        let engineAddons: [[String: Any]] = CoreBridge.shared.rawAddonDescriptors().compactMap { raw in
+            guard let url = raw["transportUrl"] as? String, !url.isEmpty else { return nil }
+            var entry = raw
+            // The dashboard reads `name`; lift it out of the manifest so the old summary shape is a subset.
+            if entry["name"] == nil, let manifest = raw["manifest"] as? [String: Any], let n = manifest["name"] as? String {
+                entry["name"] = n
+            }
+            return entry
+        }
+        // READ-SIDE GUARD on the owned add-on set. Two modes, decided per the owner's per-category
+        // "Mirror add-ons from Stremio" toggle:
+        //   FLOOR (toggle OFF, the default) = UNION: union the live engine descriptors with the account's
+        //   already-owned `doc.vortx.addons` by transportUrl, so a Stremio removal NEVER removes from VortX
+        //   and a degraded engine can never SHRINK the owned set.
+        //   MIRROR (toggle ON) = REPLACE: the engine (which reflects the live Stremio set after a pull) is
+        //   authoritative, so a Stremio removal propagates (adds AND removes tracked).
+        // NEVER-ZERO, independent of the toggle: REPLACE only applies when the engine actually has a
+        // non-empty add-on set; a degraded/empty engine falls back to UNION so a failed pull can never
+        // zero the category. Engine entries win on conflict in both modes (freshest descriptor).
+        var addonsByUrl: [String: [String: Any]] = [:]
+        let mirrorReplaceAddons = MirrorSettings.mirrorAddons && !engineAddons.isEmpty
+        if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
+            for entry in prior { if let url = entry["transportUrl"] as? String, !url.isEmpty { addonsByUrl[url] = entry } }
+        }
+        for entry in engineAddons { if let url = entry["transportUrl"] as? String { addonsByUrl[url] = entry } }
+        let addonList = Array(addonsByUrl.values)
+
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
         if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
-        if !addonList.isEmpty { v["addons"] = addonList }
+        if !addonList.isEmpty {
+            v["addons"] = addonList
+            // addonsOwnedAt distinguishes "owns an empty set" from "never snapshotted". Set ONCE, the
+            // first time a non-empty owned set is written; preserved verbatim thereafter (carried from the
+            // pulled doc), so it anchors ownership age without being reset on every push.
+            if let priorOwnedAt = existingVortx?["addonsOwnedAt"] {
+                v["addonsOwnedAt"] = priorOwnedAt
+            } else {
+                v["addonsOwnedAt"] = Int(Date().timeIntervalSince1970 * 1000)
+            }
+        } else if let priorOwnedAt = existingVortx?["addonsOwnedAt"] {
+            v["addonsOwnedAt"] = priorOwnedAt   // never lose the anchor even on an empty push
+        }
         if let active = store.activeID { v["activeProfile"] = active.uuidString }
         // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
         // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
@@ -364,7 +424,9 @@ final class VortXSyncManager: ObservableObject {
         guard let data = try? SettingsBackup.makeBackup() else { return false }
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
-        doc["vortx"] = vortxSummary()   // JSON the dashboard can read (profiles, active selection)
+        // Pass the PULLED vortx block so vortxSummary can union the account-owned add-on set (never
+        // shrink it from a degraded engine) and preserve addonsOwnedAt.
+        doc["vortx"] = vortxSummary(existingVortx: doc["vortx"] as? [String: Any])
         // READ-MERGE, never wholesale-rebuild. Start from the PULLED apiKeys and only SET the keys this
         // device actually holds; never DELETE a key this device did not author. A device without a TMDB
         // key (or with no keys at all) used to drop the whole object on push, and because pushes version
@@ -491,6 +553,98 @@ final class VortXSyncManager: ObservableObject {
         }
         lastSyncedVersion = max(lastSyncedVersion, pulled.version)
         return restored
+    }
+
+    // MARK: - Account owns everything (hydrate-from-doc + snapshot-on-import)
+
+    /// Hydrate the engine from the VortX account's OWNED add-ons + recover the owner library, so a
+    /// logged-out / degraded Stremio session shows the account's add-ons + sources + library instead of
+    /// zero (the "post-update: 0 sources / 0 add-ons" fix). This is the load-bearing new capability.
+    ///
+    /// NEVER-ZERO INVARIANT: a `.failed` or `.empty` account pull does NOTHING (we never hydrate-then-
+    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles — the VortX-owned
+    /// set always hydrates when the engine is empty/degraded; the toggles only control the snapshot
+    /// DIRECTION (Stremio -> VortX), not the floor.
+    ///
+    /// Owned add-ons = `doc.vortx.addons` UNION `doc.addons` (the website Stremio import) by transportUrl.
+    /// Hydration installs only descriptors the engine lacks (idempotent). Library recovery is gated to
+    /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
+    func hydrateEngineFromOwnedAddons() async {
+        guard isSignedIn else { return }
+        guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
+        let owned = Self.ownedAddons(from: doc)
+        if !owned.isEmpty {
+            CoreBridge.shared.hydrateAddonsFromAccount(owned)
+        }
+        await recoverOwnerLibraryIfEmpty(from: doc)
+    }
+
+    /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
+    /// full descriptors) UNIONed with `doc.addons` (the website's Stremio import) by transportUrl.
+    /// vortx.addons wins on conflict (it carries the freshest app descriptor). Legacy `{transportUrl,
+    /// name}`-only entries (no manifest) are dropped: without a manifest the engine cannot InstallAddon.
+    static func ownedAddons(from doc: [String: Any]) -> [VortXOwnedAddon] {
+        var byUrl: [String: VortXOwnedAddon] = [:]
+        // doc.addons (web import) first, so doc.vortx.addons can overwrite with the richer app descriptor.
+        if let webAddons = doc["addons"] as? [[String: Any]] {
+            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { byUrl[a.transportUrl] = a } }
+        }
+        if let vortx = doc["vortx"] as? [String: Any], let appAddons = vortx["addons"] as? [[String: Any]] {
+            for raw in appAddons { if let a = VortXOwnedAddon(json: raw) { byUrl[a.transportUrl] = a } }
+        }
+        return Array(byUrl.values)
+    }
+
+    /// Rebuild the OWNER (account) library on a cold Stremio-less device, ONLY when the engine's account
+    /// library is empty AND the account doc owns one. Goes exclusively through the engine
+    /// `AddToLibrary`/`addCatalogItemToAccount` path (real Cinemeta meta = schema-safe). NEVER writes app
+    /// data into a libraryItem doc (the poisoned-account incident). Owner-profile semantics only: items
+    /// land in the account library, which is the owner profile's history.
+    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any]) async {
+        guard let vortx = doc["vortx"] as? [String: Any] else { return }
+        // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
+        let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
+        guard !ownedLibrary.isEmpty else { return }
+        // Only recover when the engine's account library is genuinely empty (a fresh / cold device).
+        let engineLibrary = CoreBridge.shared.library?.catalog ?? []
+        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
+        guard !engineHasLibrary else { return }
+        var recovered = 0
+        for item in ownedLibrary {
+            guard let id = item["id"] as? String, !id.isEmpty,
+                  // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
+                  id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
+            let type = (item["type"] as? String) == "series" ? "series" : "movie"
+            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type)
+            recovered += 1
+        }
+        if recovered > 0 {
+            DiagnosticsLog.log("sync", "recovered \(recovered) owner-library title(s) from the VortX account on a cold device")
+        }
+    }
+
+    /// Snapshot the engine's CURRENT add-ons (full descriptors) into the account doc, anchoring
+    /// ownership on Stremio sign-in (and once on an already-synced launch when addonsOwnedAt is unset).
+    /// UNION-not-shrink with the never-zero guard: only runs when the engine actually has add-ons, and a
+    /// `.failed` account pull aborts (never clobbers the account doc). The add-on union + addonsOwnedAt
+    /// are handled by vortxSummary's read-side guard; this just forces a push so the snapshot lands.
+    func snapshotOwnedFromEngine() async {
+        guard isSignedIn else { return }
+        guard !CoreBridge.shared.addons.isEmpty else { return }   // never-zero: nothing to anchor
+        // Confirm the account doc is reachable before pushing (a .failed pull means a degraded network:
+        // syncUp's own guard would already abort, but checking here avoids a wasted makeBackup).
+        if case .failed = await pullSyncDocResult() { return }
+        await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
+    }
+
+    /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an
+    /// already-synced launch can snapshot-on-import exactly once. A `.failed`/`.empty` pull returns false
+    /// (nothing to do / no doc), so we never snapshot before the account is reachable.
+    func ownedAddonsNeverSnapshotted() async -> Bool {
+        guard isSignedIn else { return false }
+        guard case let .doc(doc) = await pullSyncDocResult() else { return false }
+        let vortx = doc["vortx"] as? [String: Any]
+        return vortx?["addonsOwnedAt"] == nil
     }
 
     // MARK: - Reconciliation (no blind last-writer-wins)
