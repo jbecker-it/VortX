@@ -121,10 +121,10 @@ struct iOSSettingsView: View {
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in
                 switch result {
                 case .success:
-                    backupAlert = BackupAlert(title: "Backup Saved",
-                        message: "Keep this file safe. Restore it in VortX to bring your settings across.")
+                    backupAlert = BackupAlert(title: String(localized: "Backup Saved"),
+                        message: String(localized: "Keep this file safe. Restore it in VortX to bring your settings across."))
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Backup Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Backup Failed"), message: error.localizedDescription)
                 }
             }
             .fileImporter(isPresented: $showBackupImporter, allowedContentTypes: [.json]) { result in
@@ -134,13 +134,13 @@ struct iOSSettingsView: View {
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let count = try SettingsBackup.restore(from: try Data(contentsOf: url))
-                        backupAlert = BackupAlert(title: "Restore Complete",
+                        backupAlert = BackupAlert(title: String(localized: "Restore Complete"),
                             message: "\(count) settings restored. Relaunch the app to apply everything.")
                     } catch {
-                        backupAlert = BackupAlert(title: "Restore Failed", message: error.localizedDescription)
+                        backupAlert = BackupAlert(title: String(localized: "Restore Failed"), message: error.localizedDescription)
                     }
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Restore Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Restore Failed"), message: error.localizedDescription)
                 }
             }
             .fileExporter(isPresented: $showLibraryExporter, document: libraryDocument,
@@ -148,10 +148,10 @@ struct iOSSettingsView: View {
                           defaultFilename: LibraryPortability.defaultFilename(profile: profiles.active?.name ?? "Library")) { result in
                 switch result {
                 case .success:
-                    backupAlert = BackupAlert(title: "Library Exported",
-                        message: "Saved this profile's titles and watch history. Import it on another device or into another profile.")
+                    backupAlert = BackupAlert(title: String(localized: "Library Exported"),
+                        message: String(localized: "Saved this profile's titles and watch history. Import it on another device or into another profile."))
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Export Failed"), message: error.localizedDescription)
                 }
             }
             .fileImporter(isPresented: $showLibraryImporter, allowedContentTypes: [.json]) { result in
@@ -161,20 +161,20 @@ struct iOSSettingsView: View {
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let items = try LibraryPortability.decode(from: try Data(contentsOf: url))
-                        let target = profiles.active?.name ?? "this profile"
+                        let target = profiles.active?.name ?? String(localized: "this profile")
                         Task {
                             let result = await profiles.importLibraryItems(items)
                             var message = "\(result.applied) \(result.applied == 1 ? "title" : "titles") added to \(target)."
                             if result.skipped > 0 {
                                 message += " \(result.skipped) \(result.skipped == 1 ? "title was" : "titles were") skipped: only standard catalog titles can be added to the main profile's account library."
                             }
-                            backupAlert = BackupAlert(title: "Library Imported", message: message)
+                            backupAlert = BackupAlert(title: String(localized: "Library Imported"), message: message)
                         }
                     } catch {
-                        backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
+                        backupAlert = BackupAlert(title: String(localized: "Import Failed"), message: error.localizedDescription)
                     }
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Import Failed"), message: error.localizedDescription)
                 }
             }
             .alert(item: $backupAlert) { info in
@@ -328,7 +328,7 @@ struct iOSSettingsView: View {
             NavigationLink("VortX account & sync") { SyncSettingsView() }
             if account.isSignedIn {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(account.email ?? "Signed in")
+                    Text(account.email ?? String(localized: "Signed in"))
                     Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -421,8 +421,8 @@ struct iOSSettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Text(PlaybackSettings.directLinksOnlyForced
-                     ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
-                     : "Hide torrent and magnet sources. Only direct and debrid links will play.")
+                     ? String(localized: "This build does not bundle the torrent engine. Only direct and debrid links can play.")
+                     : String(localized: "Hide torrent and magnet sources. Only direct and debrid links will play."))
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 if !installedExternalPlayers.isEmpty {
@@ -558,8 +558,8 @@ struct iOSSettingsView: View {
                 #endif
             Toggle("Match words as regex", isOn: $sourcePrefs.keywordsAreRegex).tint(Theme.Palette.accent)
             Text(sourcePrefs.keywordsAreRegex
-                 ? "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored."
-                 : "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns.")
+                 ? String(localized: "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored.")
+                 : String(localized: "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns."))
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Instant sources only", isOn: $sourcePrefs.instantOnly).tint(Theme.Palette.accent)
             Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
@@ -673,8 +673,8 @@ struct iOSSettingsView: View {
         } footer: {
             if effectiveDirectLinksOnly {
                 Text(PlaybackSettings.directLinksOnlyForced
-                     ? "This build does not bundle the streaming server."
-                     : "Direct Links Only is enabled, so torrent streaming and server configuration are inactive.")
+                     ? String(localized: "This build does not bundle the streaming server.")
+                     : String(localized: "Direct Links Only is enabled, so torrent streaming and server configuration are inactive."))
             }
         }
     }
@@ -742,18 +742,18 @@ struct iOSSettingsView: View {
         }
     }
     private var serverText: String {
-        if effectiveDirectLinksOnly { return "Disabled by Direct Links Only" }
+        if effectiveDirectLinksOnly { return String(localized: "Disabled by Direct Links Only") }
         switch serverOnline {
-        case .some(true): return "Online"
-        case .some(false): return "Offline"
-        default: return "Checking…"
+        case .some(true): return String(localized: "Online")
+        case .some(false): return String(localized: "Offline")
+        default: return String(localized: "Checking…")
         }
     }
     private var serverBadgeText: String {
         if effectiveDirectLinksOnly {
-            return PlaybackSettings.directLinksOnlyForced ? "NOT BUNDLED" : "DISABLED"
+            return PlaybackSettings.directLinksOnlyForced ? String(localized: "NOT BUNDLED") : String(localized: "DISABLED")
         }
-        return StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"
+        return StremioServer.isCustom ? String(localized: "CUSTOM") : String(localized: "EMBEDDED")
     }
 
     // MARK: Appearance
@@ -903,7 +903,7 @@ struct iOSSettingsView: View {
                     backupDocument = BackupDocument(data: try SettingsBackup.makeBackup())
                     showBackupExporter = true
                 } catch {
-                    backupAlert = BackupAlert(title: "Backup Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Backup Failed"), message: error.localizedDescription)
                 }
             } label: {
                 Label("Create Backup", systemImage: "arrow.up.doc")
@@ -936,8 +936,8 @@ struct iOSSettingsView: View {
     private func exportActiveLibrary() {
         let items = profiles.exportActiveLibraryItems()
         guard !items.isEmpty else {
-            backupAlert = BackupAlert(title: "Nothing to Export",
-                message: "This profile has no saved titles or watch history yet.")
+            backupAlert = BackupAlert(title: String(localized: "Nothing to Export"),
+                message: String(localized: "This profile has no saved titles or watch history yet."))
             return
         }
         do {
@@ -945,7 +945,7 @@ struct iOSSettingsView: View {
             libraryDocument = BackupDocument(data: data)
             showLibraryExporter = true
         } catch {
-            backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
+            backupAlert = BackupAlert(title: String(localized: "Export Failed"), message: error.localizedDescription)
         }
     }
 
@@ -962,7 +962,7 @@ struct iOSSettingsView: View {
                 }
             }
             LabeledContent("Version", value: appVersion)
-            LabeledContent("Player", value: "libmpv · MPVKit")
+            LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
         }
     }
 
@@ -1044,7 +1044,7 @@ private struct ServerLogView: View {
                     UIPasteboard.general.string = status + "\n\n" + lines.joined(separator: "\n")
                     copied = true
                 } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    Label(copied ? String(localized: "Copied") : String(localized: "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
                 }
             }
         }

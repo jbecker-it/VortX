@@ -148,7 +148,7 @@ struct SettingsView: View {
     // MARK: Account
 
     @ViewBuilder private var accountSection: some View {
-        section("Account") {
+        section(String(localized: "Account")) {
             // The whole account block is one focus section so Down keeps stepping DOWN through its
             // stacked rows instead of leaving after the first hit. Every focusable row (including the
             // Log Out button below) is left-aligned and full-width, so the spatial focus engine's
@@ -219,13 +219,13 @@ struct SettingsView: View {
     /// track Stremio (adds and removes) for that category. Hydration always keeps the VortX-owned set
     /// alive even when signed out of Stremio, independent of these.
     @ViewBuilder private var stremioMirrorSection: some View {
-        section("Stremio mirror") {
+        section(String(localized: "Stremio mirror")) {
             VStack(alignment: .leading, spacing: Theme.Space.md) {
-                choiceRow("Mirror add-ons from Stremio", [("0", "Off"), ("1", "On")],
+                choiceRow(String(localized: "Mirror add-ons from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorAddons ? "1" : "0" }, set: { mirrorAddons = ($0 == "1") }))
-                choiceRow("Mirror library from Stremio", [("0", "Off"), ("1", "On")],
+                choiceRow(String(localized: "Mirror library from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
-                choiceRow("Mirror Continue Watching from Stremio", [("0", "Off"), ("1", "On")],
+                choiceRow(String(localized: "Mirror Continue Watching from Stremio"), [("0", "Off"), ("1", "On")],
                           selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
                 Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -249,19 +249,19 @@ struct SettingsView: View {
                 }
                 .buttonStyle(RowFocusStyle())
             }
-            choiceRow("Audio output", AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
+            choiceRow(String(localized: "Audio output"), AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow("Video upscaling", VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
+            choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow("Player engine", PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
+            choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
             Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
-            choiceRow("Auto-skip intro & credits", [("0", "Off"), ("1", "On")],
+            choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
+            choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
-            choiceRow("Play in", externalPlayerChoices, selection: $defaultExternalPlayer)
+            choiceRow(String(localized: "Play in"), externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             NavigationLink { SeekBarStylePicker() } label: {
@@ -409,7 +409,7 @@ struct SettingsView: View {
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("App Language", appLanguageOptions, selection: Binding(
+            choiceRow(String(localized: "App Language"), appLanguageOptions, selection: Binding(
                 get: { langSelection },
                 set: { newValue in
                     langSelection = newValue
@@ -419,23 +419,23 @@ struct SettingsView: View {
             Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("Show Live TV tab", [("1", "Show"), ("0", "Hide")],
+            choiceRow(String(localized: "Show Live TV tab"), [("1", "Show"), ("0", "Hide")],
                       selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
             Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("Dolby Vision / HDR", [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
+            choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
             Text("Auto tone-maps HDR and Dolby Vision to SDR only on a TV that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple on your TV; Always HDR forces pass-through.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            stepperRow("App text size", value: theme.textScale,
+            stepperRow(String(localized: "App text size"), value: theme.textScale,
                        range: ThemeManager.textScaleRange,
                        onMinus: { theme.adjustTextScale(-1) },
                        onPlus: { theme.adjustTextScale(1) })
             Text("Makes every screen's text larger or smaller. Changes apply instantly.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("Performance", [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
+            choiceRow(String(localized: "Performance"), [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
             Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
@@ -515,7 +515,7 @@ struct SettingsView: View {
                 Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
-            choiceRow("Safety filter", [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
+            choiceRow(String(localized: "Safety filter"), [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
             Text(sourcePrefs.keywordsAreRegex
                  ? "Hides CAM and fake-quality sources. Hide / Require words are case-insensitive regex patterns (an invalid pattern is ignored)."
                  : "Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
@@ -534,7 +534,7 @@ struct SettingsView: View {
             }
             .toggleStyle(.switch)
             .tint(Theme.Palette.accent)
-            choiceRow("Max file size",
+            choiceRow(String(localized: "Max file size"),
                       [(0.0, "Off"), (2.0, "2 GB"), (5.0, "5 GB"), (10.0, "10 GB"),
                        (15.0, "15 GB"), (20.0, "20 GB"), (30.0, "30 GB"), (50.0, "50 GB")],
                       selection: $sourcePrefs.maxFileSizeGB)
@@ -547,9 +547,9 @@ struct SettingsView: View {
 
     private var audioSubtitleSection: some View {
         section("Audio & Subtitles") {
-            choiceRow("Audio language", TrackPreferences.commonLanguages, selection: $prefAudioLang)
-            choiceRow("Subtitle language", TrackPreferences.commonLanguages, selection: $prefSubLang)
-            choiceRow("Subtitles", TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
+            choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: $prefAudioLang)
+            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: $prefSubLang)
+            choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
             Text("The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
@@ -559,13 +559,13 @@ struct SettingsView: View {
 
     private var subtitleSection: some View {
         section("Subtitle Style") {
-            choiceRow("Font", SubtitleStyle.fonts.map { ($0.id, $0.label) }, selection: $subFont)
-            choiceRow("Size", SubtitleStyle.sizes.map { ($0.id, $0.label) }, selection: $subSize)
-            stepperRow("Fine size", value: subSizeScale,
+            choiceRow(String(localized: "Font"), SubtitleStyle.fonts.map { ($0.id, $0.label) }, selection: $subFont)
+            choiceRow(String(localized: "Size"), SubtitleStyle.sizes.map { ($0.id, $0.label) }, selection: $subSize)
+            stepperRow(String(localized: "Fine size"), value: subSizeScale,
                        range: SubtitleStyle.sizeScaleRange,
                        onMinus: { adjustSubScale(-1) },
                        onPlus: { adjustSubScale(1) })
-            choiceRow("Color", SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
+            choiceRow(String(localized: "Color"), SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)
             Text("Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -669,7 +669,7 @@ struct SettingsView: View {
     }
 
     private var aboutSection: some View {
-        section("About") {
+        section(String(localized: "About")) {
             if let update = updates.available {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("Update available: \(update.name)", systemImage: "arrow.down.circle.fill")
@@ -681,9 +681,9 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, Theme.Space.xs)
             }
-            infoRow("Version", appVersion)
-            infoRow("Player", "libmpv · MPVKit")
-            infoRow("Server", "Stremio streaming server (nodejs-mobile)")
+            infoRow(String(localized: "Version"), appVersion)
+            infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
+            infoRow(String(localized: "Server"), String(localized: "Stremio streaming server (nodejs-mobile)"))
         }
         .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
     }
