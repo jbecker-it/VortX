@@ -1136,6 +1136,15 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
     } else {
         resume = await account.resumeOffset(for: meta)
     }
+    // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
+    // are time-limited and expire between sessions) can AUTO-HOP to a freshly-resolved source instead of
+    // dead-ending on the "sources didn't load" overlay (the debrid CW-resume failure). Non-blocking: the
+    // stored link still plays immediately; if it fails, the player's failover now has FRESH sources to pick.
+    // (Series loads its episode streams below; this gives movies the same hop-on-failure safety net.)
+    if entry.type == "movie",
+       core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty {
+        core.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+    }
     // For a series, give the player the season's episode list + a resolver so the CW resume has the same
     // in-player Next / Prev / episode-list as the detail page. The CW item's videos may not be resident,
     // so wait briefly (~1.5s) for the meta; if it doesn't arrive, the recorded stream still resumes,

@@ -232,6 +232,9 @@ struct PlayerScreen: View {
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
     #endif
     @State private var loadErrorMsg = ""
+    /// CW-resume only: set once we've waited for a freshly-loaded source after the stored link failed, so the
+    /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
+    @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
@@ -788,6 +791,26 @@ struct PlayerScreen: View {
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
             if hopToNextSource(reason: "load failed") { return }
+            // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
+            // iOSDirectResume kicks off a background reload of the title's streams, but they may not have
+            // arrived yet, so the hop above found nothing. Wait briefly for the fresh streams and retry the
+            // hop, rather than dead-ending on the "sources didn't load" overlay and forcing a manual re-pick.
+            // One wait-cycle per playback; only for a metadata-backed (resumed) non-torrent play.
+            if recordMeta != nil, !curIsTorrent, !awaitedFreshSources {
+                awaitedFreshSources = true
+                reconnectMsg = "Finding a fresh source…"; withAnimation { reconnecting = true }
+                autoRetryTask?.cancel()
+                autoRetryTask = Task { @MainActor in
+                    for _ in 0 ..< 16 {   // up to ~4s for the background stream load to land
+                        try? await Task.sleep(for: .milliseconds(250))
+                        if Task.isCancelled { return }
+                        if hopToNextSource(reason: "fresh sources after wait") { reconnecting = false; return }
+                    }
+                    reconnecting = false
+                    withAnimation { loadFailed = true }
+                }
+                return
+            }
             withAnimation { loadFailed = true }
             return
         }
@@ -1049,7 +1072,7 @@ struct PlayerScreen: View {
         if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock
         appliedSize = false; appliedAutoTracks = false
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
-        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
+        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
         reconnectMsg = "Switching source…"
         loadIntoPlayer(newURL, headers: curHeaders, live: isLive)

@@ -295,6 +295,14 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
+            // For a MOVIE, kick off a background load of the title's streams so a stale stored link (debrid
+            // URLs are time-limited and expire between sessions) auto-hops to a FRESH source instead of
+            // dead-ending on the "sources didn't load" overlay. The stored link still plays immediately; the
+            // player's failover picks up the fresh streams on a failure.
+            if entry.type == "movie",
+               core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty {
+                core.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+            }
             presenter.request = PlaybackRequest(
                 url: url, title: entry.title,
                 meta: PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,

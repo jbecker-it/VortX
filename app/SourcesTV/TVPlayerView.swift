@@ -84,6 +84,9 @@ struct TVPlayerView: View {
     @State private var panelRows: [OptionRow] = []
     @State private var loadFailed = false              // playback couldn't start
     @State private var loadErrorMsg = ""
+    /// CW-resume only: set once we've waited for a freshly-loaded source after the stored link failed, so the
+    /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
+    @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
     // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
@@ -1559,6 +1562,25 @@ struct TVPlayerView: View {
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
             if hopToNextSource(reason: "load failed: \(msg)") { return }
+            // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
+            // HomeView.directResume kicks off a background reload of the title's streams, but they may not
+            // have arrived yet. Wait briefly for them and retry the hop to a FRESH source, rather than
+            // dead-ending on the "sources didn't load" overlay. One wait-cycle per playback, non-torrent only.
+            if curMeta != nil, !isTorrentPlayback, !awaitedFreshSources {
+                awaitedFreshSources = true
+                withAnimation { reconnecting = true }
+                autoRetryTask?.cancel()
+                autoRetryTask = Task { @MainActor in
+                    for _ in 0 ..< 16 {   // up to ~4s for the background stream load to land
+                        try? await Task.sleep(for: .milliseconds(250))
+                        if Task.isCancelled { return }
+                        if hopToNextSource(reason: "fresh sources after wait") { reconnecting = false; return }
+                    }
+                    reconnecting = false
+                    withAnimation { loadFailed = true }
+                }
+                return
+            }
             withAnimation { loadFailed = true }
             return
         }
