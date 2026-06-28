@@ -20,7 +20,7 @@ The Beta 11 follow-up. A focused pass on the bugs you reported: trailers that ac
 ### Added
 
 - **Hide the built-in Home rows.** The editorial rows (Critically Acclaimed, Hidden Gems, Modern Classics, Award Winners) are built in and used to show no matter what. A new switch in Settings, Appearance, "Show editorial Home rows," turns them off.
-- **SkipDB for skip timestamps.** A new open skip-segment source you can pick in Settings, Playback, "Skip timestamps source," alongside the existing one. (Community contribution.)
+- **SkipDB for skip timestamps.** A new open skip-segment source you can pick in Settings, Playback, "Skip timestamps source," alongside the existing one. Thanks to OrigamiSpace for contributing this (#98).
 
 ## 0.3.8 Beta 11 - 2026-06-25 (pre-release)
 
