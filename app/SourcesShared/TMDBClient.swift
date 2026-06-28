@@ -137,6 +137,80 @@ enum TMDBClient {
         return (bd.map { "https://image.tmdb.org/t/p/w780\($0)" }, lg.map { "https://image.tmdb.org/t/p/w500\($0)" })
     }
 
+    /// A streaming service for a "what's on {service}" Home rail (TMDB watch-provider id + display label).
+    struct StreamingService: Identifiable, Hashable {
+        let providerID: Int
+        let name: String
+        var id: Int { providerID }
+    }
+
+    /// The major flatrate streaming services, by TMDB watch-provider id (JustWatch). A service with nothing
+    /// available in the viewer's region resolves to an empty rail and is dropped, so users outside the US
+    /// simply see fewer rails rather than blank rows. Order here is the on-screen order.
+    static let majorStreamingServices: [StreamingService] = [
+        .init(providerID: 8, name: "Netflix"),
+        .init(providerID: 337, name: "Disney+"),
+        .init(providerID: 9, name: "Prime Video"),
+        .init(providerID: 1899, name: "Max"),
+        .init(providerID: 350, name: "Apple TV+"),
+        .init(providerID: 531, name: "Paramount+"),
+        .init(providerID: 15, name: "Hulu"),
+        .init(providerID: 386, name: "Peacock"),
+        .init(providerID: 283, name: "Crunchyroll"),
+    ]
+
+    /// Titles available on a streaming service in the region (TMDB /discover with_watch_providers, flatrate,
+    /// most-popular first), resolved to engine-playable Cinemeta (tt) previews so a tapped card plays through
+    /// the engine like any other card. Movie + TV are merged. Returns [] when no TMDB key is set or nothing
+    /// is available in-region; titles with no IMDb id are dropped (they would dead-tap without a TMDB meta
+    /// add-on). Name + poster come from the discover row itself, so this is one discover call + one
+    /// external_ids call per title (capped), not a full meta fetch per card.
+    static func streamingProviderTitles(providerID: Int, region: String = deviceRegion, limit: Int = 18) async -> [MetaPreview] {
+        guard let key = ApiKeys.tmdbKey() else { return [] }
+        async let movieRows = discoverProviderPage(media: "movie", providerID: providerID, region: region, key: key)
+        async let tvRows = discoverProviderPage(media: "tv", providerID: providerID, region: region, key: key)
+        let movies = await movieRows, series = await tvRows
+        // Interleave movie + tv (each already popularity-ordered) so a rail blends both.
+        var rows: [(tmdbID: Int, media: String, name: String, poster: String?)] = []
+        for i in 0..<max(movies.count, series.count) {
+            if i < movies.count { rows.append(movies[i]) }
+            if i < series.count { rows.append(series[i]) }
+        }
+        // Over-fetch (some drop for a missing IMDb id), resolve each TMDB id -> tt concurrently, preserve order.
+        let slice = Array(rows.prefix(limit * 2))
+        let resolved: [(Int, MetaPreview)] = await withTaskGroup(of: (Int, MetaPreview)?.self) { group in
+            for (i, row) in slice.enumerated() {
+                group.addTask {
+                    guard let ext = await get("/\(row.media)/\(row.tmdbID)/external_ids?api_key=\(key)"),
+                          let imdb = ext["imdb_id"] as? String, imdb.hasPrefix("tt"),
+                          row.poster?.isEmpty == false else { return nil }
+                    let type = row.media == "tv" ? "series" : "movie"
+                    return (i, MetaPreview(id: imdb, type: type, name: row.name, poster: row.poster, posterShape: nil, popularity: nil))
+                }
+            }
+            var out: [(Int, MetaPreview)] = []
+            for await r in group { if let r { out.append(r) } }
+            return out
+        }
+        var seen = Set<String>()
+        let ordered = resolved.sorted { $0.0 < $1.0 }.map(\.1).filter { seen.insert($0.id).inserted }
+        return Array(ordered.prefix(limit))
+    }
+
+    /// One TMDB discover-by-provider page: (tmdb id, media, title, poster URL) rows, flatrate + most popular.
+    private static func discoverProviderPage(media: String, providerID: Int, region: String, key: String)
+        async -> [(tmdbID: Int, media: String, name: String, poster: String?)] {
+        let path = "/discover/\(media)?api_key=\(key)&watch_region=\(region)&with_watch_providers=\(providerID)"
+            + "&with_watch_monetization_types=flatrate&sort_by=popularity.desc&language=en-US&page=1"
+        guard let obj = await get(path), let results = obj["results"] as? [[String: Any]] else { return [] }
+        return results.compactMap { r in
+            guard let id = r["id"] as? Int else { return nil }
+            let name = (r["title"] as? String) ?? (r["name"] as? String) ?? ""
+            let poster = (r["poster_path"] as? String).map { "https://image.tmdb.org/t/p/w342\($0)" }
+            return (id, media, name, poster)
+        }
+    }
+
     private static func get(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: host + path) else { return nil }
         do {

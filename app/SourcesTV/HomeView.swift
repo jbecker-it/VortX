@@ -9,6 +9,8 @@ struct HomeView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -63,6 +65,14 @@ struct HomeView: View {
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
                         }
+                        // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service
+                        // in-region, from TMDB watch providers. Discovery only; cards play through the engine
+                        // like any catalog card. Hidden with no TMDB key; each rail drops when empty in-region.
+                        if showStreamingRails {
+                            ForEach(streaming.collections) { collection in
+                                StreamingRow(title: collection.title, items: collection.items, focusModel: focusModel)
+                            }
+                        }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
                         }
@@ -80,7 +90,8 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks() }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); if showStreamingRails { streaming.load() } }
+        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
@@ -376,6 +387,44 @@ struct TopPicksRow: View {
 
     /// A bare hero for the backdrop; the FocusedItemModel enriches it (rating/synopsis/real backdrop)
     /// from the session cache or Cinemeta a beat after focus, exactly like a library card.
+    private func hero(for item: MetaPreview) -> FocusedHero {
+        FocusedHero(id: item.id, type: item.type, title: item.name,
+                    backdrop: item.poster, metaLine: item.type.capitalized,
+                    overview: nil, genreLine: nil)
+    }
+}
+
+/// A "browse by streaming service" Home rail (Netflix, Disney+, ...): titles available on the service
+/// in-region, from TMDB watch providers. Mirrors `TopPicksRow`; cards carry resolved Cinemeta (tt) ids so
+/// they play through the engine like any catalog card. The service name is the rail title.
+struct StreamingRow: View {
+    let title: String
+    let items: [MetaPreview]
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: "Streaming now", title: title)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   menu: .catalog,
+                                   onFocus: focusModel.map { model in
+                                       { model.focus(hero(for: item)) }
+                                   })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A bare hero for the backdrop; the FocusedItemModel enriches it (rating/synopsis/real backdrop) from
+    /// the session cache or Cinemeta a beat after focus, exactly like a Top Picks card.
     private func hero(for item: MetaPreview) -> FocusedHero {
         FocusedHero(id: item.id, type: item.type, title: item.name,
                     backdrop: item.poster, metaLine: item.type.capitalized,

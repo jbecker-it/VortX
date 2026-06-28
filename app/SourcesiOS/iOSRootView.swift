@@ -269,6 +269,8 @@ struct iOSHomeView: View {
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
+    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails on Home (needs a TMDB key)
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -305,6 +307,9 @@ struct iOSHomeView: View {
         if showCuratedRails {
             out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         }
+        if showStreamingRails {
+            out += streaming.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        }
         return out
     }
 
@@ -317,6 +322,9 @@ struct iOSHomeView: View {
         for row in core.boardRows where !row.items.isEmpty { rails.append((row.title, row.items.map(\.id))) }
         if showCuratedRails {
             for c in curated.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
+        }
+        if showStreamingRails {
+            for c in streaming.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
         }
         return rails
     }
@@ -351,6 +359,7 @@ struct iOSHomeView: View {
     private var macRailSeedKey: Int {
         continueWatchingItems.count + topPicks.items.count + core.boardRows.count
             + (showCuratedRails ? curated.collections.count : 0)
+            + (showStreamingRails ? streaming.collections.count : 0)
     }
 
     /// Seed keyboard focus onto the first card once the rails exist, so a card is the first responder and the
@@ -450,6 +459,19 @@ struct iOSHomeView: View {
                                                 onTap: handleTap))
                         }
                     }
+                    // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service in the
+                    // viewer's region, from TMDB watch providers. Discovery only - cards play through the engine
+                    // like any other. Each rail fails soft / drops when empty; the whole section needs a TMDB key.
+                    if showStreamingRails {
+                        ForEach(streaming.collections) { collection in
+                            homeRail(PosterRail(title: collection.title,
+                                                items: collection.items.map {
+                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                             poster: $0.poster, progress: 0)
+                                                },
+                                                onTap: handleTap))
+                        }
+                    }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
                     if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
@@ -518,12 +540,14 @@ struct iOSHomeView: View {
             // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
             // already loaded or in flight, and retries on the next appearance if the first fetch failed.
             if showCuratedRails { curated.load() }
+            if showStreamingRails { streaming.load() }
         }
         .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
+        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the

@@ -50,6 +50,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
@@ -775,6 +776,8 @@ struct iOSSettingsView: View {
             // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
             // cannot remove from Home" report).
             Toggle("Show editorial Home rows", isOn: $showCuratedRails)
+            // Browse-by-streaming-service rails (Netflix, Disney+, ...), from TMDB watch providers; needs a TMDB key.
+            Toggle("Show streaming-service rows", isOn: $showStreamingRails)
             // Cinematic 16:9 landscape catalog cards (clean TMDB backdrops) vs the legacy portrait posters.
             Toggle("Cinematic landscape cards", isOn: $catalogPrefs.landscapeCards)
 
