@@ -402,9 +402,11 @@ struct BrowseHeroBackdrop: View {
 struct LandscapeArt: View {
     let id: String?
     let type: String
+    let title: String
     let poster: String?
     var width: CGFloat = kLandscapeCardWidth
     @State private var image: UIImage?
+    @State private var logo: UIImage?
     @State private var usedBackdrop = false
     @State private var failed = false
 
@@ -415,6 +417,7 @@ struct LandscapeArt: View {
             if let image {
                 if usedBackdrop {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .overlay { titleLayer }
                 } else {
                     Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
                         .blur(radius: 26).opacity(0.55)
@@ -434,11 +437,32 @@ struct LandscapeArt: View {
         .task(id: id ?? poster ?? "") { await load() }
     }
 
+    /// The title ON the cinematic backdrop: the title's clean TMDB clearlogo when one resolves, else the
+    /// title as styled text, both over a bottom scrim so they read on any backdrop.
+    @ViewBuilder private var titleLayer: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .center, endPoint: .bottom)
+            if let logo {
+                Image(uiImage: logo).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: width * 0.6, maxHeight: height * 0.42, alignment: .bottomLeading)
+                    .padding(Theme.Space.md)
+            } else {
+                Text(title)
+                    .font(.system(size: 22, weight: .bold)).lineLimit(2)
+                    .foregroundStyle(.white).shadow(color: .black.opacity(0.6), radius: 4, y: 1)
+                    .padding(Theme.Space.md)
+            }
+        }
+    }
+
     private func load() async {
-        image = nil; usedBackdrop = false; failed = false
+        image = nil; logo = nil; usedBackdrop = false; failed = false
         // Clean TMDB textless 16:9 backdrop (cached by id). Only a real backdrop fills the cell.
         if let id, let bd = await LandscapeBackdropCache.backdrop(id: id, type: type), let img = await fetch(bd) {
-            image = img; usedBackdrop = true; return
+            image = img; usedBackdrop = true
+            // Title overlay: prefer the clearlogo (PNG); titleLayer falls back to text when nil.
+            if let lg = await LandscapeBackdropCache.logo(id: id, type: type) { logo = await fetch(lg) }
+            return
         }
         // No TMDB backdrop: composite the poster (blurred fill behind a fit copy), never an ugly 2:3 crop.
         if let img = await fetch(poster) { image = img; usedBackdrop = false; return }
@@ -508,7 +532,7 @@ struct PosterCard: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Group {
                     if landscape {
-                        LandscapeArt(id: id, type: type, poster: PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
+                        LandscapeArt(id: id, type: type, title: title, poster: PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
                     } else {
                         PosterArt(PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
                     }

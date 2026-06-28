@@ -1840,8 +1840,10 @@ struct CachedPosterImage: View {
 private struct LandscapeArtiOS: View {
     let id: String
     let type: String
+    let title: String
     let poster: String?
     @State private var image: PlatformPosterImage?
+    @State private var logo: PlatformPosterImage?
     @State private var usedBackdrop = false
     @State private var failed = false
 
@@ -1850,6 +1852,7 @@ private struct LandscapeArtiOS: View {
             if let image {
                 if usedBackdrop {
                     imageView(image).resizable().scaledToFill()
+                        .overlay { titleLayer }
                 } else {
                     imageView(image).resizable().scaledToFill()
                         .blur(radius: 18).opacity(0.55)
@@ -1866,6 +1869,26 @@ private struct LandscapeArtiOS: View {
         .task(id: id) { await load() }
     }
 
+    /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a
+    /// bottom scrim. GeometryReader so the logo scales to the (small) card.
+    @ViewBuilder private var titleLayer: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .bottomLeading) {
+                LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .center, endPoint: .bottom)
+                if let logo {
+                    imageView(logo).resizable().scaledToFit()
+                        .frame(maxWidth: geo.size.width * 0.62, maxHeight: geo.size.height * 0.44, alignment: .bottomLeading)
+                        .padding(8)
+                } else {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold)).lineLimit(2)
+                        .foregroundStyle(.white).shadow(color: .black.opacity(0.6), radius: 3, y: 1)
+                        .padding(8)
+                }
+            }
+        }
+    }
+
     private func imageView(_ img: PlatformPosterImage) -> Image {
         #if canImport(UIKit)
         Image(uiImage: img)
@@ -1875,24 +1898,29 @@ private struct LandscapeArtiOS: View {
     }
 
     private func load() async {
-        failed = false
+        failed = false; logo = nil
         let backdrop = await LandscapeBackdropCache.backdrop(id: id, type: type)
         usedBackdrop = backdrop != nil
         let raw = backdrop ?? PosterArtwork.poster(id: id, fallback: poster)
         guard let raw, !raw.isEmpty, let u = URL(string: raw) else { failed = true; return }
-        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { image = cached; return }
+        guard let img = await fetchImage(u) else { if !Task.isCancelled { failed = true }; return }
+        image = img
+        // On a real backdrop, resolve the title clearlogo for the overlay (titleLayer falls back to text).
+        if usedBackdrop, let lg = await LandscapeBackdropCache.logo(id: id, type: type), let lu = URL(string: lg) {
+            logo = await fetchImage(lu)
+        }
+    }
+
+    private func fetchImage(_ u: URL) async -> PlatformPosterImage? {
+        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { return cached }
         var req = URLRequest(url: u)
         req.cachePolicy = .returnCacheDataElseLoad   // immutable art: prefer the shared disk cache
         do {
             let (data, _) = try await URLSession.shared.data(for: req)
-            guard !Task.isCancelled else { return }
-            if let img = PlatformPosterImage(data: data) {
-                posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
-                image = img
-            } else { failed = true }
-        } catch {
-            if !Task.isCancelled { failed = true }   // a cancel (scrolled away) is not a failure; the next appear retries
-        }
+            guard !Task.isCancelled, let img = PlatformPosterImage(data: data) else { return nil }
+            posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
+            return img
+        } catch { return nil }
     }
 }
 
@@ -1933,7 +1961,7 @@ private struct PosterCardiOS: View {
                 // portrait crops the poster to the card so non-2:3 add-on posters fill cleanly (F37).
                 Group {
                     if landscape {
-                        LandscapeArtiOS(id: id, type: type, poster: poster ?? fallbackArt)
+                        LandscapeArtiOS(id: id, type: type, title: name, poster: poster ?? fallbackArt)
                     } else {
                         CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: poster ?? fallbackArt))
                     }
