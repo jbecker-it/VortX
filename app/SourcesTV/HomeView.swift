@@ -299,9 +299,10 @@ struct CoreContinueWatchingRow: View {
             // URLs are time-limited and expire between sessions) auto-hops to a FRESH source instead of
             // dead-ending on the "sources didn't load" overlay. The stored link still plays immediately; the
             // player's failover picks up the fresh streams on a failure.
+            let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
             if entry.type == "movie",
-               core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty {
-                core.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+               bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
+                bridge.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
             }
             presenter.request = PlaybackRequest(
                 url: url, title: entry.title,
