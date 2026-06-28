@@ -71,6 +71,35 @@ enum ERDB {
     }
 }
 
+/// fanart.tv as a DIRECT art provider, INDEPENDENT of ERDB. Off by default. When on, the async art sites
+/// prefer fanart.tv's community clearlogo / clearart / poster / background (resolved via `FanartClient`
+/// using the user's fanart.tv key from Metadata keys) over the add-on/metahub art, WITHOUT enabling ERDB's
+/// rating-baked renders. Resolution is async (network), so callers await it from already-async art sites
+/// (e.g. the hero logo); it never blocks the synchronous `PosterArtwork` URL builders.
+enum Fanart {
+    static let enabledKey = "stremiox.fanart.enabled"   // absent = OFF (opt-in, independent of ERDB)
+    static var isEnabled: Bool { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? false }
+
+    /// The fanart.tv clearlogo URL for a title, or nil when disabled / fanart has none. Async (one cached
+    /// fanart.tv lookup per id); fail-soft so the caller keeps its existing logo on any miss.
+    static func logo(id: String, type: String) async -> String? {
+        guard isEnabled else { return nil }
+        return await FanartClient.art(id: id, type: type).logo
+    }
+
+    /// The fanart.tv poster URL for a title, or nil when disabled / fanart has none. Async, fail-soft.
+    static func poster(id: String, type: String) async -> String? {
+        guard isEnabled else { return nil }
+        return await FanartClient.art(id: id, type: type).poster
+    }
+
+    /// The fanart.tv background (16:9) URL for a title, or nil when disabled / fanart has none. Async, fail-soft.
+    static func background(id: String, type: String) async -> String? {
+        guard isEnabled else { return nil }
+        return await FanartClient.art(id: id, type: type).background
+    }
+}
+
 /// The single place every poster / backdrop / logo URL is resolved, so the active art provider is chosen
 /// once. Precedence: ERDB (when the user set a token) wins, then the VortX / XRDB poster service, then the
 /// original add-on artwork. Keeps the three poster call sites and the two logo slots from each re-deciding.

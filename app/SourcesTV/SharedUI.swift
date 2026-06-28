@@ -421,9 +421,11 @@ struct BrowseHeroBackdrop: View {
     /// text shows at once, then swaps to the logo when it resolves (nil = TMDB has none / no key = text stays).
     private func loadHeroLogo() async {
         heroLogo = nil
-        guard let hero = model.hero,
-              let lg = PosterArtwork.logo(id: hero.id, fallback: hero.logo ?? metahubLogo(for: hero.id)),
-              let img = await fetchHeroImage(lg) else { return }
+        guard let hero = model.hero else { return }
+        // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo. Both fail-soft.
+        let resolved = await Fanart.logo(id: hero.id, type: hero.type)
+            ?? PosterArtwork.logo(id: hero.id, fallback: hero.logo ?? metahubLogo(for: hero.id))
+        guard let lg = resolved, let img = await fetchHeroImage(lg) else { return }
         heroLogo = img
     }
 

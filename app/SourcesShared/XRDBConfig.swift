@@ -64,6 +64,7 @@ struct XRDBSettingsView: View {
     @AppStorage(ERDB.tokenKey) private var erdbToken = ""
     @AppStorage(ERDB.baseKey) private var erdbBase = ""
     @AppStorage(ERDB.fanartPostersKey) private var erdbFanartPosters = false
+    @AppStorage(Fanart.enabledKey) private var fanartEnabled = false
 
     var body: some View {
         ScrollView {
@@ -116,6 +117,23 @@ struct XRDBSettingsView: View {
                     .foregroundStyle(Theme.Palette.textTertiary)
                 field("ERDB token (optional)", text: $erdbToken, hint: "Not required: ERDB works keyless. Only for your own ERDB configurator profile. Stored on this device and synced, encrypted, to your VortX account.", url: false)
                 field("ERDB base URL (optional)", text: $erdbBase, hint: "Leave blank to use easyratingsdb.com. Or set a self-hosted ERDB instance.", url: true)
+
+                Text("fanart.tv artwork")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("Use community clearlogos from fanart.tv for the hero, INDEPENDENT of ERDB (no rating-baked posters). Uses your fanart.tv key from Metadata keys. More fanart art (clearart, posters, backgrounds) follows.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                Toggle(isOn: $fanartEnabled) {
+                    Text("Use fanart.tv logos")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
