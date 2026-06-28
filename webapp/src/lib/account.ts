@@ -8,7 +8,15 @@
 // directly, it goes through vault's saveSession/loadSession/clearSession.
 
 import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, type Session } from "./vault";
-import { mergeInstalledAddons, mergeLibrary, mergeContinueWatching, type CWEntry } from "./store";
+import {
+  mergeInstalledAddons,
+  mergeLibrary,
+  mergeContinueWatching,
+  mergeLibraryForScope,
+  mergeContinueWatchingForScope,
+  type CWEntry,
+} from "./store";
+import { mergeSyncedProfiles, type SyncedProfile } from "./profiles";
 import { updateSettings } from "./settings";
 import type { MetaItem } from "./types";
 
@@ -83,6 +91,74 @@ function addonUrl(a: unknown): string | null {
   return null;
 }
 
+/** Coerce an unknown to an array of plain objects (the loose synced-doc shape). */
+function asObjArr(v: unknown): Record<string, unknown>[] {
+  return Array.isArray(v) ? (v.filter((x) => x && typeof x === "object") as Record<string, unknown>[]) : [];
+}
+
+/** Map synced library items (carrying t/d seconds + lastWatched + v resumeId) to CW entries. Shared by
+ *  the owner library and each per-profile (byProfile) library so the logic stays in one place. */
+function cwEntriesFrom(items: unknown): CWEntry[] {
+  const out: CWEntry[] = [];
+  for (const it of asObjArr(items)) {
+    if (typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") continue;
+    const t = Number(it.t);
+    const d = Number(it.d);
+    if (!(t > 0) || !(d > 0) || t / d >= 0.95) continue; // not started / already finished
+    const lw = typeof it.lastWatched === "string" ? Date.parse(it.lastWatched) : NaN;
+    out.push({
+      id: it.id,
+      type: it.type,
+      name: it.name,
+      poster: typeof it.poster === "string" ? it.poster : undefined,
+      resumeId: typeof it.v === "string" && it.v ? it.v : it.id, // overlay items carry the resume episode id
+      position: t,
+      duration: d,
+      updatedAt: Number.isFinite(lw) ? lw : 0,
+    });
+  }
+  return out;
+}
+
+/** Build the web profile roster from the synced doc, mirroring the dashboard's normalizeDoc essentials:
+ *  read vortx.profiles, collapse duplicate "main" rows (the duplicate-Main bug), drop deletedProfiles
+ *  tombstones unconditionally, and overlay doc.profileEdits ONLY when it is newer than the mirror
+ *  (editedAt > vortx.updatedAt) so a stale web edit never masks a newer device change. Returns the slim
+ *  roster the web store needs. */
+function rosterFromDoc(vortx: Record<string, unknown>, doc: Record<string, unknown>): SyncedProfile[] {
+  let roster: SyncedProfile[] = asObjArr(vortx.profiles)
+    .filter((p) => p.id != null)
+    .map((p, i) => {
+      const st = p.settings && typeof p.settings === "object" ? (p.settings as Record<string, unknown>) : {};
+      const avatar = typeof st.avatar === "string" && st.avatar.trim() ? st.avatar.trim() : undefined;
+      return { id: String(p.id), name: String(p.name ?? `Profile ${i + 1}`), main: !!p.main || i === 0, avatar };
+    });
+  const mains = roster.filter((p) => p.main);
+  if (mains.length > 1) {
+    const drop = new Set(mains.slice(1).map((p) => p.id));
+    roster = roster.filter((p) => !drop.has(p.id));
+  }
+  const tombIds = new Set((Array.isArray(vortx.deletedProfiles) ? vortx.deletedProfiles : []).map((x) => String(x)));
+  if (tombIds.size) roster = roster.filter((p) => !tombIds.has(p.id));
+  const edits = doc.profileEdits && typeof doc.profileEdits === "object" ? (doc.profileEdits as Record<string, unknown>) : null;
+  if (edits && (Number(edits.editedAt) || 0) > (Number(vortx.updatedAt) || 0) && Array.isArray(edits.roster)) {
+    const byId = new Map(roster.map((p) => [p.id, p] as const));
+    for (const raw of edits.roster) {
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      if (e.id == null) continue;
+      const id = String(e.id);
+      if (tombIds.has(id)) continue;
+      if (e.deleted) { byId.delete(id); continue; }
+      const base = byId.get(id);
+      if (base) byId.set(id, { ...base, name: typeof e.name === "string" && e.name ? e.name : base.name });
+      else byId.set(id, { id, name: String(e.name ?? "Profile"), main: false });
+    }
+    roster = [...byId.values()];
+  }
+  return roster;
+}
+
 /** Apply a decrypted sync document to local state (READ-ONLY merge: add-ons, library, metadata keys).
  *  Pure (no network) so it is unit-testable; hydrateFromAccount fetches the doc then calls this. Tolerant
  *  of any missing/odd key - a partial or foreign doc never throws. */
@@ -114,33 +190,35 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   const libItems = (Array.isArray(vortx.library) ? vortx.library : []) as Array<Record<string, unknown>>;
   mergeLibrary(libItems as unknown as MetaItem[]);
 
-  // Continue Watching: derive from the synced library items that carry in-progress watch state, so the
-  // user's history from their other VortX devices appears on Home. Web playback is local-only, so without
-  // this the rail is empty for users who watch on the apps. t/d are seconds, matching the web CW store.
-  const cwEntries: CWEntry[] = [];
-  for (const it of libItems) {
-    if (!it || typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") continue;
-    const t = Number(it.t);
-    const d = Number(it.d);
-    if (!(t > 0) || !(d > 0) || t / d >= 0.95) continue; // not started / already finished
-    const lw = typeof it.lastWatched === "string" ? Date.parse(it.lastWatched) : NaN;
-    cwEntries.push({
-      id: it.id,
-      type: it.type,
-      name: it.name,
-      poster: typeof it.poster === "string" ? it.poster : undefined,
-      resumeId: typeof it.v === "string" && it.v ? it.v : it.id, // overlay items carry the resume episode id
-      position: t,
-      duration: d,
-      updatedAt: Number.isFinite(lw) ? lw : 0,
-    });
-  }
-  const cwChanged = mergeContinueWatching(cwEntries);
+  // Continue Watching for the OWNER: derive from the synced library items' t/d progress, plus any explicit
+  // vortx.continueWatching the app emits. cwEntriesFrom is shared with the per-profile hydration below.
+  const cwChanged = mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)]);
 
-  // The running app rendered before hydration; tell main.ts to reload add-ons + re-render so newly-merged
-  // add-ons AND Continue Watching appear immediately (Library reads storage fresh, so it already shows).
-  if ((addonsChanged || cwChanged) && typeof window !== "undefined") {
-    window.dispatchEvent(new Event("vortx:addons-changed"));
+  // Profiles roster + per-profile (byProfile) library/CW. Without this the webapp only ever showed the
+  // local "You" profile and never the user's real synced roster, and secondary profiles had empty
+  // libraries. Ports the dashboard normalizeDoc essentials (roster + tombstones + profileEdits overlay)
+  // and writes each profile's library/CW into its own scoped store keys. Read-only: never deletes.
+  const rosterChanged = mergeSyncedProfiles(rosterFromDoc(vortx, doc));
+  let byProfileChanged = false;
+  const byProfile = vortx.byProfile && typeof vortx.byProfile === "object" ? (vortx.byProfile as Record<string, unknown>) : null;
+  if (byProfile) {
+    for (const pid of Object.keys(byProfile)) {
+      const bp = byProfile[pid];
+      if (!bp || typeof bp !== "object") continue;
+      const rec = bp as Record<string, unknown>;
+      if (mergeLibraryForScope(pid, asObjArr(rec.library) as unknown as MetaItem[])) byProfileChanged = true;
+      const cwSrc = Array.isArray(rec.continueWatching) ? rec.continueWatching : rec.library;
+      if (mergeContinueWatchingForScope(pid, cwEntriesFrom(cwSrc))) byProfileChanged = true;
+    }
+  }
+
+  // Re-render: any add-on/library/CW change reloads the nav; a roster change repaints the profile switcher
+  // and the scoped Home/Library/Continue-Watching for the active profile.
+  if (typeof window !== "undefined") {
+    if (addonsChanged || cwChanged || rosterChanged || byProfileChanged) {
+      window.dispatchEvent(new Event("vortx:addons-changed"));
+    }
+    if (rosterChanged) window.dispatchEvent(new Event("vortx:profile-changed"));
   }
 }
 

@@ -148,6 +148,55 @@ export function deleteProfile(id: string): void {
   if (activeProfileId() === id) setActiveProfile(next[0].id);
 }
 
+/** A synced profile from the account doc (doc.vortx.profiles, normalized by account.ts): the roster the
+ *  Apple app emits and the dashboard reads. Only the fields the web roster needs today. */
+export interface SyncedProfile {
+  id: string;
+  name: string;
+  main?: boolean;
+  avatar?: string;
+}
+
+/** Reconcile the account-synced roster into the local profile store, so a signed-in user finally sees
+ *  their real multi-profile roster instead of just the local "You". The synced MAIN profile maps onto the
+ *  local owner (index 0, base storage, keeping its local id so existing owner data is never orphaned);
+ *  each secondary synced profile becomes an overlay profile keyed by its SYNCED id, so its scoped library
+ *  + continue-watching (written by store.mergeLibraryForScope/mergeContinueWatchingForScope under that id)
+ *  line up. Names + avatars come from the roster; per-profile look sync is a later phase, so an existing
+ *  profile keeps its local look and a new one is seeded from the current settings. Purely-local profiles
+ *  not in the roster are preserved (a read-only sync never deletes them). Returns true if anything changed. */
+export function mergeSyncedProfiles(roster: SyncedProfile[]): boolean {
+  const valid = (Array.isArray(roster) ? roster : []).filter(
+    (p) => p && typeof p.id === "string" && typeof p.name === "string",
+  );
+  if (!valid.length) return false;
+  const local = profiles();
+  const owner = local[0];
+  const main = valid.find((p) => p.main) ?? valid[0];
+  const byId = new Map(local.map((p) => [p.id, p] as const));
+  const next: Profile[] = [];
+  // Owner row: keep the local id + base storage, adopt the synced main's name/avatar.
+  next.push({ ...owner, name: main.name.trim() || owner.name, avatar: main.avatar || owner.avatar });
+  // Secondary synced profiles, keyed by their synced id (so scoped storage matches).
+  for (const sp of valid) {
+    if (sp.id === main.id) continue;
+    const existing = byId.get(sp.id);
+    next.push({
+      id: sp.id,
+      name: sp.name.trim() || existing?.name || "Profile",
+      avatar: sp.avatar || existing?.avatar || PROFILE_AVATARS[next.length % PROFILE_AVATARS.length],
+      look: existing?.look ?? lookFromSettings(),
+    });
+  }
+  // Keep purely-local overlay profiles the synced roster does not include.
+  for (const p of local.slice(1)) {
+    if (!next.some((n) => n.id === p.id)) next.push(p);
+  }
+  if (JSON.stringify(next) === JSON.stringify(local)) return false;
+  persist(next);
+  return true;
+}
+
 export function onProfilesChange(fn: () => void): () => void {
   listeners.add(fn);
   return () => listeners.delete(fn);

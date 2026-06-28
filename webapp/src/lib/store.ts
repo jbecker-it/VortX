@@ -332,6 +332,84 @@ export function mergeContinueWatching(entries: CWEntry[]): boolean {
   return true;
 }
 
+// --- Per-profile (scoped) hydration -------------------------------------------------------------
+// Account hydration of a SECONDARY (overlay) profile's synced library / continue-watching writes into
+// that profile's own scoped key (LIBRARY_KEY.<scope> / CW_KEY.<scope>), matching scopedKey()'s scheme,
+// so switching to that profile shows its own titles + resume points. scope "" targets the owner (base
+// key). Read-only union (existing local entries win); never deletes. Returns whether anything changed.
+
+function scopedBaseKey(base: string, scope: string): string {
+  return scope ? `${base}.${scope}` : base;
+}
+
+/** Merge a profile's synced library into its scoped key (union by id, existing wins). */
+export function mergeLibraryForScope(scope: string, items: MetaItem[]): boolean {
+  const valid = items.filter(
+    (m) => m && typeof m.id === "string" && typeof m.type === "string" && typeof m.name === "string",
+  );
+  if (!valid.length) return false;
+  const key = scopedBaseKey(LIBRARY_KEY, scope);
+  let existing: MetaItem[] = [];
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as MetaItem[];
+  } catch {
+    existing = [];
+  }
+  const seen = new Set(existing.map((e) => e.id));
+  const additions = valid
+    .filter((m) => !seen.has(m.id))
+    .map((m) => ({ id: m.id, type: m.type, name: m.name, poster: m.poster }));
+  if (!additions.length) return false;
+  try {
+    localStorage.setItem(key, JSON.stringify([...existing, ...additions]));
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
+/** Merge a profile's synced continue-watching into its scoped key (union by resumeId, fresher wins). */
+export function mergeContinueWatchingForScope(scope: string, entries: CWEntry[]): boolean {
+  const incoming = entries.filter(
+    (e) =>
+      e &&
+      typeof e.id === "string" &&
+      typeof e.resumeId === "string" &&
+      e.duration > 0 &&
+      e.position > 0 &&
+      e.position / e.duration < 0.95,
+  );
+  if (!incoming.length) return false;
+  const key = scopedBaseKey(CW_KEY, scope);
+  let existing: CWEntry[] = [];
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
+  } catch {
+    existing = [];
+  }
+  const byResume = new Map(existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]));
+  let changed = false;
+  for (const e of incoming) {
+    const cur = byResume.get(e.resumeId);
+    if (!cur || e.updatedAt > cur.updatedAt) {
+      byResume.set(e.resumeId, e);
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
+  try {
+    localStorage.setItem(key, JSON.stringify(next));
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
 // --- Recent searches ----------------------------------------------------------------------------
 // The last few search queries, newest first, so the Search page can offer one-tap repeats. Local only.
 const RECENT_KEY = "vortx.web.recent.v1";
