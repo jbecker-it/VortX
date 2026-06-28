@@ -6,6 +6,7 @@ struct DiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
     @StateObject private var focusModel = FocusedItemModel()
     @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @ObservedObject private var apiKeys = ApiKeys.shared
@@ -53,9 +54,12 @@ struct DiscoverView: View {
     }
 
     private func typeChips(_ types: [CoreSelectableType]) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        // With Live TV turned off, hide its content types (tv / channel / events / ...) from the Discover
+        // type filter too, so a disabled Live surface leaves no orphan "Channel" pill (owner report).
+        let shown = hideLiveTab ? types.filter { !LiveTypes.contains($0.type) } : types
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Theme.Space.sm) {
-                ForEach(types) { type in
+                ForEach(shown) { type in
                     Button { core.selectDiscover(type.request) } label: { Text(type.type.capitalized) }
                         .buttonStyle(ChipButtonStyle(selected: type.selected))
                 }

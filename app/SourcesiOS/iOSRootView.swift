@@ -894,6 +894,7 @@ struct iOSDiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @State private var path: [FeaturedHeroItem] = []
@@ -925,7 +926,7 @@ struct iOSDiscoverView: View {
                         // own line with consistent spacing so a row's pills can never be drawn on top
                         // of the row above it (#7).
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                            chipScroll { ForEach(discover.selectable.types) { t in
+                            chipScroll { ForEach(hideLiveTab ? discover.selectable.types.filter { !LiveTypes.contains($0.type) } : discover.selectable.types) { t in
                                 Button(t.type.capitalized) { core.selectDiscover(t.request) }
                                     .buttonStyle(ChipButtonStyle(selected: t.selected)) } }
                             chipScroll { ForEach(discover.selectable.catalogs) { c in
