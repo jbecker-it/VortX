@@ -87,6 +87,14 @@ struct CatalogManagerView: View {
                 Text("Choose which rows appear on Home and the order they show in.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
+                if !ordered.isEmpty {
+                    // One-tap: group every add-on's catalogs together, in add-on (priority) order.
+                    Button { groupByAddonOrder() } label: {
+                        Label("Group by add-on order", systemImage: "rectangle.3.group")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
+                }
                 let items = ordered
                 if items.isEmpty {
                     Text("No catalogs yet. Install an add-on that provides catalogs first.")
@@ -112,15 +120,25 @@ struct CatalogManagerView: View {
                 Text(info.title)
                     .font(Theme.Typography.cardTitle)
                     .foregroundStyle(isHidden ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
+                    .lineLimit(1)
                 Text(info.addonName)
                     .font(Theme.Typography.label)
                     .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1)
             }
             Spacer(minLength: Theme.Space.sm)
+            // Move to top -> up -> down -> bottom, then the show/hide eye. Send-to-top / send-to-bottom
+            // are the fast path on a long catalog list (and the only practical reorder on Apple TV).
+            Button { move(keys, from: index, to: 0) } label: { Image(systemName: "arrow.up.to.line") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .disabled(index == 0)
             Button { move(keys, from: index, to: index - 1) } label: { Image(systemName: "chevron.up") }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .disabled(index == 0)
             Button { move(keys, from: index, to: index + 1) } label: { Image(systemName: "chevron.down") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+                .disabled(index == total - 1)
+            Button { move(keys, from: index, to: total - 1) } label: { Image(systemName: "arrow.down.to.line") }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 .disabled(index == total - 1)
             Button { prefs.setHidden(info.key, !isHidden) } label: {
@@ -139,5 +157,24 @@ struct CatalogManagerView: View {
         let item = next.remove(at: from)
         next.insert(item, at: to)
         prefs.reorder(next)
+    }
+
+    /// Reorder every catalog grouped by its add-on, in the add-on (priority) order, so each add-on's
+    /// catalogs sit together. Catalogs of an add-on not currently installed keep their relative order at
+    /// the end. (Owner request: rearrange catalogs based on add-on order.)
+    private func groupByAddonOrder() {
+        var addonIndex: [String: Int] = [:]
+        for (i, addon) in core.addons.enumerated() { addonIndex[addon.transportUrl] = i }
+        let sorted = ordered.enumerated().sorted { a, b in
+            let ia = addonIndex[Self.base(of: a.element.key)] ?? Int.max
+            let ib = addonIndex[Self.base(of: b.element.key)] ?? Int.max
+            return ia != ib ? ia < ib : a.offset < b.offset
+        }.map(\.element.key)
+        prefs.reorder(sorted)
+    }
+
+    /// The add-on transport URL embedded in a catalog key (`base|type|id`).
+    private static func base(of key: String) -> String {
+        key.components(separatedBy: "|").first ?? key
     }
 }
