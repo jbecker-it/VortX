@@ -111,6 +111,32 @@ enum TMDBClient {
         return youtube.first.flatMap { $0["key"] as? String }
     }
 
+    /// CLEAN landscape artwork for the cinematic cards: a textless 16:9 backdrop + a PNG clearlogo from
+    /// TMDB, with NO rating/quality overlay (distinct from the ERDB rating-bake path, which stays opt-in for
+    /// posters). Requires a TMDB key; accepts an IMDb id (tt..., via /find) or a `tmdb:[type:]id`. Either URL
+    /// is nil when absent. The card layer caches the result so each title resolves once.
+    static func landscapeImages(metaID: String, type: String) async -> (backdrop: String?, logo: String?) {
+        guard let key = ApiKeys.tmdbKey() else { return (nil, nil) }
+        let media = (type == "series") ? "tv" : "movie"
+        var tmdbID: Int?
+        if metaID.hasPrefix("tt") {
+            guard let found = await get("/find/\(metaID)?external_source=imdb_id&api_key=\(key)"),
+                  let first = (found[media == "tv" ? "tv_results" : "movie_results"] as? [[String: Any]])?.first else { return (nil, nil) }
+            tmdbID = first["id"] as? Int
+        } else if metaID.hasPrefix("tmdb:") {
+            tmdbID = metaID.split(separator: ":").last.flatMap { Int($0) }
+        }
+        guard let id = tmdbID,
+              let imgs = await get("/\(media)/\(id)/images?api_key=\(key)&include_image_language=en,null") else { return (nil, nil) }
+        // Prefer a TEXTLESS backdrop (iso_639_1 == null) for a clean card, else the first available.
+        let backdrops = (imgs["backdrops"] as? [[String: Any]]) ?? []
+        let bd = ((backdrops.first { ($0["iso_639_1"] as? String) == nil }) ?? backdrops.first)?["file_path"] as? String
+        // Prefer a PNG clearlogo (transparent), else the first.
+        let logos = (imgs["logos"] as? [[String: Any]]) ?? []
+        let lg = ((logos.first { ($0["file_path"] as? String)?.lowercased().hasSuffix(".png") == true }) ?? logos.first)?["file_path"] as? String
+        return (bd.map { "https://image.tmdb.org/t/p/w780\($0)" }, lg.map { "https://image.tmdb.org/t/p/w500\($0)" })
+    }
+
     private static func get(_ path: String) async -> [String: Any]? {
         guard let url = URL(string: host + path) else { return nil }
         do {
