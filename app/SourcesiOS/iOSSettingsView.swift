@@ -48,6 +48,7 @@ struct iOSSettingsView: View {
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
@@ -763,6 +764,10 @@ struct iOSSettingsView: View {
             // Placed first so the Live TV tab toggle is easy to find at the top of Appearance
             // (it was previously buried below all the pickers and steppers).
             Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
+            // The built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.) are Cinemeta-
+            // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
+            // cannot remove from Home" report).
+            Toggle("Show editorial Home rows", isOn: $showCuratedRails)
 
             // ThemeAccentPicker / ThemeBackgroundPicker are tvOS-only (declared in SourcesTV); on
             // iOS we bind native Pickers to the SAME ThemeManager state (accentID, oled).

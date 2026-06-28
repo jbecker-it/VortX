@@ -268,6 +268,7 @@ struct iOSHomeView: View {
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
+    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -301,8 +302,49 @@ struct iOSHomeView: View {
                      background: $0.background, description: $0.description, releaseInfo: $0.releaseInfo,
                      imdbRating: $0.imdbRating, genres: $0.genres)
         }
-        out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        if showCuratedRails {
+            out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        }
         return out
+    }
+
+    /// The Home rails as (title, item-ids) in display order, keyed by the SAME titles the cards focus on
+    /// (`MacBrowseFocus.card(rail:item:)`), so arrow nav can step within a row and between rows.
+    private var macRails: [(title: String, ids: [String])] {
+        var rails: [(String, [String])] = []
+        if !continueWatchingItems.isEmpty { rails.append(("Continue Watching", continueWatchingItems.map(\.id))) }
+        if !topPicks.items.isEmpty { rails.append(("Top Picks for you", topPicks.items.map(\.id))) }
+        for row in core.boardRows where !row.items.isEmpty { rails.append((row.title, row.items.map(\.id))) }
+        if showCuratedRails {
+            for c in curated.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
+        }
+        return rails
+    }
+
+    /// Translate an arrow key into a focus move across `macRails`: Left/Right within a row, Up/Down between
+    /// rows (keeping the column where possible). Seeds the first card when nothing is focused yet. This is
+    /// what makes arrows actually MOVE on macOS - `.focusable()` + `.focusSection()` join the Tab loop but
+    /// never bind arrows to focus movement the way tvOS does, so the ring used to show on a clicked card and
+    /// then sit there dead.
+    private func advanceMacFocus(_ direction: MoveCommandDirection) {
+        let rails = macRails
+        guard !rails.isEmpty else { return }
+        var r = 0, i = 0
+        if case let .card(railTitle, itemID) = macFocus,
+           let ri = rails.firstIndex(where: { $0.title == railTitle }),
+           let ii = rails[ri].ids.firstIndex(of: itemID) {
+            r = ri; i = ii
+        } else {
+            macFocus = .card(rail: rails[0].title, item: rails[0].ids[0]); return
+        }
+        switch direction {
+        case .left:  i = max(0, i - 1)
+        case .right: i = min(rails[r].ids.count - 1, i + 1)
+        case .up:    if r > 0 { r -= 1; i = min(i, rails[r].ids.count - 1) }
+        case .down:  if r < rails.count - 1 { r += 1; i = min(i, rails[r].ids.count - 1) }
+        @unknown default: break
+        }
+        macFocus = .card(rail: rails[r].title, item: rails[r].ids[i])
     }
     #endif
 
@@ -381,13 +423,15 @@ struct iOSHomeView: View {
                     // Cinemeta catalogs, rendered BELOW the add-on catalog rows. They give Home an
                     // opinionated shape even with no extra catalog add-ons installed, and each fails soft
                     // (an empty collection is dropped; an empty section renders nothing, no error state).
-                    ForEach(curated.collections) { collection in
-                        homeRail(PosterRail(title: collection.title,
-                                            items: collection.items.map {
-                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                         poster: $0.poster, progress: 0)
-                                            },
-                                            onTap: handleTap))
+                    if showCuratedRails {
+                        ForEach(curated.collections) { collection in
+                            homeRail(PosterRail(title: collection.title,
+                                                items: collection.items.map {
+                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                             poster: $0.poster, progress: 0)
+                                                },
+                                                onTap: handleTap))
+                        }
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
@@ -401,6 +445,11 @@ struct iOSHomeView: View {
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
             #if os(macOS)
+            // Arrow keys MOVE the keyboard-browse selection. On plain SwiftUI/macOS, .focusable() +
+            // .focusSection() join the Tab loop but do NOT bind arrows to focus movement (unlike tvOS), so
+            // without this the accent ring shows on a clicked card but arrows do nothing (the "Mac arrow-key
+            // nav dead" report). advanceMacFocus walks the rails and sets macFocus.
+            .onMoveCommand { advanceMacFocus($0) }
             // Escape steps focus up a level: drop the focused card so the keyboard browse returns to a
             // neutral state (the bottom tab strip is its own focus space, reachable via Tab / arrows).
             .onExitCommand { macFocus = nil }
@@ -447,10 +496,13 @@ struct iOSHomeView: View {
             refreshTopPicks()
             // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
             // already loaded or in flight, and retries on the next appearance if the first fetch failed.
-            curated.load()
+            if showCuratedRails { curated.load() }
         }
         .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
+        // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
+        .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
@@ -1065,6 +1117,13 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
     }
     LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
+    // Re-prime the torrent engine before resuming: the stored loopback URL carries NO trackers, so without
+    // this the server opens a peerless DHT-only engine that never sends data (the "sources didn't load" red
+    // triangle on most CW torrent resumes). POST /{hash}/create with reachable trackers first; /create is
+    // idempotent, so an already-warm engine is untouched. Only loopback torrents (debrid/direct skip it).
+    if entry.torrent == true, let hash = url.pathComponents.dropFirst().first, hash.count == 40 {
+        StremioServer.primeTorrent(hash: hash.lowercased())
+    }
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)

@@ -133,6 +133,27 @@ enum StremioServer {
         URLSession.shared.dataTask(with: req).resume()
     }
 
+    /// (Re)prime the embedded torrent engine for a KNOWN INFO HASH (not a full Stream), injecting the
+    /// swarm-reaching HTTP/HTTPS trackers (TorrentTrackers) so the server opens a peered engine instead of
+    /// a DHT-only one. Used by the Continue-Watching direct-resume path, whose stored loopback URL carries
+    /// NO `?tr=` trackers: without this, resuming a torrent hits a peerless engine that never sends data
+    /// (the "sources didn't load" red triangle on most CW torrent resumes). `/create` is idempotent, so an
+    /// already-warm engine keeps its first sources. Fire-and-forget; the player's warm-up polling then
+    /// succeeds because the engine now has reachable trackers.
+    static func primeTorrent(hash: String, streamSources: [String]? = nil) {
+        guard !PlaybackSettings.torrentsDisabled,
+              let url = URL(string: "\(base)/\(hash)/create") else { return }
+        let sources = TorrentTrackers.sources(forHash: hash, streamSources: streamSources)
+        let body: [String: Any] = ["torrent": ["infoHash": hash],
+                                   "peerSearch": ["sources": sources, "min": 40, "max": 150]]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = data
+        URLSession.shared.dataTask(with: req).resume()
+    }
+
     /// Cap the embedded server's torrent cache once it's reachable. The server defaults to a
     /// 2 GB cache, which is too much for the Apple TV's per-app memory budget: a torrent
     /// buffering pieces into it pushes the app past the limit and tvOS jetsam-kills the whole
