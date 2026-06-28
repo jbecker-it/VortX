@@ -7,6 +7,10 @@ import UIKit
 /// Standard poster width across the app. Posters are 2:3, so height is `width * 1.5`.
 let kPosterWidth: CGFloat = 200
 
+/// Standard LANDSCAPE catalog-card width on tvOS (16:9, so height = width * 9 / 16 ~= 219pt, shorter than
+/// the 300pt poster height, so each rail reads as a cinematic stripe while shrinking vertically).
+let kLandscapeCardWidth: CGFloat = 390
+
 /// In-memory poster cache, on top of the shared URLCache (disk). Decoded images, evicted under memory
 /// pressure. Keyed by URL so a poster shown in several rails decodes once.
 private let posterMemoryCache: NSCache<NSURL, UIImage> = {
@@ -386,6 +390,70 @@ struct BrowseHeroBackdrop: View {
             }
         }
         .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
+    }
+}
+
+/// Cinematic LANDSCAPE artwork for a catalog card: a 16:9 cell filled with the title's CLEAN TMDB backdrop
+/// (textless, no rating overlay), resolved by id via `LandscapeBackdropCache`. With no TMDB backdrop (no key
+/// set, or none on TMDB) it does NOT crop a 2:3 poster into an ugly slab: it fills with a heavily blurred +
+/// darkened copy of the poster and lays the poster fit/centered on top, so the 16:9 frame always looks
+/// intentional. The add-on `meta.background` is deliberately NOT used (it is frequently a 2:3 poster URL, the
+/// source of the cropped art that got the first landscape attempt reverted). Same cached loader as `PosterArt`.
+struct LandscapeArt: View {
+    let id: String?
+    let type: String
+    let poster: String?
+    var width: CGFloat = kLandscapeCardWidth
+    @State private var image: UIImage?
+    @State private var usedBackdrop = false
+    @State private var failed = false
+
+    private var height: CGFloat { (width * 9 / 16).rounded() }
+
+    var body: some View {
+        Group {
+            if let image {
+                if usedBackdrop {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                } else {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .blur(radius: 26).opacity(0.55)
+                        .overlay(Color.black.opacity(0.35))
+                        .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit))
+                }
+            } else if failed {
+                Theme.Palette.surface2.overlay(
+                    Image(systemName: "film").font(.system(size: 40)).foregroundStyle(Theme.Palette.textTertiary)
+                )
+            } else {
+                Theme.Palette.surface2.overlay(ProgressView().tint(Theme.Palette.textTertiary))
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .task(id: id ?? poster ?? "") { await load() }
+    }
+
+    private func load() async {
+        image = nil; usedBackdrop = false; failed = false
+        // Clean TMDB textless 16:9 backdrop (cached by id). Only a real backdrop fills the cell.
+        if let id, let bd = await LandscapeBackdropCache.backdrop(id: id, type: type), let img = await fetch(bd) {
+            image = img; usedBackdrop = true; return
+        }
+        // No TMDB backdrop: composite the poster (blurred fill behind a fit copy), never an ugly 2:3 crop.
+        if let img = await fetch(poster) { image = img; usedBackdrop = false; return }
+        failed = true
+    }
+
+    private func fetch(_ raw: String?) async -> UIImage? {
+        guard let raw, !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
+        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
+              let img = UIImage(data: data) else { return nil }
+        posterMemoryCache.setObject(img, forKey: url as NSURL)
+        return img
     }
 }
 
