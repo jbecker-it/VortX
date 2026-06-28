@@ -379,13 +379,23 @@ final class VortXSyncManager: ObservableObject {
         // NEVER-ZERO, independent of the toggle: REPLACE only applies when the engine actually has a
         // non-empty add-on set; a degraded/empty engine falls back to UNION so a failed pull can never
         // zero the category. Engine entries win on conflict in both modes (freshest descriptor).
-        var addonsByUrl: [String: [String: Any]] = [:]
+        // ORDER-PRESERVING merge (AIOManager-compat: the AddonCollectionSet array order = Stremio
+        // priority, so sync must not scramble it). The engine collection order is authoritative and is
+        // the spine; in UNION mode the VortX-doc-only add-ons (in the prior sync but not the engine)
+        // append after, in their own order. The engine descriptor wins on a URL in both (freshest).
         let mirrorReplaceAddons = MirrorSettings.mirrorAddons && !engineAddons.isEmpty
-        if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
-            for entry in prior { if let url = entry["transportUrl"] as? String, !url.isEmpty { addonsByUrl[url] = entry } }
+        var addonList: [[String: Any]] = []
+        var seenAddonURLs = Set<String>()
+        for entry in engineAddons {
+            guard let url = entry["transportUrl"] as? String, seenAddonURLs.insert(url).inserted else { continue }
+            addonList.append(entry)
         }
-        for entry in engineAddons { if let url = entry["transportUrl"] as? String { addonsByUrl[url] = entry } }
-        let addonList = Array(addonsByUrl.values)
+        if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
+            for entry in prior {
+                guard let url = entry["transportUrl"] as? String, !url.isEmpty, seenAddonURLs.insert(url).inserted else { continue }
+                addonList.append(entry)
+            }
+        }
 
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
@@ -637,14 +647,19 @@ final class VortXSyncManager: ObservableObject {
     /// name}`-only entries (no manifest) are dropped: without a manifest the engine cannot InstallAddon.
     static func ownedAddons(from doc: [String: Any]) -> [VortXOwnedAddon] {
         var byUrl: [String: VortXOwnedAddon] = [:]
+        var order: [String] = []   // preserve install order (AIOManager-compat: collection order = priority)
+        func add(_ a: VortXOwnedAddon) {
+            if byUrl[a.transportUrl] == nil { order.append(a.transportUrl) }
+            byUrl[a.transportUrl] = a
+        }
         // doc.addons (web import) first, so doc.vortx.addons can overwrite with the richer app descriptor.
         if let webAddons = doc["addons"] as? [[String: Any]] {
-            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { byUrl[a.transportUrl] = a } }
+            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
         }
         if let vortx = doc["vortx"] as? [String: Any], let appAddons = vortx["addons"] as? [[String: Any]] {
-            for raw in appAddons { if let a = VortXOwnedAddon(json: raw) { byUrl[a.transportUrl] = a } }
+            for raw in appAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
         }
-        return Array(byUrl.values)
+        return order.compactMap { byUrl[$0] }
     }
 
     /// Rebuild the OWNER (account) library on a cold Stremio-less device, ONLY when the engine's account

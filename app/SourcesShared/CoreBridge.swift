@@ -102,18 +102,29 @@ final class CoreBridge: ObservableObject {
     /// it, build the full Descriptor the engine's InstallAddon action expects (mirroring UninstallAddon's
     /// contract), and dispatch it. The engine's ctx event then refreshes `addons`. Returns a user-facing
     /// error string on failure, nil on success.
-    @MainActor
-    func installAddon(urlString: String) async -> String? {
+    /// Normalize a pasted add-on URL the way installAddon does (trim + ensure a /manifest.json suffix),
+    /// so AddonsView can detect an already-installed URL and offer to UPDATE it instead of erroring.
+    /// Nil if it is not a valid http(s) URL.
+    func normalizedAddonURL(_ urlString: String) -> String? {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            return "Enter a valid add-on URL (https://…/manifest.json)."
-        }
+              scheme == "http" || scheme == "https" else { return nil }
         if !url.absoluteString.lowercased().hasSuffix("manifest.json") {
             url = url.appendingPathComponent("manifest.json")
         }
-        if addons.contains(where: { $0.transportUrl == url.absoluteString }) {
-            return "That add-on is already installed."
+        return url.absoluteString
+    }
+
+    @MainActor
+    func installAddon(urlString: String, replacingExisting: Bool = false) async -> String? {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
+            return "Enter a valid add-on URL (https://…/manifest.json)."
+        }
+        if addons.contains(where: { $0.transportUrl == normalized }) {
+            guard replacingExisting else { return "That add-on is already installed." }
+            // Update in place: drop the existing descriptor so InstallAddon takes the freshly-fetched
+            // manifest (refreshes name / logo / version). The engine processes Uninstall before Install.
+            if let existing = rawAddonsByUrl[normalized] { dispatchCtx(["action": "UninstallAddon", "args": existing]) }
         }
         do {
             let (data, resp) = try await URLSession.shared.data(from: url)

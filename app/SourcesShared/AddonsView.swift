@@ -100,6 +100,7 @@ struct AddonsView: View {
     @State private var installMessage: String?
     @State private var installFailed = false
     @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
+    @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
 
     var body: some View {
         NavigationStack {
@@ -152,6 +153,12 @@ struct AddonsView: View {
                 case .editURL(let a): EditAddonURLView(addon: a)
                 }
             }
+            .confirmationDialog("Add-on already installed", isPresented: $showUpdateConfirm, titleVisibility: .visible) {
+                Button("Update") { runInstall(replacingExisting: true) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This add-on is already installed. Update it to its latest manifest?")
+            }
         }
     }
 
@@ -197,30 +204,58 @@ struct AddonsView: View {
     }
 
     private func install() {
+        // Already installed? Offer to UPDATE (re-fetch the manifest) instead of erroring (owner request).
+        if let normalized = core.normalizedAddonURL(newAddonURL),
+           core.addons.contains(where: { $0.transportUrl == normalized }) {
+            showUpdateConfirm = true
+            return
+        }
+        runInstall(replacingExisting: false)
+    }
+
+    private func runInstall(replacingExisting: Bool) {
         installing = true
         installMessage = nil
         let url = newAddonURL
         Task { @MainActor in
-            let error = await core.installAddon(urlString: url)
+            let error = await core.installAddon(urlString: url, replacingExisting: replacingExisting)
             installing = false
             installFailed = error != nil
             if let error {
                 installMessage = error
             } else {
-                installMessage = "Installed."
+                installMessage = replacingExisting ? "Updated." : "Installed."
                 newAddonURL = ""
             }
+        }
+    }
+
+    /// The add-on's icon: its `manifest.logo` (so an AIOManager-set custom logo renders), falling back to
+    /// the capability SF Symbol when there is no logo or it fails to load.
+    @ViewBuilder private func addonIcon(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
+        let tint = isOff ? Theme.Palette.textTertiary
+                         : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
+        if let logo = addon.manifest.logo, let url = URL(string: logo) {
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFit()
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
+                        .opacity(isOff ? 0.5 : 1)
+                } else {
+                    Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint)
+                }
+            }
+            .frame(width: 56, height: 56)
+        } else {
+            Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint).frame(width: 56)
         }
     }
 
     private func addonRow(_ addon: CoreDescriptor) -> some View {
         let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
         return HStack(alignment: .top, spacing: Theme.Space.md) {
-            Image(systemName: addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill")
-                .font(.system(size: 36))
-                .foregroundStyle(isOff ? Theme.Palette.textTertiary
-                                       : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary))
-                .frame(width: 56)
+            addonIcon(addon, isOff: isOff)
             VStack(alignment: .leading, spacing: 8) {
                 Text(addon.manifest.name).font(Theme.Typography.cardTitle)
                     .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)

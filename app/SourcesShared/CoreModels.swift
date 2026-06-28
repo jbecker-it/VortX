@@ -178,6 +178,9 @@ struct CoreManifest: Decodable {
     let resources: [CoreManifestResource]?
     /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
     let behaviorHints: CoreManifestBehaviorHints?
+    /// The add-on's logo URL (Stremio `manifest.logo`). AIOManager bakes a user's custom logo here, so
+    /// VortX renders it on the add-on row for parity. Optional; older/sparser manifests omit it.
+    let logo: String?
 }
 
 /// Manifest-level `behaviorHints` (distinct from the meta-level + per-stream ones). `configurable` flags
