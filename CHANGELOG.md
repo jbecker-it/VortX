@@ -25,6 +25,8 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 - **Apple TV: offline downloads.** Download movies and episodes on Apple TV, with a note that the system can reclaim the space when storage runs low.
 - **A Collections hub on Home and Discover.** A new band high on the screen with three rows: Discover cards (Trending, Popular, Latest, Upcoming), Streaming Services shown with their logos (Netflix, Disney+, Prime, and the services available in your region, including anime, K-drama, and regional ones), and Genres. Tap any tile to browse its catalogs, Movies, Shows, New Movies, New Shows, Top This Week, Month, and Year, and Trending, and every title plays through VortX as usual. You can reorder the streaming services, turn the hub on or off for Home and Discover separately, and choose how often it refreshes. Needs a TMDB key (Settings, Metadata). It replaces the older grouped streaming and genre rails. On Apple TV, iPhone, iPad, and Mac.
 - **Budget and box office on a movie's page.** A movie now shows its budget, box office, and profit under the ratings. Movies only, needs a TMDB key, and you can hide it in Settings. On Apple TV, iPhone, iPad, and Mac.
+- **Spoiler-safe episodes.** Episode thumbnails you have not watched yet are blurred so a future episode's art does not spoil you. Watched episodes stay clear; turn it off in Settings. On Apple TV, iPhone, iPad, and Mac.
+- **AirPlay from the player.** iPhone and iPad now show an AirPlay button in the player overlay, so you can start AirPlay without leaving the app.
 
 ## 0.3.8 Beta 14 - 2026-06-29 (pre-release)
 
