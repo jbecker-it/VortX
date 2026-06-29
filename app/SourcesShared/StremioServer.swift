@@ -161,8 +161,9 @@ enum StremioServer {
     /// reopen). The player's own read-ahead buffer and the binge preload are independent of this.
     /// POST /settings merges the value (server.js: saveSettings -> userSettings.extend). Custom
     /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
-    static func applyServerConfig() async {
-        guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return }
+    @discardableResult
+    static func applyServerConfig(maxAttempts: Int = 20) async -> Bool {
+        guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return false }
         // The cache counts toward the app's OWN memory on iOS/iPadOS/tvOS (the server runs in-process), so
         // on top of mpv's 4K decode buffers even a 512 MB cache trips iOS jetsam on a real device during
         // playback (the device-only "server dies" report; the Simulator never hits it because it borrows
@@ -174,27 +175,36 @@ enum StremioServer {
         let physical = ProcessInfo.processInfo.physicalMemory
         let cap = Int(min(UInt64(192 * 1024 * 1024), max(UInt64(96 * 1024 * 1024), physical / 32)))
         #endif
-        for _ in 0 ..< 12 {
-            if await isOnline() {
-                var req = URLRequest(url: url)
-                req.httpMethod = "POST"
-                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                // cacheSize bounds the ON-DISK piece cache. It does NOT bound the engine's in-memory
-                // piece map: the disk storage backend writes each completed 512KB piece into a native
-                // Buffer (off-heap, so it never shows in the JS heap — the "heap flat at 27MB, RSS to
-                // 1.5GB" signature) and only frees it once the piece's verification group is whole AND
-                // the SINGLE-worker disk writer (bagpipe(1)) has drained it. With 55 default connections
-                // feeding pieces out-of-order, partial verify-groups pile up faster than they drain and
-                // the process gets jetsam-killed on iOS. Halving the connection count keeps far fewer
-                // partial groups in flight, so pieces verify+commit+free promptly and the in-memory map
-                // stays bounded. btMaxConnections flows through enginefs.getDefaults -> engine.connections.
-                // (Direct/debrid streams never touch this path; this only matters for torrent playback.)
-                let body: [String: Any] = ["cacheSize": cap, "btMaxConnections": 24]
-                req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-                _ = try? await URLSession.shared.data(for: req)
-                return
-            }
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
+        // cacheSize bounds the ON-DISK piece cache. It does NOT bound the engine's in-memory
+        // piece map: the disk storage backend writes each completed 512KB piece into a native
+        // Buffer (off-heap, so it never shows in the JS heap — the "heap flat at 27MB, RSS to
+        // 1.5GB" signature) and only frees it once the piece's verification group is whole AND
+        // the SINGLE-worker disk writer (bagpipe(1)) has drained it. With 55 default connections
+        // feeding pieces out-of-order, partial verify-groups pile up faster than they drain and
+        // the process gets jetsam-killed on iOS. Halving the connection count keeps far fewer
+        // partial groups in flight, so pieces verify+commit+free promptly and the in-memory map
+        // stays bounded. btMaxConnections flows through enginefs.getDefaults -> engine.connections.
+        // (Direct/debrid streams never touch this path; this only matters for torrent playback.)
+        let body: [String: Any] = ["cacheSize": cap, "btMaxConnections": 24]
+        guard let payload = try? JSONSerialization.data(withJSONObject: body) else { return false }
+        // POST the cap and VERIFY it landed (HTTP 200), retrying while the server finishes its cold boot.
+        // This cap is the ONLY thing keeping the in-process torrent cache off the jetsam line, and the
+        // engine reads it at engine-creation time -- so a silently-dropped POST means the server runs its
+        // 2 GB default cache + 55 connections and tvOS jetsam-kills the whole app under torrent load (the
+        // "server crash / nav bar dead / whole device sluggish" class). The old code fire-and-forgot the
+        // POST with no 200 check and no retry, so a boot slower than its 18 s window left the cap unset for
+        // the entire session. A successful POST also proves the server is reachable, so it doubles as the
+        // readiness gate (no separate isOnline() round-trip). Bounded loop; ~1 s between tries.
+        for attempt in 0 ..< max(1, maxAttempts) {
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = payload
+            req.timeoutInterval = 4
+            if let (_, resp) = try? await URLSession.shared.data(for: req),
+               (resp as? HTTPURLResponse)?.statusCode == 200 { return true }
+            if attempt < maxAttempts - 1 { try? await Task.sleep(nanoseconds: 1_000_000_000) }
         }
+        return false
     }
 }

@@ -2104,10 +2104,20 @@ struct TVPlayerView: View {
         let body: [String: Any] = ["torrent": ["infoHash": hash],
                                    "peerSearch": ["sources": sources, "min": 40, "max": 150]]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var request = URLRequest(url: url); request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = data
-        URLSession.shared.dataTask(with: request).resume()
+        // Guarantee the TV-safe cache + connection cap is applied BEFORE this engine is created: the server
+        // reads cacheSize + btMaxConnections at engine-creation time (enginefs.getDefaults), and the boot-time
+        // apply can silently miss on a slow cold start -- leaving this engine at the 2 GB default cache + 55
+        // connections, which jetsams the whole 2 GB Apple TV under torrent load (the owner's "server crash /
+        // hang after finishing one title and opening another" report). A quick (<=3 try) VERIFIED apply here
+        // makes every torrent engine start capped, not just when the one-shot boot POST happened to land.
+        // No-op on a custom remote server (applyServerConfig returns immediately when isCustom).
+        Task {
+            await StremioServer.applyServerConfig(maxAttempts: 3)
+            var request = URLRequest(url: url); request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = data
+            URLSession.shared.dataTask(with: request).resume()
+        }
     }
 
     /// Tell the embedded server to destroy a torrent engine (GET /{hash}/remove). Each engine
@@ -2133,8 +2143,15 @@ struct TVPlayerView: View {
     }
 
     /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream.
+    /// Matches the ACTIVE streaming server's host:port (the embedded :11470 OR a custom remote server),
+    /// not a hardcoded :11470 -- otherwise closeTorrent silently skipped teardown for custom-server
+    /// torrents and leaked their swarms (peers/sockets/cache) across plays, the same RSS-balloon that
+    /// the embedded path's remove() exists to prevent. curURL is built from StremioServer.base, so the
+    /// host+port compare against base is exact.
     private var currentTorrentHash: String? {
-        guard let u = curURL, u.port == 11470, u.pathComponents.count >= 2 else { return nil }
+        guard let u = curURL, let serverBase = URL(string: StremioServer.base),
+              u.host == serverBase.host, u.port == serverBase.port,
+              u.pathComponents.count >= 2 else { return nil }
         let hash = u.pathComponents[1]
         return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
     }

@@ -961,8 +961,14 @@ final class ProfileStore: ObservableObject {
     var cwItems: [CoreCWItem] {
         var dated: [(lastWatched: String, item: CoreCWItem)] = []
         for (metaId, entry) in watch {
-            if entry.type == "movie", entry.durationMs > 0,
-               Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95 { continue }
+            // A finished MOVIE leaves Continue Watching. Two finish signals: the movie's OWN id marked
+            // watched (markWatched/setWatched append it; finishedWatching then zeroes the offset, so without
+            // this a watched movie stays pinned forever by the watchedVideoIds keep-rule below), OR a near-end
+            // offset. A series is unaffected: its keep-signal is EPISODE ids, never the series metaId, so it
+            // rolls forward to the next episode as before. (libraryItems keeps finished movies; this is cwItems.)
+            if entry.type == "movie",
+               entry.watchedVideoIds.contains(metaId)
+                || (entry.durationMs > 0 && Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95) { continue }
             guard entry.timeOffsetMs > 0 || !entry.watchedVideoIds.isEmpty else { continue }
             let item = CoreCWItem(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
                                   state: CoreLibState(timeOffset: Double(entry.timeOffsetMs),
@@ -1100,19 +1106,21 @@ final class ProfileStore: ObservableObject {
 
     private func schedulePushWatch() {
         pushWatchTask?.cancel()
-        // An overlay profile's library/CW just changed: nudge the VortX E2E sync so doc.vortx.byProfile
-        // refreshes and the SyncRoom broadcast fires, so sibling devices pull within ~5s and
-        // applyRemoteOverlay shows it (real-time per-profile sync). Runs regardless of the legacy
-        // ProfileSync key below; requestSyncSoon no-ops when not signed into a VortX account.
-        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
-        guard let profile = active, !profile.usesEngineHistory,
-              let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
+        // DEBOUNCED (3s): progress writes fire on every ~20s tick AND on every pause / seek / menu / close,
+        // so nudging the VortX E2E sync on EACH write (the old immediate requestSyncSoon) stormed the
+        // whole-doc encrypt + push on overlay profiles - a burst of seeks = a burst of syncs. Coalesce BOTH
+        // the E2E nudge and the legacy ProfileSync push into one trailing task, so a burst of writes = ONE
+        // sync 3s after the last write. requestSyncSoon no-ops when not signed into a VortX account.
+        let profile = active
         let snapshot = watch
-        let id = profile.id
-        pushWatchTask = Task {
+        pushWatchTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
-            await ProfileSync.pushWatch(snapshot, profileID: id, authKey: key)
+            VortXSyncManager.shared.requestSyncSoon()
+            if let profile, !profile.usesEngineHistory,
+               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty {
+                await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key)
+            }
         }
     }
 
