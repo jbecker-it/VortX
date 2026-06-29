@@ -7,6 +7,10 @@ import UIKit
 /// Standard poster width across the app. Posters are 2:3, so height is `width * 1.5`.
 let kPosterWidth: CGFloat = 200
 
+/// Standard LANDSCAPE catalog-card width on tvOS (16:9, so height = width * 9 / 16 ~= 219pt, shorter than
+/// the 300pt poster height, so each rail reads as a cinematic stripe while shrinking vertically).
+let kLandscapeCardWidth: CGFloat = 390
+
 /// In-memory poster cache, on top of the shared URLCache (disk). Decoded images, evicted under memory
 /// pressure. Keyed by URL so a poster shown in several rails decodes once.
 private let posterMemoryCache: NSCache<NSURL, UIImage> = {
@@ -78,6 +82,7 @@ struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
     let metaLine: String      // prebuilt "2026 · ★ 7.6 · Movie" style line
     let overview: String?
     var genreLine: String?    // "Drama · Fantasy · Adventure" (optional so older caches decode)
+    var logo: String?         // clearlogo URL (add-on meta.logo or metahub); optional so older caches decode
 }
 
 /// The standard Stremio background art for an IMDB-identified title: real 16:9 backdrop art at
@@ -85,6 +90,13 @@ struct FocusedHero: Codable, Equatable, Hashable, Identifiable {
 private func metahubBackground(for id: String) -> String? {
     guard id.hasPrefix("tt") else { return nil }
     return "https://images.metahub.space/background/big/\(id)/img"
+}
+
+/// The standard Stremio clearlogo (transparent PNG) for an IMDB-identified title, mirroring the iOS hero
+/// seed. Only `tt` ids have metahub art; other id schemes fall back to the add-on `meta.logo` via enrichment.
+private func metahubLogo(for id: String) -> String? {
+    guard id.hasPrefix("tt") else { return nil }
+    return "https://images.metahub.space/logo/medium/\(id)/img"
 }
 
 extension CoreMeta {
@@ -97,7 +109,7 @@ extension CoreMeta {
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: background ?? metahubBackground(for: id) ?? poster,
                            metaLine: parts.joined(separator: "  ·  "), overview: description,
-                           genreLine: genreLine)
+                           genreLine: genreLine, logo: logo ?? metahubLogo(for: id))
     }
 }
 
@@ -109,7 +121,7 @@ extension CoreCWItem {
         let line = pct > 0 ? "\(type.capitalized)  ·  \(pct)% watched" : type.capitalized
         return FocusedHero(id: id, type: type, title: name,
                            backdrop: metahubBackground(for: id) ?? poster,
-                           metaLine: line, overview: nil, genreLine: nil)
+                           metaLine: line, overview: nil, genreLine: nil, logo: metahubLogo(for: id))
     }
 }
 
@@ -159,7 +171,8 @@ extension CoreCWItem {
         return FocusedHero(id: hero.id, type: hero.type, title: hero.title,
                            backdrop: cached.backdrop ?? hero.backdrop,
                            metaLine: line, overview: cached.overview ?? hero.overview,
-                           genreLine: cached.genreLine ?? hero.genreLine)
+                           genreLine: cached.genreLine ?? hero.genreLine,
+                           logo: cached.logo ?? hero.logo)
     }
 
     /// Capture what the detail page knows (the engine resolves EVERY id scheme, tmdb: included), so
@@ -176,7 +189,7 @@ extension CoreCWItem {
         let genreLine = (genres?.isEmpty == false) ? genres!.prefix(3).joined(separator: " · ") : nil
         let hero = FocusedHero(id: id, type: type, title: title, backdrop: backdrop,
                                metaLine: parts.joined(separator: "  ·  "), overview: overview,
-                               genreLine: genreLine)
+                               genreLine: genreLine, logo: metahubLogo(for: id))
         guard enrichmentCache[id] != hero else { return }
         enrichmentCache[id] = hero
         saveCache()
@@ -255,7 +268,8 @@ extension CoreCWItem {
                 let enriched = FocusedHero(id: hero.id, type: hero.type, title: hero.title,
                                            backdrop: meta.background ?? hero.backdrop,
                                            metaLine: parts.joined(separator: "  ·  "),
-                                           overview: meta.description, genreLine: genreLine)
+                                           overview: meta.description, genreLine: genreLine,
+                                           logo: meta.logo ?? hero.logo)
                 await MainActor.run {
                     Self.enrichmentCache[hero.id] = enriched
                     Self.saveCache()
@@ -284,6 +298,7 @@ private struct AddonMetaResponse: Decodable {
         let background: String?
         let runtime: String?
         let genres: [String]?
+        let logo: String?
     }
     let meta: Meta?
 }
@@ -324,6 +339,9 @@ struct BrowseHeroBackdrop: View {
     /// even as the tab bar shows or hides and shifts the top safe area.
     var detailsBottom: CGFloat? = nil
     @EnvironmentObject private var theme: ThemeManager
+    /// The focused title's clean TMDB clearlogo (textless PNG), resolved by id like the landscape cards.
+    /// nil until it resolves (or when TMDB has none / no key) - the title then falls back to styled text.
+    @State private var heroLogo: UIImage?
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -343,6 +361,9 @@ struct BrowseHeroBackdrop: View {
         }
         .animation(.easeOut(duration: 0.35), value: model.hero?.id)
         .animation(.easeOut(duration: 0.25), value: model.detailsVisible)
+        // Resolve the focused title's clearlogo by id (TMDB, same source as the landscape cards) so the
+        // hero shows the logo in place of the serif title text, matching the iOS/Mac hero. Re-runs per hero.
+        .task(id: model.hero?.id) { await loadHeroLogo() }
         // No ignoresSafeArea here: the image layer handles its own full-bleed, and keeping this
         // container inside the safe area lets the tab bar reclaim focus when you press up at the top.
     }
@@ -361,11 +382,19 @@ struct BrowseHeroBackdrop: View {
     /// reads as one composed unit instead of evenly stacked lines.
     private func detailsBlock(_ hero: FocusedHero) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(hero.title)
-                .font(Theme.Typography.screenTitle)
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .lineLimit(2).minimumScaleFactor(0.7)
-                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+            if let heroLogo {
+                // The clearlogo IS the title in image form; expose the name to VoiceOver, not the art.
+                Image(uiImage: heroLogo).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: 540, maxHeight: 180, alignment: .leading)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                    .accessibilityLabel(hero.title)
+            } else {
+                Text(hero.title)
+                    .font(Theme.Typography.screenTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(2).minimumScaleFactor(0.7)
+                    .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+            }
             Text(hero.metaLine)
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
@@ -387,6 +416,117 @@ struct BrowseHeroBackdrop: View {
         }
         .shadow(color: .black.opacity(0.35), radius: 8, y: 2)
     }
+
+    /// Resolve + load the focused hero's clearlogo. Resets immediately on every hero change so the title
+    /// text shows at once, then swaps to the logo when it resolves (nil = TMDB has none / no key = text stays).
+    private func loadHeroLogo() async {
+        heroLogo = nil
+        guard let hero = model.hero else { return }
+        // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo. Both fail-soft.
+        let resolved = await Fanart.logo(id: hero.id, type: hero.type)
+            ?? PosterArtwork.logo(id: hero.id, fallback: hero.logo ?? metahubLogo(for: hero.id))
+        guard let lg = resolved, let img = await fetchHeroImage(lg) else { return }
+        heroLogo = img
+    }
+
+    private func fetchHeroImage(_ raw: String) async -> UIImage? {
+        guard !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
+        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
+              let img = UIImage(data: data) else { return nil }
+        posterMemoryCache.setObject(img, forKey: url as NSURL)
+        return img
+    }
+}
+
+/// Cinematic LANDSCAPE artwork for a catalog card: a 16:9 cell filled with the title's CLEAN TMDB backdrop
+/// (textless, no rating overlay), resolved by id via `LandscapeBackdropCache`. With no TMDB backdrop (no key
+/// set, or none on TMDB) it does NOT crop a 2:3 poster into an ugly slab: it fills with a heavily blurred +
+/// darkened copy of the poster and lays the poster fit/centered on top, so the 16:9 frame always looks
+/// intentional. The add-on `meta.background` is deliberately NOT used (it is frequently a 2:3 poster URL, the
+/// source of the cropped art that got the first landscape attempt reverted). Same cached loader as `PosterArt`.
+struct LandscapeArt: View {
+    let id: String?
+    let type: String
+    let title: String
+    let poster: String?
+    var width: CGFloat = kLandscapeCardWidth
+    @State private var image: UIImage?
+    @State private var logo: UIImage?
+    @State private var usedBackdrop = false
+    @State private var failed = false
+
+    private var height: CGFloat { (width * 9 / 16).rounded() }
+
+    var body: some View {
+        Group {
+            if let image {
+                if usedBackdrop {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .overlay { titleLayer }
+                } else {
+                    Image(uiImage: image).resizable().aspectRatio(contentMode: .fill)
+                        .blur(radius: 26).opacity(0.55)
+                        .overlay(Color.black.opacity(0.35))
+                        .overlay(Image(uiImage: image).resizable().aspectRatio(contentMode: .fit))
+                }
+            } else if failed {
+                Theme.Palette.surface2.overlay(
+                    Image(systemName: "film").font(.system(size: 40)).foregroundStyle(Theme.Palette.textTertiary)
+                )
+            } else {
+                Theme.Palette.surface2.overlay(ProgressView().tint(Theme.Palette.textTertiary))
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .task(id: id ?? poster ?? "") { await load() }
+    }
+
+    /// The title ON the cinematic backdrop: the title's clean TMDB clearlogo when one resolves, else the
+    /// title as styled text, both over a bottom scrim so they read on any backdrop.
+    @ViewBuilder private var titleLayer: some View {
+        ZStack(alignment: .bottomLeading) {
+            LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .center, endPoint: .bottom)
+            if let logo {
+                Image(uiImage: logo).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: width * 0.6, maxHeight: height * 0.42, alignment: .bottomLeading)
+                    .padding(Theme.Space.md)
+            } else {
+                Text(title)
+                    .font(.system(size: 22, weight: .bold)).lineLimit(2)
+                    .foregroundStyle(.white).shadow(color: .black.opacity(0.6), radius: 4, y: 1)
+                    .padding(Theme.Space.md)
+            }
+        }
+    }
+
+    private func load() async {
+        image = nil; logo = nil; usedBackdrop = false; failed = false
+        // Clean TMDB textless 16:9 backdrop (cached by id). Only a real backdrop fills the cell.
+        if let id, let bd = await LandscapeBackdropCache.backdrop(id: id, type: type), let img = await fetch(bd) {
+            image = img; usedBackdrop = true
+            // Title overlay: prefer the clearlogo (PNG); titleLayer falls back to text when nil.
+            if let lg = await LandscapeBackdropCache.logo(id: id, type: type) { logo = await fetch(lg) }
+            return
+        }
+        // No TMDB backdrop: composite the poster (blurred fill behind a fit copy), never an ugly 2:3 crop.
+        if let img = await fetch(poster) { image = img; usedBackdrop = false; return }
+        failed = true
+    }
+
+    private func fetch(_ raw: String?) async -> UIImage? {
+        guard let raw, !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
+        var req = URLRequest(url: url)
+        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
+        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
+              let img = UIImage(data: data) else { return nil }
+        posterMemoryCache.setObject(img, forKey: url as NSURL)
+        return img
+    }
 }
 
 /// The focusable poster + title used in every rail and grid. Navigates to the detail page; crafted
@@ -403,6 +543,15 @@ struct PosterCard: View {
     var onFocus: (() -> Void)? = nil   // browse pages report focus to drive the hero backdrop
     var directPlay: (() -> Void)? = nil   // Continue Watching: resume the same link straight into the player
     var onDetails: (() -> Void)? = nil    // Continue Watching: open the full detail page from the long-press menu
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+
+    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
+    /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
+    /// users keep the clean portrait grid until they add a key (Settings > API keys).
+    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    /// Landscape cards use one cinematic width; portrait cards honor the caller's `width`.
+    private var cardWidth: CGFloat { landscape ? kLandscapeCardWidth : width }
 
     var body: some View {
         if menu == .none {
@@ -429,7 +578,13 @@ struct PosterCard: View {
     private var legacyCardLabel: some View {
         Group {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                PosterArt(XRDB.imageURL(id: id, fallback: poster), width: width)
+                Group {
+                    if landscape {
+                        LandscapeArt(id: id, type: type, title: title, poster: PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
+                    } else {
+                        PosterArt(PosterArtwork.poster(id: id, fallback: poster), width: cardWidth)
+                    }
+                }
                     .overlay(alignment: .bottom) {
                         if let progress, progress > 0.01 {
                             ProgressStripe(value: progress).padding(Theme.Space.xs)
@@ -440,7 +595,7 @@ struct PosterCard: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .foregroundStyle(Theme.Palette.textSecondary)
-                    .frame(width: width, alignment: .leading)
+                    .frame(width: cardWidth, alignment: .leading)
             }
             .background { if let onFocus { FocusReporter(onFocus: onFocus) } }
             // Pin the focus/long-press interaction region to the card's RESTING rect. Without this,

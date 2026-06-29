@@ -142,6 +142,10 @@ struct CoreDescriptor: Decodable, Identifiable {
     var id: String { transportUrl }
     /// Default addons (Cinemeta, the local addon) the engine refuses to uninstall.
     var isProtected: Bool { flags?.protected ?? false }
+    /// A Stremio default/official add-on (Cinemeta, the local add-on, WatchHub, Public Domain, …). A
+    /// logout resets the profile to ONLY these, so "every add-on is official" means the user's installed
+    /// add-ons were wiped.
+    var isOfficial: Bool { flags?.official ?? false }
 
     var providesStreams: Bool { (manifest.resources ?? []).contains { $0.name == "stream" } }
     var providesMeta: Bool { (manifest.resources ?? []).contains { $0.name == "meta" } }
@@ -149,6 +153,18 @@ struct CoreDescriptor: Decodable, Identifiable {
     var hasCatalogs: Bool { !manifest.catalogs.isEmpty }
     /// Host only (the full transportUrl can embed a debrid config token).
     var host: String { URL(string: transportUrl)?.host ?? transportUrl }
+    /// True when the add-on declares a web configuration page (manifest behaviorHints.configurable).
+    var isConfigurable: Bool { manifest.behaviorHints?.configurable == true }
+    /// The add-on's configuration page: the manifest URL with the trailing `manifest.json` swapped for
+    /// `configure` (the Stremio convention). Opens in a browser on iPhone/iPad/Mac; on Apple TV the
+    /// Configure sheet shows it as a QR to finish on a phone (or via the web dashboard).
+    var configureURL: URL? {
+        guard isConfigurable else { return nil }
+        if transportUrl.hasSuffix("/manifest.json") {
+            return URL(string: String(transportUrl.dropLast("manifest.json".count)) + "configure")
+        }
+        return URL(string: transportUrl)
+    }
     /// "Catalogs · Streams · Subtitles", the resource kinds the addon exposes.
     var capabilities: String {
         var caps: [String] = []
@@ -164,6 +180,18 @@ struct CoreManifest: Decodable {
     let name: String
     let catalogs: [CoreManifestCatalog]
     let resources: [CoreManifestResource]?
+    /// Manifest-level behaviorHints; `configurable` means the add-on exposes a web configuration page.
+    let behaviorHints: CoreManifestBehaviorHints?
+    /// The add-on's logo URL (Stremio `manifest.logo`). AIOManager bakes a user's custom logo here, so
+    /// VortX renders it on the add-on row for parity. Optional; older/sparser manifests omit it.
+    let logo: String?
+}
+
+/// Manifest-level `behaviorHints` (distinct from the meta-level + per-stream ones). `configurable` flags
+/// that the add-on has a config page (Stremio convention: its manifest URL with `manifest.json` -> `configure`).
+struct CoreManifestBehaviorHints: Decodable {
+    let configurable: Bool?
+    let configurationRequired: Bool?
 }
 
 /// `ManifestResource` is `#[serde(untagged)]`: either a bare string ("stream") or an object
@@ -198,6 +226,10 @@ struct CoreBoardRow: Identifiable {
     let title: String
     let type: String
     let items: [CoreMeta]
+    /// Index of this catalog in the engine's `board.catalogs`, so a Home row can ask the engine to
+    /// `LoadNextPage(engineIndex)` for its own horizontal infinite scroll (#95). Stable across page
+    /// loads and board widening; `buildBoardRows` captures it before the display filter/sort.
+    let engineIndex: Int
 }
 
 /// The content types Stremio treats as Live TV (the same set tvOS uses for its live-tuned player
@@ -433,9 +465,25 @@ struct CoreStream: Decodable, Identifiable {
     var id: String { (url ?? externalUrl ?? infoHash ?? "?") + "#" + (name ?? "") + (description ?? "") }
     var isTorrent: Bool { url == nil && infoHash != nil }
 
+    /// A bare YouTube source (`ytId`, no direct `url`): a trailer/clip from a trailer add-on like
+    /// Streailer, not a full feature stream. Playable (via the `/yt` route in `playableURL`) so the
+    /// user can tap it, but excluded from quality RANKING and the one-press auto-pick — otherwise an
+    /// unscored "🎬 Trailer" row could become `StreamRanking.best` and play the trailer in place of
+    /// the movie (and a trailer must never be recorded as Continue Watching).
+    var isYouTubeTrailer: Bool { url == nil && infoHash == nil && (ytId.map { !$0.isEmpty } ?? false) }
+
     /// Direct/debrid URLs play as-is; torrents go through the embedded streaming server.
+    ///
+    /// A `ytId`-only stream is a YouTube source (e.g. a trailer add-on like Streailer returns
+    /// `{ "ytId": "…" }` streams, no `url`/`infoHash`): play it through the embedded server's
+    /// `/yt/{id}` route — the same InnerTube redirect the Trailer button uses (`TrailerRequest`).
+    /// Gated on `canProxy` so the Lite build (no embedded server) leaves it non-playable, exactly
+    /// as before. Without this, every Streailer stream rendered as an inert lock-icon row.
     var playableURL: URL? {
         if let url, let parsed = URL(string: url) { return parsed }
+        if let ytId, !ytId.isEmpty, StremioServer.canProxy {
+            return URL(string: "\(StremioServer.base)/yt/\(ytId)")
+        }
         guard !PlaybackSettings.torrentsDisabled else { return nil }
         guard let hash = infoHash?.lowercased() else { return nil }
         return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
@@ -475,6 +523,10 @@ struct CoreDiscover: Decodable {
     let selectable: CoreDiscoverSelectable
     let catalog: [CoreCatalogPage]          // Vec<ResourceLoadable<Vec<MetaItemPreview>>> (pages)
     var items: [CoreMeta] { catalog.compactMap { $0.content?.ready }.flatMap { $0 } }
+    /// True while any catalog page is still loading (e.g. a just-dispatched next-page request). Lets the
+    /// bridge tell a mid-load emit (same item count, more coming) apart from a settled end-of-catalog
+    /// (load finished with no new items), so cursorless-pagination end-detection never latches early.
+    var isLoadingPage: Bool { catalog.contains { $0.content?.isLoading == true } }
 }
 
 struct CoreDiscoverSelectable: Decodable {
@@ -579,4 +631,70 @@ struct CoreLibraryRequest: Codable, Hashable {
     let type: String?
     let sort: String
     let page: Int
+}
+
+// MARK: - VortX account-owned add-on (sync doc)
+
+/// A full add-on descriptor the VortX account OWNS, stored plaintext in `doc.vortx.addons` so the
+/// engine can be re-hydrated network-free when a Stremio session is absent/degraded (the "0 sources /
+/// 0 add-ons" fix). The shape mirrors the engine's `InstallAddon` descriptor (`{transportUrl, manifest,
+/// flags}`) so a re-dispatch is byte-shape-exact, plus `name` for the dashboard. `manifest`/`flags`
+/// are kept as opaque JSON passthrough so the descriptor round-trips into the engine unchanged without
+/// this layer needing to model the whole Stremio manifest schema. Only descriptors enter the doc (the
+/// Stremio token stays Keychain-only); these already ride `doc.addons` + `apiKeys` E2E today.
+struct VortXOwnedAddon {
+    let transportUrl: String
+    let name: String
+    let manifest: [String: Any]   // opaque passthrough, re-dispatched verbatim to the engine
+    let flags: [String: Any]?
+
+    /// Build from one `doc.vortx.addons` (or `doc.addons`) entry. Tolerates the legacy
+    /// `{transportUrl,name}`-only shape (manifest absent) by skipping it: without a manifest the engine
+    /// cannot InstallAddon, so it is not hydratable and is dropped rather than dispatched as a no-op.
+    init?(json: [String: Any]) {
+        guard let url = json["transportUrl"] as? String, !url.isEmpty,
+              let manifest = json["manifest"] as? [String: Any] else { return nil }
+        self.transportUrl = url
+        self.manifest = manifest
+        self.flags = json["flags"] as? [String: Any]
+        self.name = (json["name"] as? String) ?? (manifest["name"] as? String) ?? url
+    }
+
+    /// The exact `InstallAddon` descriptor the engine expects (`installAddon` sends the same shape).
+    /// Keys are camelCase to match the engine's serde contract; a lowercase-key mismatch silently
+    /// no-ops in the engine, so this MUST stay aligned with CoreBridge.installAddon.
+    var installDescriptor: [String: Any] {
+        var d: [String: Any] = ["transportUrl": transportUrl, "manifest": manifest]
+        d["flags"] = flags ?? ["official": false, "protected": false]
+        return d
+    }
+}
+
+// MARK: - Stremio mirror settings (owner-requested per-category control)
+
+/// Per-category control of whether VortX mirrors a live Stremio account.
+///
+/// DEFAULT OFF for every category = the FLOOR: VortX owns the category. Snapshot-on-import seeds it
+/// once, hydrate-from-doc keeps it alive, and a Stremio removal NEVER removes it from VortX.
+///
+/// ON = EXACT MIRROR for that category: on a SUCCESSFUL Stremio reconcile the VortX-owned set for the
+/// category is replaced to match the live Stremio set (adds AND removes tracked).
+///
+/// The never-zero guard is independent of these toggles: a failed/absent/empty Stremio pull is ignored
+/// and never zeroes a category. Hydrate-from-doc is also NOT gated by the toggles. The toggles only
+/// control the snapshot/mirror DIRECTION (Stremio -> VortX) and whether Stremio removals propagate.
+///
+/// Stored in UserDefaults so the flags ride the SettingsBackup blob (doc.settings) and sync across
+/// devices.
+enum MirrorSettings {
+    static let addonsKey = "stremiox.sync.mirror.addons"
+    static let libraryKey = "stremiox.sync.mirror.library"
+    static let continueWatchingKey = "stremiox.sync.mirror.cw"
+
+    /// Mirror add-ons from Stremio (default OFF = VortX keeps its own add-on set).
+    static var mirrorAddons: Bool { UserDefaults.standard.bool(forKey: addonsKey) }
+    /// Mirror library from Stremio (default OFF = VortX keeps its own library).
+    static var mirrorLibrary: Bool { UserDefaults.standard.bool(forKey: libraryKey) }
+    /// Mirror Continue Watching from Stremio (default OFF = VortX keeps its own CW).
+    static var mirrorContinueWatching: Bool { UserDefaults.standard.bool(forKey: continueWatchingKey) }
 }

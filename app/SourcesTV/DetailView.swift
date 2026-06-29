@@ -12,6 +12,10 @@ struct DetailView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation (Trailer)
 
+    // #44 in-hero trailer gating, the SAME keys iOS uses: the "Autoplay trailers" setting + reduce-motion.
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
     @State private var watchAvail: TMDBClient.WatchAvailability?
@@ -223,16 +227,15 @@ struct DetailView: View {
     private func moviePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
+            // #44: the muted, looping trailer fades in OVER the still backdrop (full-bleed, behind the
+            // scrolling content). Non-focusable + no hit-testing, so the focus engine is untouched.
+            heroTrailerLayer(m).ignoresSafeArea()
             ScrollView {
                 VStack(alignment: .leading, spacing: Theme.Space.lg) {
                     VStack(alignment: .leading, spacing: Theme.Space.lg) {
                         Spacer().frame(height: 380)
                         VStack(alignment: .leading, spacing: Theme.Space.sm) {
-                            Text(m.name)
-                                .font(Theme.Typography.hero).tracking(-1.5)
-                                .foregroundStyle(Theme.Palette.textPrimary)
-                                .lineLimit(2).minimumScaleFactor(0.6)
-                                .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
+                            titleOrLogo(m)
                             metaRow(m)
                             ratingsRow()
                             if let d = m.description, !d.isEmpty {
@@ -257,6 +260,25 @@ struct DetailView: View {
                 .padding(.bottom, Theme.Space.xl)
             }
         }
+    }
+
+    /// The title block: an ERDB rating-baked logo (or the add-on's clearart logo) by id when available,
+    /// otherwise the serif hero title text. Mirrors iOS `iOSDetailView.titleOrLogo`.
+    @ViewBuilder private func titleOrLogo(_ m: CoreMetaItem) -> some View {
+        // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
+        ResolvedTitleLogo(id: m.id, type: m.type, fallbackLogo: m.logo,
+                          maxWidth: 640, maxHeight: 200, shadowOpacity: 0.5, shadowRadius: 12,
+                          accessibilityName: m.name) {
+            heroTitleText(m)
+        }
+    }
+
+    private func heroTitleText(_ m: CoreMetaItem) -> some View {
+        Text(m.name)
+            .font(Theme.Typography.hero).tracking(-1.5)
+            .foregroundStyle(Theme.Palette.textPrimary)
+            .lineLimit(2).minimumScaleFactor(0.6)
+            .shadow(color: .black.opacity(0.5), radius: 12, y: 4)
     }
 
     /// Live channel page: the same full-bleed cinematic backdrop as a movie, but stripped of VOD chrome —
@@ -369,20 +391,21 @@ struct DetailView: View {
     private func hero(_ m: CoreMetaItem, primaryEpisode: CoreVideo? = nil, primaryIsResume: Bool = false,
                       primaryProgress: Double = 0,
                       scrollToContent: @escaping () -> Void) -> some View {
+        // FIX J: the series hero is now FULL-BLEED, matching the movie detail + home hero, instead of the
+        // old fixed ~560pt clipped band that read as a small box. The backdrop uses the shared
+        // FullBleedBackdrop treatment (self-bleeding past safe area horizontally, warm canvas scrims), and
+        // the hero region fills a tall top band proportioned like the movie page hero. The episode list
+        // (CoreSeasonedEpisodes) still renders BELOW it in the seriesPage scroll, unchanged.
         ZStack(alignment: .bottomLeading) {
-            AsyncImage(url: URL(string: m.background ?? m.poster ?? "")) { phase in
-                switch phase {
-                case .success(let img): img.resizable().aspectRatio(contentMode: .fill)
-                default: Theme.Palette.surface1
-                }
-            }
-            .frame(height: 560)
-            .frame(maxWidth: .infinity)
-            .clipped()
-            .overlay(LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
-                                    startPoint: .top, endPoint: .bottom))
-            .overlay(LinearGradient(colors: [Theme.Palette.canvas.opacity(0.75), .clear],
-                                    startPoint: .leading, endPoint: .center))
+            FullBleedBackdrop(url: m.background ?? m.poster)
+            // #44: the muted, looping trailer fades in OVER the still hero art, full-bleed behind the title.
+            // Non-focusable + no hit-testing, so the focusable Play / Episodes row below is untouched.
+            heroTrailerLayer(m).ignoresSafeArea()
+            // A bottom canvas scrim under the title/actions block so it stays readable over vivid art.
+            LinearGradient(colors: [.clear, Theme.Palette.canvas.opacity(0.55), Theme.Palette.canvas],
+                           startPoint: .top, endPoint: .bottom)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
 
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Text(m.name)
@@ -443,7 +466,29 @@ struct DetailView: View {
             .padding(.horizontal, Theme.Space.screenEdge)
             .padding(.bottom, Theme.Space.lg)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // FIX J: a tall, full-width hero region so the backdrop fills the top of the screen like the movie
+        // detail + home hero, instead of the old small ~560pt band. The title/actions block stays pinned to
+        // the bottom (ZStack .bottomLeading); the episode list scrolls in below this in seriesPage.
+        .frame(maxWidth: .infinity, minHeight: 760, alignment: .bottomLeading)
+    }
+
+    /// #44 in-hero trailer layer: a muted, looping libmpv clip ({serverBase}/yt/{id}) painted OVER the
+    /// still backdrop on the cinematic detail header, the tvOS twin of the iOS `InHeroTrailerView`. Mounted
+    /// only when ALL hold: the "Autoplay trailers" setting is on, motion is allowed, this is a VOD title
+    /// (live channels carry no trailers), and `TrailerRequest` resolved a PLAYABLE url. The url is nil on the
+    /// Lite build (no `/yt` route) and for a YouTube-only trailer with no server, so the layer never mounts
+    /// there and the still backdrop stays — the same auto-hide the Trailer chip uses. The clip itself only
+    /// reveals once it actually starts decoding and the server is confirmed online (see `TVInHeroTrailerView`),
+    /// so a missing / slow / blocked trailer never blanks the band.
+    @ViewBuilder private func heroTrailerLayer(_ m: CoreMetaItem) -> some View {
+        if autoplayTrailers, !reduceMotion, !LiveTypes.contains(type),
+           let url = TrailerRequest.from(meta: m)?.playableURL {
+            // Detail = a short SILENT WINDOW (owner's clip-scope answer): start ~10s in and loop an
+            // ~8s snippet, the tvOS parity of the iOS detail's `.clip(startSeconds:windowSeconds:)`.
+            // For a SERIES this `m` is the series meta, so a series-episode hero shows the SERIES
+            // trailer snippet (there is no per-episode trailer).
+            TVInHeroTrailerView(url: url, window: (start: 10, length: 8))
+        }
     }
 
     /// Trailer chip. Plays the meta's trailer as a one-off clip through the player (no torrent, no
@@ -453,7 +498,9 @@ struct DetailView: View {
     @ViewBuilder private func trailerChip(_ m: CoreMetaItem) -> some View {
         if let req = TrailerRequest.from(meta: m), let url = req.playableURL {
             Button {
-                presenter.request = PlaybackRequest(url: url, title: "\(m.name) — Trailer")
+                // FIX I: tag this as a trailer so a dead /yt route shows "Trailer unavailable" instead
+                // of failing over to the engine's content streams (which would play the actual/random movie).
+                presenter.request = PlaybackRequest(url: url, title: "\(m.name) Trailer", isTrailer: true)
             } label: {
                 Label("Trailer", systemImage: "film")
             }
@@ -867,9 +914,23 @@ struct CoreStreamList: View {
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
+    @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
+    // FIX H (take 3): seat the detail page's initial focus on Watch Now, not the Trailer chip. The movie
+    // page lays the trailer chip out ABOVE this list, so without an explicit default the focus engine parks
+    // on Trailer. The earlier takes set `.defaultFocus($watchFocused, true)` but ONLY bound $watchFocused to
+    // the READY button (`if let best`), which does not exist on first appear while sources are still loading
+    // - so defaultFocus had no target and tvOS fell back to the first focusable (the trailer chip). This
+    // take binds $watchFocused to the loading AND no-sources buttons too, so the target always exists and
+    // focus follows the one primary-action slot as it transitions loading -> ready, plus a one-shot
+    // programmatic seat (.task below) as belt-and-suspenders over defaultFocus (only a hint tvOS can drop).
+    // It only sets WHERE focus lands; it does not touch the RemoteCatcher model.
+    @FocusState private var watchFocused: Bool
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
+    // Debrid cache AWARENESS: which raw torrents the user's debrid account has cached, so they badge +
+    // rank up. Empty (no badges, ranking unchanged) with no debrid key configured.
+    @StateObject private var debridCache = DebridCacheAwareness()
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -878,7 +939,8 @@ struct CoreStreamList: View {
     private var sourcePin: ResolvedPin? { pinContext.flatMap { pinStore.effectivePin($0) } }
 
     var body: some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin)   // best source first within each add-on
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                                debridCachedHashes: debridCache.cachedHashes)   // best source first within each add-on
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
@@ -887,7 +949,8 @@ struct CoreStreamList: View {
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin)
+        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin,
+                                      debridCachedHashes: debridCache.cachedHashes)
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
@@ -917,6 +980,7 @@ struct CoreStreamList: View {
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(watchReady ? 1 : 0.55)
                     .contextMenu { resolutionMenu(groups) }
+                    .focused($watchFocused)   // FIX H: target of the page's default focus
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
                     // 720p / Others), then the flavors inside it (Dolby Vision · Remux, HDR · Atmos, …).
@@ -986,11 +1050,13 @@ struct CoreStreamList: View {
                     }
                 }
                 .buttonStyle(PrimaryActionStyle())
+                .focused($watchFocused)   // FIX H take 3: the default-focus target must exist in THIS (loading) state too
             } else {
                 // Done, nothing playable: a greyed (disabled-looking) button + an explanation. Focusable so Back works.
                 Button {} label: { Label("No sources found", systemImage: "exclamationmark.triangle") }
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(0.55)
+                    .focused($watchFocused)   // FIX H take 3: keep the seat valid in the no-sources state as well
                 Text("None of your \(addons.total) add-on\(addons.total == 1 ? "" : "s") returned a playable source for this title.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             }
@@ -999,9 +1065,27 @@ struct CoreStreamList: View {
         // (just two buttons + a status line, no full-width row yet) collapsed to button-width and an
         // enclosing ScrollView centered it — the "black bar with two buttons in the middle" bug.
         .frame(maxWidth: .infinity, alignment: .leading)
+        // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
+        // first focusable view, which on the movie page is the Trailer chip laid out higher up.
+        .defaultFocus($watchFocused, true)
+        .task {
+            // Belt-and-suspenders over .defaultFocus (a hint tvOS drops when a sibling like the trailer chip
+            // is laid out first): force the seat onto the Watch Now slot once, just after appear. One-shot
+            // via hasSeatedFocus so it never yanks focus back after the user has moved it.
+            guard !hasSeatedFocus else { return }
+            try? await Task.sleep(for: .milliseconds(60))
+            hasSeatedFocus = true
+            watchFocused = true
+        }
         .task {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true
+        }
+        // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
+        // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
+        // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
+        .onChange(of: core.streamLoadProgress().loaded) { _ in
+            debridCache.refresh(from: displayGroups(core.streamGroups()))
         }
     }
 
@@ -1023,7 +1107,27 @@ struct CoreStreamList: View {
 
     /// Play a stream by handing a request to the root, which swaps the whole shell out for the player
     /// (the only reliable tvOS focus isolation — see RootView). Wires the engine + prepares torrents first.
+    ///
+    /// CACHED DEBRID: for a RAW TORRENT the user's debrid account can serve, play the debrid DIRECT link
+    /// instead of starting the local torrent engine. The resolve is bounded and FAIL-SOFT — any
+    /// failure/timeout (and the entire no-key path, with zero await) falls through to today's embedded path,
+    /// byte-identical. A debrid URL is a remote direct link, so it is presented with `torrent: false` and
+    /// skips `prepareTorrent` (no `/create`); the player keys torrent behaviour off the URL shape, so it
+    /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(_ stream: CoreStream) {
+        Task { await playResolving(stream) }
+    }
+
+    @MainActor private func playResolving(_ stream: CoreStream) async {
+        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream) {
+            core.loadEnginePlayer(for: stream)
+            presenter.request = PlaybackRequest(url: direct, title: title, meta: meta, episodes: episodes,
+                                                sourceHint: StreamRanking.signature(stream), torrent: false,
+                                                bingeGroup: stream.behaviorHints?.bingeGroup,
+                                                headers: stream.requestHeaders)
+            return
+        }
+        // Today's path, unchanged.
         guard let url = stream.playableURL else { return }
         core.loadEnginePlayer(for: stream)
         prepareTorrent(stream)
@@ -1049,7 +1153,7 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if stream.playableURL != nil {
-            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream)) }
+            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream)) }
                 .buttonStyle(RowFocusStyle())
                 .contextMenu { pinMenu(addon, stream) }
         } else {
@@ -1060,6 +1164,13 @@ struct CoreStreamList: View {
             Button {} label: { streamLabel(addon, stream, enabled: false) }
                 .buttonStyle(RowFocusStyle())
         }
+    }
+
+    /// True when this raw torrent's infoHash is in the debrid-confirmed cached set (drives the row chip).
+    /// False for every stream when the set is empty (no key / not yet checked), so no chips render.
+    private func isDebridCached(_ stream: CoreStream) -> Bool {
+        guard !debridCache.cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
+        return debridCache.cachedHashes.contains(h)
     }
 
     /// True when this stream matches the effective pin - drives the row's pin badge.
@@ -1091,7 +1202,8 @@ struct CoreStreamList: View {
         }
     }
 
-    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false) -> some View {
+    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false,
+                             debridCached: Bool = false) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 30))
@@ -1104,6 +1216,9 @@ struct CoreStreamList: View {
                     }
                     badge(addon.uppercased())
                     if stream.isTorrent { badge("TORRENT") }
+                    // Debrid cache chip: this raw torrent is instant from the user's debrid account. Accent
+                    // tint sets it apart from the neutral add-on/torrent badges; only shown when confirmed.
+                    if debridCached { badge("⚡ CACHED", accent: true) }
                 }
                 if let name = stream.name, !name.isEmpty {
                     Text(name).font(Theme.Typography.cardTitle)
@@ -1121,11 +1236,11 @@ struct CoreStreamList: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    private func badge(_ text: String) -> some View {
+    private func badge(_ text: String, accent: Bool = false) -> some View {
         Text(text).font(Theme.Typography.eyebrow).tracking(1)
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Theme.Palette.surface3, in: Capsule())
-            .foregroundStyle(Theme.Palette.textSecondary)
+            .background(accent ? Theme.Palette.accent.opacity(0.22) : Theme.Palette.surface3, in: Capsule())
+            .foregroundStyle(accent ? Theme.Palette.accent : Theme.Palette.textSecondary)
     }
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.

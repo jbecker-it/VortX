@@ -93,8 +93,19 @@ final class CoreBridge: ObservableObject {
 
     /// Remove an installed addon. UninstallAddon takes a full Descriptor, so we send back the raw one
     /// the engine gave us (matched by transportUrl).
-    func uninstallAddon(_ descriptor: CoreDescriptor) {
+    ///
+    /// `tombstone` (default true) records a DURABLE cross-device removal in `AddonTombstones` so the
+    /// removal SYNCS: `vortxSummary` pushes the set into `doc.vortx.deletedAddons` and subtracts it from
+    /// the `doc.vortx.addons` UNION, and `syncDown` re-applies it on peers (mirrors `deletedProfiles`).
+    /// Official/protected stubs are NEVER tombstoned (a logout resets the engine to exactly those, so a
+    /// tombstone there would wrongly suppress a default forever). The Change-URL replace path passes
+    /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
+    /// URL must stay re-addable on every device. The genuine in-app Remove button keeps the default.
+    func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         guard let raw = rawAddonsByUrl[descriptor.transportUrl] else { return }
+        if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
+            AddonTombstones.tombstone(descriptor.transportUrl)
+        }
         dispatchCtx(["action": "UninstallAddon", "args": raw])
     }
 
@@ -102,25 +113,39 @@ final class CoreBridge: ObservableObject {
     /// it, build the full Descriptor the engine's InstallAddon action expects (mirroring UninstallAddon's
     /// contract), and dispatch it. The engine's ctx event then refreshes `addons`. Returns a user-facing
     /// error string on failure, nil on success.
-    @MainActor
-    func installAddon(urlString: String) async -> String? {
+    /// Normalize a pasted add-on URL the way installAddon does (trim + ensure a /manifest.json suffix),
+    /// so AddonsView can detect an already-installed URL and offer to UPDATE it instead of erroring.
+    /// Nil if it is not a valid http(s) URL.
+    func normalizedAddonURL(_ urlString: String) -> String? {
         let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
         guard var url = URL(string: trimmed), let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else {
-            return "Enter a valid add-on URL (https://…/manifest.json)."
-        }
+              scheme == "http" || scheme == "https" else { return nil }
         if !url.absoluteString.lowercased().hasSuffix("manifest.json") {
             url = url.appendingPathComponent("manifest.json")
         }
-        if addons.contains(where: { $0.transportUrl == url.absoluteString }) {
-            return "That add-on is already installed."
+        return url.absoluteString
+    }
+
+    @MainActor
+    func installAddon(urlString: String, replacingExisting: Bool = false) async -> String? {
+        guard let normalized = normalizedAddonURL(urlString), let url = URL(string: normalized) else {
+            return "Enter a valid add-on URL (https://…/manifest.json)."
         }
+        let alreadyInstalled = addons.contains(where: { $0.transportUrl == normalized })
+        if alreadyInstalled, !replacingExisting { return "That add-on is already installed." }
         do {
             let (data, resp) = try await URLSession.shared.data(from: url)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
                   let manifest = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   manifest["id"] != nil, manifest["name"] != nil else {
                 return "That URL did not return a valid add-on manifest."
+            }
+            // Update in place: drop the existing descriptor ONLY now that the new manifest is fetched +
+            // validated, so a flaky fetch / bad manifest can never leave the user with NEITHER the old nor
+            // the new add-on (the install-first invariant the Change-URL path also holds). The engine
+            // processes Uninstall before Install, so the freshly-fetched manifest replaces the old one.
+            if alreadyInstalled, let existing = rawAddonsByUrl[normalized] {
+                dispatchCtx(["action": "UninstallAddon", "args": existing])
             }
             let descriptor: [String: Any] = [
                 "transportUrl": url.absoluteString,
@@ -131,6 +156,57 @@ final class CoreBridge: ObservableObject {
             return nil
         } catch {
             return "Could not reach that add-on. Check the URL and your connection."
+        }
+    }
+
+    /// True when the engine has NO stream-capable add-on installed (every title would report "no
+    /// sources"). The account-owns-everything hydration targets exactly this condition. Extracted from
+    /// `scheduleSessionRepair`'s inline test so launch / scenePhase / sync can share it.
+    var hasNoStreamAddon: Bool { !addons.contains { $0.providesStreams } }
+
+    /// True when the engine has no USER-INSTALLED stream add-on (only the official stubs, or none). This
+    /// is the REAL "we lost the user's sources" signal: a Stremio logout / token-expiry reinstalls the
+    /// OFFICIAL stream stubs (local / WatchHub / Public Domain), so `hasNoStreamAddon` is structurally
+    /// FALSE after a logout even though every real title reports "no sources". The account-owns-everything
+    /// restore triggers off THIS so a logout re-applies the user's owned add-ons instead of staying wiped.
+    var hasNoUserStreamAddon: Bool {
+        !addons.contains { $0.providesStreams && !($0.isOfficial || $0.isProtected) }
+    }
+
+    /// The raw installed add-on descriptors the engine currently holds (the exact `{transportUrl,
+    /// manifest, flags}` objects kept for round-tripping), so the sync layer can snapshot the full
+    /// descriptor set into the VortX account doc for network-free re-hydration. Account/engine add-on
+    /// set only; never a per-profile overlay.
+    func rawAddonDescriptors() -> [[String: Any]] {
+        Array(rawAddonsByUrl.values)
+    }
+
+    /// Same descriptors as `rawAddonDescriptors`, but in the engine's TRUE install order (the typed `addons`
+    /// Vec order) instead of the nondeterministic dictionary order, so the sync layer can persist + round-trip
+    /// the user's add-on PRIORITY: a reorder on one device reaches the others via doc.vortx.addons.
+    func rawAddonDescriptorsOrdered() -> [[String: Any]] {
+        addons.compactMap { rawAddonsByUrl[$0.transportUrl] }
+    }
+
+    /// Install the VortX account's owned add-ons back INTO the engine, but ONLY descriptors the engine
+    /// lacks (idempotent). This is the load-bearing "account owns everything" capability: it lets a
+    /// logged-out / degraded Stremio session show the account's add-ons + sources instead of zero.
+    ///
+    /// Uses the EXACT `InstallAddon` descriptor shape `installAddon` sends (`{transportUrl, manifest,
+    /// flags}`, camelCase) — the engine mutates `ctx.profile.addons` LOCALLY with no api.strem.io call.
+    /// A lowercase-key mismatch silently no-ops in the engine, so `VortXOwnedAddon.installDescriptor`
+    /// keeps the keys aligned with `installAddon`. Targets the account/engine add-on set ONLY; it never
+    /// touches a per-profile overlay and never `disabledAddons` (which stays a render-layer filter).
+    func hydrateAddonsFromAccount(_ owned: [VortXOwnedAddon]) {
+        guard !owned.isEmpty else { return }
+        let installed = Set(addons.map(\.transportUrl)) .union(rawAddonsByUrl.keys)
+        var installedCount = 0
+        for addon in owned where !installed.contains(addon.transportUrl) {
+            dispatchCtx(["action": "InstallAddon", "args": addon.installDescriptor])
+            installedCount += 1
+        }
+        if installedCount > 0 {
+            NSLog("[CoreBridge] hydrated \(installedCount) account-owned add-on(s) into the engine (no Stremio session needed)")
         }
     }
 
@@ -146,11 +222,29 @@ final class CoreBridge: ObservableObject {
     private func bootstrapAuth() {
         if isLoggedIn() {
             refreshFromAPI()
-            loadBoard() // addons already hydrated from the engine's own storage
+            // VortX-first (account-owns-everything): hydrate the VortX account's owned add-ons into the engine
+            // on EVERY launch, not only when degraded, so doc.vortx.addons is the source of truth and a still-
+            // valid Stremio session reconciles ON TOP of it rather than the engine's Stremio-sourced storage
+            // being the sole source. Idempotent + never-zero guarded inside the sync manager (installs only the
+            // missing owned add-ons), so a healthy engine is a no-op and a failed/empty account pull does nothing.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                self.loadBoard()
+            }
+            loadBoard() // refresh the board now too; addons were already hydrated from the engine's own storage
             return       // scheduleSessionRepair() is now called once from start() for ALL paths
         }
         guard let key = Keychain.string(activeTokenAccount), !key.isEmpty else {
             NSLog("[CoreBridge] no auth token in Keychain; engine stays signed out")
+            // Account-owns-everything: with no Stremio session, hydrate the VortX account's owned add-ons
+            // back into the engine BEFORE loading the board, so a logged-out device shows the account's
+            // add-ons + sources instead of only Cinemeta. Idempotent + never-zero guarded inside the sync
+            // manager (a failed/empty account pull does nothing). loadBoard runs once hydration kicks the
+            // ctx event, and again here so a no-account-doc device still gets the default browsable Home.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                self.loadBoard()
+            }
             // Still surface the default addons' catalogs (Cinemeta et al. ship in the engine's default
             // profile) so a signed-out Home is a real, browsable landing screen — backdrop hero + rails
             // — not an empty "please sign in" page. Discover already loads signed-out; Home should too.
@@ -176,14 +270,32 @@ final class CoreBridge: ObservableObject {
     /// add-ons + the full library fresh. Runs once per launch and never fights an in-flight auth/switch.
     private func scheduleSessionRepair() {
         DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in
-            guard let self, !self.switchInFlight, !self.awaitingAuthMigration,
-                  let key = Keychain.string(self.activeTokenAccount), !key.isEmpty else { return }
+            guard let self, !self.switchInFlight, !self.awaitingAuthMigration else { return }
             let cwItems = self.decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? []
             let noAccountData = self.continueWatching.isEmpty && cwItems.isEmpty && (self.library?.catalog.isEmpty ?? true)
-            let noStreamAddon = !self.addons.contains { $0.providesStreams }
+            let noStreamAddon = self.hasNoUserStreamAddon   // user-installed stream add-ons gone (logout-proof)
             guard noAccountData || noStreamAddon else { return }
-            NSLog("[CoreBridge] signed in but \(noStreamAddon ? "engine has no stream add-on" : "no account data arrived") — re-authenticating with the stored token to re-pull add-ons + library")
-            self.switchAccount(token: key)
+            let key = Keychain.string(self.activeTokenAccount)
+            let hasStremioToken = (key?.isEmpty == false)
+            // Account-owns-everything: hydrate the VortX account's owned add-ons + recover the owner
+            // library FIRST, regardless of whether a Stremio token exists. Idempotent + never-zero
+            // guarded inside the sync manager (a failed/empty account pull does nothing), so it can
+            // never make things worse. This is what fixes "post-update: 0 sources / 0 add-ons" on a
+            // genuinely-logged-out or degraded device.
+            Task { @MainActor in
+                await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                // When a Stremio token still exists, also re-establish that session so the live Stremio
+                // pull reconciles on top of the hydrated floor (no zero window: the doc hydrated first).
+                // When there is NO usable token (genuinely logged out), the doc hydration is the whole
+                // recovery — never call switchAccount with an empty token.
+                if hasStremioToken, let key {
+                    NSLog("[CoreBridge] degraded session (\(noStreamAddon ? "no stream add-on" : "no account data")) with a stored token — hydrated account add-ons, now re-authenticating to reconcile from Stremio")
+                    self.switchAccount(token: key)
+                } else {
+                    NSLog("[CoreBridge] degraded session with no Stremio token — recovered from the VortX account doc")
+                    self.loadBoard()
+                }
+            }
         }
     }
 
@@ -253,6 +365,8 @@ final class CoreBridge: ObservableObject {
     func loadBoard(rows: Int = 30) {
         boardRowsLoaded = rows
         boardPageInFlight = false
+        boardRowPageInFlight = [:]   // catalogs reload from page 1, so engine indices reset (#95)
+        boardRowExhausted = []
         dispatch(action: ["action": "Load",
                           "args": ["model": "CatalogsWithExtra",
                                    "args": ["type": NSNull(), "extra": []]]],
@@ -269,6 +383,15 @@ final class CoreBridge: ObservableObject {
     /// onAppear events can't fire duplicate loads (mirrors `discoverPageInFlight`).
     private var boardPageInFlight = false
 
+    /// Per-row ITEM pagination for the Home board (#95: a Home catalog row was capped at its first page,
+    /// e.g. MyTraktSync stuck at ~20 while it scrolls forever on official Stremio). The board only ever
+    /// range-loaded whole ROWS; the engine's `CatalogsWithExtra.LoadNextPage(index)` appends the next page
+    /// to ONE catalog, which we drive per row on horizontal scroll. Keyed by the engine catalog index
+    /// (stable across LoadNextPage + board widening; carried on `CoreBoardRow.engineIndex`). Both maps are
+    /// touched only on the main queue (mirrors `boardPageInFlight`).
+    private var boardRowPageInFlight: [Int: Int] = [:]   // engineIndex -> item count when the load was dispatched
+    private var boardRowExhausted: Set<Int> = []          // engine indices whose last settled load added nothing
+
     /// True while the last board load filled its requested window, so there may be more catalogs to show.
     /// Once the engine returns fewer rows than asked, every catalog is on screen and this goes false.
     var boardHasNextPage: Bool { boardRows.count >= boardRowsLoaded }
@@ -283,6 +406,37 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "CatalogsWithExtra",
                           "args": ["action": "LoadRange", "args": ["start": 0, "end": boardRowsLoaded]]],
                  field: "board")
+    }
+
+    /// Load the next page of ITEMS for one Home catalog row (#95, the horizontal infinite scroll). The
+    /// engine appends to `board.catalogs[engineIndex]` and re-emits `board`, so the row grows in place.
+    /// No-op while a page is already in flight for this row, or once the row is exhausted (a settled load
+    /// added no new items). Call from the row's last-card `onAppear`. Main-queue only (mirrors the others).
+    func loadBoardRowNextPage(engineIndex: Int) {
+        guard !boardRowExhausted.contains(engineIndex), boardRowPageInFlight[engineIndex] == nil else { return }
+        guard let board = decode(CoreBoardState.self, field: "board"), engineIndex < board.catalogs.count else { return }
+        let count = board.catalogs[engineIndex].compactMap { $0.content?.ready }.flatMap { $0 }.count
+        guard count > 0 else { return }   // the row has not hydrated yet; nothing to page from
+        boardRowPageInFlight[engineIndex] = count
+        dispatch(action: ["action": "CatalogsWithExtra",
+                          "args": ["action": "LoadNextPage", "args": engineIndex]],
+                 field: "board")
+    }
+
+    /// Reconcile in-flight per-row pagination after a `board` emit (#95). A SETTLED load (the catalog no
+    /// longer loading) that GREW the row clears the in-flight gate so the next page can load; a settled
+    /// load that added nothing marks the row exhausted so it stops (a finite catalog never loops on no-op
+    /// loads, mirroring `discoverExhausted`). Main-queue only; takes the board decoded off-main by the caller.
+    private func reconcileBoardRowPagination(_ board: CoreBoardState?) {
+        guard !boardRowPageInFlight.isEmpty, let board else { return }
+        for (index, dispatchedCount) in boardRowPageInFlight {
+            guard index < board.catalogs.count else { boardRowPageInFlight[index] = nil; continue }
+            let pages = board.catalogs[index]
+            if pages.contains(where: { $0.content?.isLoading == true }) { continue }   // still settling; wait
+            let count = pages.compactMap { $0.content?.ready }.flatMap { $0 }.count
+            boardRowPageInFlight[index] = nil
+            if count <= dispatchedCount { boardRowExhausted.insert(index) }
+        }
     }
 
     /// Ensure the Live tab can see EVERY installed add-on's live catalogs. The Live surface filters the
@@ -312,6 +466,7 @@ final class CoreBridge: ObservableObject {
 
     /// Load Discover's default catalog (the engine picks the first selectable type).
     func loadDiscover() {
+        resetDiscoverPagination()
         dispatch(action: ["action": "Load", "args": ["model": "CatalogWithFilters", "args": NSNull()]],
                  field: "discover")
     }
@@ -319,15 +474,43 @@ final class CoreBridge: ObservableObject {
     /// Switch Discover's type / catalog / genre, pass the chip's own `request` back verbatim.
     func selectDiscover(_ request: CoreRequest) {
         guard let requestDict = Self.encodeToDict(request) else { return }
+        resetDiscoverPagination()
         dispatch(action: ["action": "Load", "args": ["model": "CatalogWithFilters", "args": ["request": requestDict]]],
                  field: "discover")
     }
 
-    /// True when the current Discover catalog has another page to load (engine skip-pagination).
-    var discoverHasNextPage: Bool { discover?.selectable.nextPage != nil }
-    /// Set while a next-page load is dispatched, cleared when `discover` re-emits, so a burst of
-    /// last-item onAppear events from the grid can't fire duplicate page loads.
+    /// True when the current Discover catalog has another page to load. `selectable.nextPage` is the
+    /// authoritative cursor, but the engine only sets it when the add-on declares the `skip` extra. Many
+    /// add-ons (e.g. AIO Metadata, KhmerAve) omit `skip`, so the cursor is always nil even though
+    /// `LoadNextPage` pages them fine and the official app paginates them too. For those catalogs we fall
+    /// back to a count-driven gate that keeps paging until a fully-settled load returns no new items
+    /// (`discoverExhausted`).
+    ///
+    /// #95: a catalog can ADVERTISE `skip` (so a cursor appears) yet have its cursor go nil mid-catalog
+    /// while more items still exist (MyTraktSync stops at ~15-20 this way). The old gate latched
+    /// `discoverEverHadCursor` the first time any cursor appeared and then returned `false` forever once the
+    /// cursor went nil, permanently disabling the count-driven fallback and stranding the catalog at one
+    /// page. So we no longer hard-stop on the latch alone: when there is no cursor we defer to the same
+    /// count-driven gate the cursorless catalogs use, which keeps paging only until a settled `LoadNextPage`
+    /// returns no new items (`discoverExhausted`). A genuinely finished cursored catalog therefore makes at
+    /// most ONE extra no-op `LoadNextPage` (the engine ignores it when there is truly no next page) and then
+    /// `discoverExhausted` stops it -- additive, and it does not loop. A healthy catalog that still has its
+    /// cursor returns early on the first line and is unaffected.
+    var discoverHasNextPage: Bool {
+        if discover?.selectable.nextPage != nil { return true }
+        return !discoverExhausted && (discover?.items.count ?? 0) > 0   // count-driven fallback (#95)
+    }
+    /// Set while a next-page load is dispatched, cleared when the load SETTLES (not on the interim
+    /// "Loading" emit), so a burst of last-item onAppear events from the grid can't fire duplicate loads.
     private var discoverPageInFlight = false
+    /// Latched true when a next-page load settles without growing the list (no more pages), so a finite
+    /// catalog never loops on no-op loads. Reset on every catalog change. #95: this is now the SOLE stop for
+    /// a cursor that went nil (cursorless from the start, or a cursored catalog whose cursor dropped
+    /// mid-catalog), so it must stay accurate for both.
+    private var discoverExhausted = false
+    /// Item count captured when a next-page load is dispatched, to detect whether the settled load grew the
+    /// list (more pages) or not (end of a cursorless catalog).
+    private var discoverCountAtLoad = 0
 
     /// Load the next page of the current Discover catalog (infinite scroll). The engine appends the
     /// page to `discover.catalog` and clears `next_page` at the end. No-op at the end or while a page
@@ -336,7 +519,16 @@ final class CoreBridge: ObservableObject {
     func loadDiscoverNextPage() {
         guard discoverHasNextPage, !discoverPageInFlight else { return }
         discoverPageInFlight = true
+        discoverCountAtLoad = discover?.items.count ?? 0
         dispatch(action: ["action": "CatalogWithFilters", "args": ["action": "LoadNextPage"]], field: "discover")
+    }
+
+    /// Reset the cursorless-pagination tracking on every catalog change (new type / catalog / genre), so
+    /// the next catalog starts fresh and the previous one's exhausted/cursor state never leaks across.
+    private func resetDiscoverPagination() {
+        discoverPageInFlight = false
+        discoverExhausted = false
+        discoverCountAtLoad = 0
     }
 
     /// Load the Library (all types, most-recent first). Auto-refreshes on library changes.
@@ -1033,7 +1225,13 @@ final class CoreBridge: ObservableObject {
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change.
         if fields.contains("board") || fields.contains("ctx") {
             let rows = buildBoardRows()
-            DispatchQueue.main.async { [weak self] in self?.boardRows = rows; self?.boardPageInFlight = false }
+            let boardState = decode(CoreBoardState.self, field: "board")   // decode off-main; reconcile on main
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination
+                self.boardRows = rows
+                self.boardPageInFlight = false
+            }
         }
         if fields.contains("ctx") {
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
@@ -1046,8 +1244,18 @@ final class CoreBridge: ObservableObject {
         if fields.contains("discover") {
             let value = decode(CoreDiscover.self, field: "discover")
             DispatchQueue.main.async { [weak self] in
-                self?.discover = value
-                self?.discoverPageInFlight = false   // a next-page load (or any discover change) settled
+                guard let self else { return }
+                // End-stop (#95): a next-page load that has FULLY settled (no page still loading) without
+                // growing the list means there are no more pages, whether the catalog was cursorless or its
+                // cursor went nil mid-catalog. Gate on !isLoadingPage so the interim "Loading" emit (same
+                // count, more coming) never latches exhausted early.
+                if self.discoverPageInFlight, let v = value, !v.isLoadingPage, v.items.count <= self.discoverCountAtLoad {
+                    self.discoverExhausted = true
+                }
+                self.discover = value
+                // Clear the in-flight flag only once the load has settled, so onAppear bursts during the
+                // page fetch can't fire a duplicate load (the interim "Loading" emit keeps it set).
+                if value?.isLoadingPage != true { self.discoverPageInFlight = false }
             }
             // A null first load derives the default catalog before the selectable is refreshed from
             // addons, so it can land with catalogs available but nothing selected (Discover stuck on
@@ -1118,7 +1326,7 @@ final class CoreBridge: ObservableObject {
         let titles = catalogTitleMap()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         var rows: [CoreBoardRow] = []
-        for catalog in board.catalogs {
+        for (engineIndex, catalog) in board.catalogs.enumerated() {
             guard let request = catalog.first?.request else { continue }
             guard !disabledAddons.contains(request.base) else { continue }
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
@@ -1126,7 +1334,7 @@ final class CoreBridge: ObservableObject {
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
             if CatalogPrefsStore.isHidden(key) { continue }   // user hid this catalog row (catalog manager)
             rows.append(CoreBoardRow(id: key, title: titles[key] ?? request.path.id,
-                                     type: request.path.type, items: items))
+                                     type: request.path.type, items: items, engineIndex: engineIndex))
         }
         // Apply the user's catalog order; unlisted catalogs keep the engine's relative order after the listed ones.
         return rows.enumerated().sorted { a, b in

@@ -16,15 +16,16 @@ import {
   renderDiscoverShell,
   selectDiscoverCatalog,
 } from "./views/discover";
-import { loadMoreSearch, loadSearch, renderSearchShell } from "./views/search";
+import { loadMoreSearch, loadSearch, renderSearchShell, updateSearchSuggestions, hideSuggestions } from "./views/search";
 import { renderAddons, wireAddons } from "./views/addons";
 import { renderLibrary } from "./views/library";
 import { loadLive, renderLive } from "./views/live";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
 import { handleSettingsClick, renderSettings } from "./views/settings";
 import { handleLoginClick, renderLogin } from "./views/login";
+import { renderApprove, handleApproveClick } from "./views/approve";
 import { applySettings } from "./lib/settings";
-import { ensureValidSession } from "./lib/account";
+import { ensureValidSession, hydrateFromAccount } from "./lib/account";
 
 // VortX web client entry point. Flow: load installed add-ons (Cinemeta + user stream add-ons) ->
 // hash-routed surfaces (Home board, Discover grid, Search, Detail, Add-ons). Detail resolves streams
@@ -169,6 +170,10 @@ async function renderRoute(route: Route): Promise<void> {
       renderLogin(mainHost());
       return;
     }
+    case "approve": {
+      renderApprove(mainHost());
+      return;
+    }
     case "detail": {
       const host = el("detail-host");
       if (!host) return;
@@ -185,15 +190,42 @@ async function reloadAddonsAndRender(): Promise<void> {
   await renderRoute(parseRoute());
 }
 
-/** Submit the search form by navigating to the shareable search route. */
+/** Wire the search box: Enter commits to the shareable route; typing runs a debounced live search that
+ *  streams results in (no route churn), so it feels instant like the apps. */
+let searchDebounce = 0;
 function wireSearchForm(): void {
   const form = document.getElementById("search-form") as HTMLFormElement | null;
+  const input = document.getElementById("search-input") as HTMLInputElement | null;
   form?.addEventListener("submit", (ev) => {
     ev.preventDefault();
-    const input = document.getElementById("search-input") as HTMLInputElement | null;
-    const query = input?.value.trim() ?? "";
-    navigate({ name: "search", query });
+    window.clearTimeout(searchDebounce);
+    hideSuggestions();
+    navigate({ name: "search", query: input?.value.trim() ?? "" });
   });
+  // As-you-type: debounced, results stream into the grid as each catalog responds; the URL is kept in
+  // sync via replaceState (shareable on the spot) without a full route re-render, and it is not recorded
+  // as a recent search on every keystroke. The typeahead panel updates in the same debounce: recents
+  // paint instantly, title suggestions append once the quick lookup resolves.
+  input?.addEventListener("input", () => {
+    window.clearTimeout(searchDebounce);
+    const q = input.value.trim();
+    searchDebounce = window.setTimeout(() => {
+      try {
+        history.replaceState(null, "", q ? `#/search/${encodeURIComponent(q)}` : "#/search/");
+      } catch {
+        /* hash routing still works without replaceState */
+      }
+      void updateSearchSuggestions(addons, q);
+      if (q) void loadSearch(addons, q, false);
+    }, 220);
+  });
+  // Show recent-search suggestions the moment the box is focused (before any typing).
+  input?.addEventListener("focus", () => void updateSearchSuggestions(addons, input.value.trim()));
+  // Escape closes the panel; a delayed blur lets a click on a suggestion land before it hides.
+  input?.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hideSuggestions();
+  });
+  input?.addEventListener("blur", () => window.setTimeout(hideSuggestions, 150));
 }
 
 /** Global click delegation: Detail overlay clicks, player close, Escape-like back affordances. */
@@ -274,6 +306,10 @@ function wireGlobalClicks(): void {
       ev.preventDefault();
       return;
     }
+    if (parseRoute().name === "approve" && handleApproveClick(ev.target)) {
+      ev.preventDefault();
+      return;
+    }
     // While the Detail overlay is active, route its action clicks to the Detail handler.
     if (el("detail-host")?.classList.contains("active")) {
       void handleDetailClick(ev.target);
@@ -317,7 +353,12 @@ async function start(): Promise<void> {
   wireGlobalClicks();
   initCardMenu(); // right-click / long-press context menu on poster cards
 
-  void ensureValidSession(); // clear a revoked token in the background; never blocks first paint
+  // Validate the token in the background, then pull the account sync doc so a returning (already signed-in)
+  // user's add-ons, library, and Continue Watching refresh on load - not only on a fresh sign-in. Never
+  // blocks first paint; applySyncDoc fires vortx:addons-changed to re-render when something merges.
+  void ensureValidSession().then((session) => {
+    if (session) void hydrateFromAccount(session);
+  });
   addons = await loadInstalledAddons();
   onRouteChange((route) => void renderRoute(route));
   // Account hydration (on sign-in) merges synced add-ons into storage; reload + re-render so they appear.

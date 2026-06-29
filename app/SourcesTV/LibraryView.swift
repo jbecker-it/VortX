@@ -8,7 +8,14 @@ struct LibraryView: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
     @StateObject private var focusModel = FocusedItemModel()
-    private let columns = Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+    /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
+    private var columns: [GridItem] {
+        catalogPrefs.landscapeCards && apiKeys.hasTMDB
+            ? Array(repeating: GridItem(.fixed(kLandscapeCardWidth), spacing: Theme.Space.lg), count: 3)
+            : Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
+    }
 
     var body: some View {
         NavigationStack {

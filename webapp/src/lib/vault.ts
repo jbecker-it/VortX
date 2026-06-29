@@ -500,3 +500,355 @@ export async function putSyncDoc(session: Session, doc: Record<string, unknown>)
   });
   if (r.status !== 200) throw new Error("Could not save to your account.");
 }
+
+/** Read-modify-write the sync document with optimistic concurrency. Fetches the current doc + version,
+ *  runs `mutate` on it in place, then PUTs at version+1. The worker stores a PUT only when its version
+ *  is strictly greater (ON CONFLICT ... WHERE excluded.version > backups.version) and reports
+ *  `{ accepted }`; a rejected (stale) write means another device won the race, so we re-fetch and retry.
+ *  This is the SAFE alternative to putSyncDoc's blind Date.now() write, which silently loses a concurrent
+ *  change (a 200 with accepted:false reads as success). The `mutate` callback MUST only touch web-owned
+ *  sibling keys (doc.profileEdits, doc.apiKeys, doc.addons) and NEVER doc.vortx.* (app-authoritative). */
+export async function mutateSyncDoc(
+  session: Session,
+  mutate: (doc: Record<string, unknown>) => void,
+): Promise<void> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const status = await fetchSync(session);
+    const base = status.synced ? status.version ?? 0 : 0;
+    const doc = (status.contents as Record<string, unknown>) ?? {};
+    mutate(doc);
+    const ciphertext = await seal(session.dataKey, enc(JSON.stringify(doc)));
+    const r = await api("/v1/backup", {
+      method: "PUT",
+      token: session.token,
+      body: { document: ciphertext, version: base + 1 },
+    });
+    if (r.status !== 200) throw new Error("Could not save to your account.");
+    if (r.data?.accepted !== false) return; // stored (accepted true, or older worker without the field)
+    // accepted === false: a newer version landed between our read and write; loop to re-fetch and merge.
+  }
+  throw new Error("Could not save to your account (kept losing to another device).");
+}
+
+// --- QR / device sign-in (pairing) --------------------------------------------------------------
+// A new device shows a QR; an already-signed-in device approves it, handing over the data key WITHOUT
+// the server ever seeing it. This reuses the Apple app's PairingCrypto contract byte-for-byte: an
+// ephemeral X25519 key agreement, HKDF-SHA256 (salt "vortx-pairing-salt-v1", info "vortx-pairing-v1")
+// to a 32-byte AES-GCM key, sealing the 32-byte data key in the combined nonce||ct||tag framing, all
+// base64url. So the same flow can later interoperate with the native app as the approver. The worker
+// (/v1/qr/*) relays only ciphertext + ephemeral public keys and mints the session token on approval.
+
+const PAIR_SALT = enc("vortx-pairing-salt-v1");
+const PAIR_INFO = enc("vortx-pairing-v1");
+
+/** base64url (no padding), matching the app's BackupCrypto.base64URL, for ephemeral pubkeys + sealed blobs. */
+function b64url(u8: Uint8Array): string {
+  return b64(u8).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function unb64url(s: string): Uint8Array {
+  return unb64(s.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (s.length % 4)) % 4));
+}
+
+/** ECDH(X25519) + HKDF-SHA256 -> the 32-byte one-time wrapping key, from our private key + the peer's
+ *  raw public key (base64url). ECDH is symmetric, so wrap and unwrap derive the same key. */
+async function pairWrappingKey(ourPrivate: CryptoKey, peerPubB64url: string): Promise<Uint8Array> {
+  const peer = await crypto.subtle.importKey("raw", unb64url(peerPubB64url) as BufferSource, { name: "X25519" }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: peer }, ourPrivate, 256));
+  const hk = await crypto.subtle.importKey("raw", secret as BufferSource, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: PAIR_SALT as BufferSource, info: PAIR_INFO as BufferSource },
+    hk,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/** AES-GCM seal in the app's combined framing (nonce||ct||tag), base64url. */
+async function sealPair(key: Uint8Array, pt: Uint8Array): Promise<string> {
+  const k = await crypto.subtle.importKey("raw", key as BufferSource, "AES-GCM", false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, k, pt as BufferSource));
+  const out = new Uint8Array(12 + ct.length);
+  out.set(iv, 0);
+  out.set(ct, 12);
+  return b64url(out);
+}
+/** AES-GCM open of a base64url combined sealed blob. Null on any failure (wrong key / tamper). */
+async function openPair(key: Uint8Array, blobB64url: string): Promise<Uint8Array | null> {
+  try {
+    const comb = unb64url(blobB64url);
+    const k = await crypto.subtle.importKey("raw", key as BufferSource, "AES-GCM", false, ["decrypt"]);
+    return new Uint8Array(
+      await crypto.subtle.decrypt({ name: "AES-GCM", iv: comb.subarray(0, 12) as BufferSource }, k, comb.subarray(12) as BufferSource),
+    );
+  } catch {
+    return null;
+  }
+}
+
+/** Whether this browser has the X25519 WebCrypto the QR flow needs (so the UI can hide it otherwise). */
+export async function qrSupported(): Promise<boolean> {
+  try {
+    await crypto.subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export interface QrJoin {
+  pairingID: string;
+  code: string;
+  /** What the QR encodes: an approve deep-link a signed-in device opens. */
+  approveURL: string;
+  /** Kept in memory by the caller until approval; needed to unwrap the approved payload. */
+  ephemeral: CryptoKeyPair;
+}
+
+/** Joiner: start a QR sign-in. Mints an ephemeral X25519 keypair, registers its public key with the
+ *  worker, and returns the pairing id + the human code + the approve URL to render as a QR. */
+export async function qrSignInStart(approveBase: string): Promise<QrJoin> {
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const pub = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const r = await api("/v1/qr/start", { method: "POST", body: { devicePublicKey: pub } });
+  const d = r.data as { pairingID?: string; code?: string } | null;
+  if (r.status !== 200 || !d?.pairingID || !d?.code) throw new Error("Could not start QR sign-in.");
+  const approveURL = `${approveBase}#/approve?c=${encodeURIComponent(d.code)}&k=${encodeURIComponent(pub)}`;
+  return { pairingID: d.pairingID, code: d.code, approveURL, ephemeral };
+}
+
+/** Joiner: poll once. Returns the live Session when approved, null while still pending. Throws on a
+ *  definite failure (expired pairing, undecryptable payload). */
+export async function qrSignInPoll(join: QrJoin): Promise<Session | null> {
+  const r = await api(`/v1/qr/status?id=${encodeURIComponent(join.pairingID)}`);
+  if (r.status === 410 || r.status === 404) throw new Error("This QR code expired. Generate a new one.");
+  const d = r.data as { token?: string; payload?: string; pending?: boolean } | null;
+  if (!d || d.pending || !d.token || !d.payload) return null; // still waiting for approval
+  let parsed: { claim?: string; wrapped?: string };
+  try {
+    parsed = JSON.parse(d.payload) as { claim?: string; wrapped?: string };
+  } catch {
+    throw new Error("Sign-in failed (bad approval payload).");
+  }
+  if (!parsed.claim || !parsed.wrapped) throw new Error("Sign-in failed (incomplete approval).");
+  const wrapKey = await pairWrappingKey(join.ephemeral.privateKey, parsed.claim);
+  const dataKey = await openPair(wrapKey, parsed.wrapped);
+  if (!dataKey || dataKey.length !== 32) throw new Error("Could not unlock your data from the approval.");
+  // The worker minted the session token on approval; fetch the account fields it belongs to.
+  const me = await api("/v1/auth/me", { token: d.token });
+  const account = me.status === 200 ? (me.data?.account as Account | undefined) : undefined;
+  if (!account) throw new Error("Sign-in failed (account lookup).");
+  const session: Session = { token: d.token, account, dataKey };
+  saveSession(session);
+  return session;
+}
+
+/** Approver (signed in): wrap our data key to a joining device's published public key and authorize the
+ *  pairing. `code` + `devicePublicKey` come from the QR the joining device displayed. */
+export async function qrApprove(session: Session, code: string, devicePublicKey: string): Promise<void> {
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const claim = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const wrapKey = await pairWrappingKey(ephemeral.privateKey, devicePublicKey);
+  const wrapped = await sealPair(wrapKey, session.dataKey);
+  const r = await api("/v1/qr/authorize", {
+    method: "POST",
+    token: session.token,
+    body: { code: code.trim().toUpperCase(), wrappedPayload: JSON.stringify({ claim, wrapped }) },
+  });
+  if (r.status === 404) throw new Error("That code was not found. It may have expired.");
+  if (r.status === 410) throw new Error("That code has expired.");
+  if (r.status !== 200) throw new Error("Could not approve the sign-in.");
+}
+
+// --- Household sharing (shared add-ons / library / metadata + debrid keys across SEPARATE accounts) ---
+// A household has ONE random 32-byte household key (`hhKey`, versioned by `hhKeyVersion`). Every member
+// can decrypt the household-scoped shared blob with it; the worker (/v1/household/*) never sees `hhKey`
+// in plaintext. Admission reuses the SAME ephemeral X25519 + ECDH + HKDF primitive as QR pairing above,
+// but with a DISTINCT HKDF salt AND info ("vortx-household-salt-v1" / "vortx-household-v1") so a
+// household-wrapped payload can never cross-replay with a pairing-wrapped one (domain separation). The
+// owner ECDH-wraps the RAW 32-byte `hhKey` to a joiner's published public key; the worker relays only
+// the ciphertext. Byte contract is identical to the Apple app's HouseholdCrypto.swift + the e2e test:
+//   wrappingKey = HKDF-SHA256(ECDH(ourPriv, peerPub),
+//                             salt = utf8("vortx-household-salt-v1"),
+//                             info = utf8("vortx-household-v1"), L = 32)
+//   wrappedHhKey = base64url( AES-GCM-seal(hhKey 32B, wrappingKey) )   // iv(12)||ct(32)||tag(16), base64URL
+//   public keys  = base64url( X25519 raw public key (32 bytes) )       // same framing as the pairing flow
+// The SHARED BLOB itself is sealed under `hhKey` with the account-backup framing (standard base64
+// iv||ct||tag, i.e. seal/open above), NOT base64url — two distinct b64 alphabets for two channels, kept
+// separate on purpose so each matches its Swift counterpart exactly.
+
+const HOUSEHOLD_SALT = enc("vortx-household-salt-v1");
+const HOUSEHOLD_INFO = enc("vortx-household-v1");
+
+/** ECDH(X25519) + HKDF-SHA256 -> the 32-byte household wrapping key, from our private key + the peer's
+ *  raw public key (base64url). DISTINCT salt+info from pairWrappingKey for real domain separation. */
+async function householdWrappingKey(ourPrivate: CryptoKey, peerPubB64url: string): Promise<Uint8Array> {
+  const peer = await crypto.subtle.importKey("raw", unb64url(peerPubB64url) as BufferSource, { name: "X25519" }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: peer }, ourPrivate, 256));
+  const hk = await crypto.subtle.importKey("raw", secret as BufferSource, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: HOUSEHOLD_SALT as BufferSource, info: HOUSEHOLD_INFO as BufferSource },
+    hk,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/** Mint a brand-new household key: 32 random bytes. Called ONCE on household init and again ONLY on
+ *  rotation (a member leaves), where the version is bumped so old members are locked out of FUTURE
+ *  shared content. Never derive these bytes deterministically. */
+export function newHhKey(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(32));
+}
+
+/** Joiner: mint a one-time ephemeral X25519 keypair for a household key-request. Hold the keypair in
+ *  memory until the owner answers, then unwrap with unwrapHhKey. */
+export async function newHouseholdEphemeral(): Promise<{ keyPair: CryptoKeyPair; publicKeyB64url: string }> {
+  const keyPair = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const publicKeyB64url = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey)));
+  return { keyPair, publicKeyB64url };
+}
+
+/** Owner side: wrap the RAW 32-byte `hhKey` to a joiner's published public key. Mints a fresh ephemeral
+ *  keypair (so the owner public key for THIS answer is `ownerPublicKey`), does ECDH against the joiner
+ *  key, derives the household wrapping key, and seals `hhKey` under it. Returns the owner ephemeral
+ *  public key + the sealed key, both base64url. */
+export async function wrapHhKey(
+  hhKey: Uint8Array,
+  joinerPublicKeyB64url: string,
+): Promise<{ ownerPublicKey: string; wrappedHhKey: string }> {
+  if (hhKey.length !== 32) throw new Error("hhKey must be exactly 32 bytes.");
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const ownerPublicKey = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const wrapKey = await householdWrappingKey(ephemeral.privateKey, joinerPublicKeyB64url);
+  const wrappedHhKey = await sealPair(wrapKey, hhKey);
+  return { ownerPublicKey, wrappedHhKey };
+}
+
+/** Joiner side: unwrap the household key with our ephemeral private key + the owner's ephemeral public
+ *  key. Returns the RAW 32-byte `hhKey`, or null if anything fails to verify (wrong key / tamper / the
+ *  recovered bytes are not 32 long). The joiner is expected to re-seal these bytes under its own dataKey
+ *  for durability (doc.household.wrappedHhKey), which is a plain seal() with the dataKey. */
+export async function unwrapHhKey(
+  wrappedHhKey: string,
+  ownerPublicKeyB64url: string,
+  ourPrivate: CryptoKey,
+): Promise<Uint8Array | null> {
+  const wrapKey = await householdWrappingKey(ourPrivate, ownerPublicKeyB64url);
+  const hhKey = await openPair(wrapKey, wrappedHhKey);
+  if (!hhKey || hhKey.length !== 32) return null;
+  return hhKey;
+}
+
+/** Seal the household shared blob under `hhKey`. Uses the account-backup framing (standard base64
+ *  iv||ct||tag), pinned to seal() so the blob stored in household_docs matches every surface + the app's
+ *  HouseholdCrypto.sealSharedBlob. */
+export async function sealSharedBlob(plaintext: Uint8Array, hhKey: Uint8Array): Promise<string> {
+  return seal(hhKey, plaintext);
+}
+/** Open the household shared blob sealed under `hhKey`. Null on any failure (wrong key / tamper). */
+export async function openSharedBlob(ciphertext: string, hhKey: Uint8Array): Promise<Uint8Array | null> {
+  return open(hhKey, ciphertext);
+}
+
+// --- Household worker calls (the /v1/household/* relay; the worker stays a blind ciphertext relay) ---
+
+export interface HouseholdStatus {
+  familyId: string;
+  role: string;
+  hasBlob: boolean;
+  version: number;
+  hhKeyVersion: number;
+  pendingRequests: number;
+}
+export interface HouseholdKeyRequest {
+  accountId: string;
+  username: string;
+  joinerPublicKey: string;
+  createdAt: number;
+}
+
+/** GET /v1/household — sharing status for the caller's family, or null when not in a household. */
+export async function householdStatus(session: Session): Promise<HouseholdStatus | null> {
+  const r = await api("/v1/household", { token: session.token });
+  if (r.status !== 200) return null;
+  return (r.data?.household as HouseholdStatus | null) ?? null;
+}
+
+/** GET /v1/household/blob — the shared ciphertext blob + its versions, or null when none exists yet. */
+export async function householdBlobGet(
+  session: Session,
+): Promise<{ document: string; version: number; hhKeyVersion: number } | null> {
+  const r = await api("/v1/household/blob", { token: session.token });
+  if (r.status === 404) return null;
+  if (r.status !== 200) throw new Error("Could not read the household.");
+  const d = r.data as { document: string; version: number; hhKeyVersion: number };
+  return { document: d.document, version: d.version, hhKeyVersion: d.hhKeyVersion };
+}
+
+/** PUT /v1/household/blob — store the shared blob, LWW by version (accepted only when strictly newer). */
+export async function householdBlobPut(
+  session: Session,
+  document: string,
+  version: number,
+  hhKeyVersion: number,
+): Promise<boolean> {
+  const r = await api("/v1/household/blob", {
+    method: "PUT",
+    token: session.token,
+    body: { document, version, hhKeyVersion },
+  });
+  if (r.status !== 200) throw new Error("Could not save the household.");
+  return r.data?.accepted !== false; // false = a newer version already won; caller re-fetches + merges
+}
+
+/** Joiner: POST /v1/household/key-request — publish our ephemeral public key so the owner can wrap hhKey. */
+export async function householdKeyRequest(session: Session, joinerPublicKey: string): Promise<void> {
+  const r = await api("/v1/household/key-request", {
+    method: "POST",
+    token: session.token,
+    body: { joinerPublicKey },
+  });
+  if (r.status !== 200) throw new Error("Could not request the household key.");
+}
+
+/** Owner: GET /v1/household/key-requests — pending hhKey requests from members (owner only). */
+export async function householdKeyRequests(session: Session): Promise<HouseholdKeyRequest[]> {
+  const r = await api("/v1/household/key-requests", { token: session.token });
+  if (r.status !== 200) return [];
+  return (r.data?.requests as HouseholdKeyRequest[]) ?? [];
+}
+
+/** Owner: POST /v1/household/key-answer — relay the wrapped hhKey + our ephemeral public key to a member. */
+export async function householdKeyAnswer(
+  session: Session,
+  accountId: string,
+  ownerPublicKey: string,
+  wrappedHhKey: string,
+  hhKeyVersion: number,
+): Promise<void> {
+  const r = await api("/v1/household/key-answer", {
+    method: "POST",
+    token: session.token,
+    body: { accountId, ownerPublicKey, wrappedHhKey, hhKeyVersion },
+  });
+  if (r.status !== 200) throw new Error("Could not answer the household key request.");
+}
+
+/** Joiner: GET /v1/household/key-status — poll for the owner's answer. The worker returns the wrapped key
+ *  ONCE (and deletes the request), so call unwrapHhKey immediately on an "answered" status. */
+export async function householdKeyStatus(session: Session): Promise<{
+  status: "none" | "pending" | "expired" | "answered";
+  ownerPublicKey?: string;
+  wrappedHhKey?: string;
+  hhKeyVersion?: number;
+}> {
+  const r = await api("/v1/household/key-status", { token: session.token });
+  if (r.status !== 200) return { status: "none" };
+  return r.data as {
+    status: "none" | "pending" | "expired" | "answered";
+    ownerPublicKey?: string;
+    wrappedHhKey?: string;
+    hhKeyVersion?: number;
+  };
+}

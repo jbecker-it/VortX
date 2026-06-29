@@ -29,7 +29,10 @@ enum VortXRatingsClient {
         let mediaType = (type == "series") ? "series" : "movie"
         guard let url = URL(string: "\(base)/v1/ratings/\(mediaType)/\(imdbID)") else { return nil }
         do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
+            // Sign for the gated ratings.vortx.tv host (no-op when the user pointed at a custom base).
+            var request = URLRequest(url: url)
+            VortXEdgeAuth.sign(&request)
+            let (data, resp) = try await URLSession.shared.data(for: request)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
             // The VortX service returns IMDb on its native 0-10 scale and RT/TMDB as 0-100, matching the

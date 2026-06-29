@@ -5,10 +5,17 @@ import WebKit
 /// inside a `WKWebView` with NO API key and NO extraction - the same mechanism the official Stremio
 /// client uses (`stremio-video`'s `YouTubeVideo`: the YouTube IFrame Player API + `loadVideoById`).
 ///
-/// Hosting: the official IFrame player is loaded via `loadHTMLString(_:baseURL:)` with a real
-/// `https://www.youtube.com` base URL so the player sees a legitimate embedding `origin` (passed to the
-/// iframe as `enablejsapi=1&origin=…`) - the documented embedding path, which sidesteps the "player
-/// configuration" Error 153 the old top-level `load(embed-url)` hit.
+/// Hosting (the July-2025 Referer fix): YouTube's IFrame player started REQUIRING a real network
+/// `Referer` header on its July 9 2025 enforcement. The old `loadHTMLString(_:baseURL:)` path did NOT
+/// deliver one: WebKit (bug 169846) never sends a network `Referer` for the cross-origin `iframe_api`
+/// and player requests fired from a synthetic loadHTMLString document, no matter what `baseURL` is
+/// passed, so YouTube rejected EVERY embed with a 15x-family error ("This video is unavailable.
+/// Error code: 152-4"). The `origin` playerVar is only a JS postMessage parameter, NOT the network
+/// Referer YouTube now checks. We therefore serve the player HTML from a real loaded document via a
+/// `WKURLSchemeHandler` (custom `vortx-yt://` scheme) and `webView.load(URLRequest)`, with a
+/// `<base href="https://www.youtube.com/">` plus `<meta name="referrer" content="origin">` so the
+/// browser attaches `Referer: https://www.youtube.com/` to the cross-origin iframe_api + player
+/// requests. A desktop-class `applicationNameForUserAgent` makes YouTube serve the standard web embed.
 ///
 /// FAIL-SOFT (the reason this is now a single JS-API path for every mode): many trailers - especially
 /// official studio uploads - have embedding DISABLED by the owner, so the iframe renders YouTube's
@@ -67,12 +74,12 @@ private struct YouTubeIFrameWebView: UIViewRepresentable {
     func makeCoordinator() -> YouTubeEmbedCoordinator { YouTubeEmbedCoordinator(onFailure: onFailure) }
 
     func makeUIView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero, configuration: YouTubeEmbedConfig.make(context.coordinator))
+        let webView = WKWebView(frame: .zero, configuration: YouTubeEmbedConfig.make(context.coordinator, id: youTubeID, mode: mode))
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
         webView.backgroundColor = .clear
         webView.scrollView.backgroundColor = .clear
-        webView.loadHTMLString(YouTubeEmbedHTML.page(id: youTubeID, mode: mode), baseURL: YouTubeEmbedHTML.baseURL)
+        webView.load(YouTubeEmbedHTML.documentRequest)
         return webView
     }
 
@@ -91,9 +98,9 @@ private struct YouTubeIFrameWebView: NSViewRepresentable {
     func makeCoordinator() -> YouTubeEmbedCoordinator { YouTubeEmbedCoordinator(onFailure: onFailure) }
 
     func makeNSView(context: Context) -> WKWebView {
-        let webView = WKWebView(frame: .zero, configuration: YouTubeEmbedConfig.make(context.coordinator))
+        let webView = WKWebView(frame: .zero, configuration: YouTubeEmbedConfig.make(context.coordinator, id: youTubeID, mode: mode))
         webView.setValue(false, forKey: "drawsBackground")  // transparent canvas on macOS
-        webView.loadHTMLString(YouTubeEmbedHTML.page(id: youTubeID, mode: mode), baseURL: YouTubeEmbedHTML.baseURL)
+        webView.load(YouTubeEmbedHTML.documentRequest)
         return webView
     }
 
@@ -117,7 +124,14 @@ final class YouTubeEmbedCoordinator: NSObject, WKScriptMessageHandler {
     init(onFailure: (() -> Void)?) { self.onFailure = onFailure }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == YouTubeEmbedConfig.handlerName, !fired else { return }
+        guard message.name == YouTubeEmbedConfig.handlerName else { return }
+        // Diagnostic logs share the one handler. Surface them to the device console (so the real onError
+        // code is visible) but never treat a log as the failure signal.
+        if let s = message.body as? String, s.hasPrefix("log:") {
+            NSLog("[YouTubeEmbed] %@", String(s.dropFirst(4)))
+            return
+        }
+        guard !fired else { return }
         fired = true
         let cb = onFailure
         DispatchQueue.main.async { cb?() }
@@ -128,33 +142,89 @@ final class YouTubeEmbedCoordinator: NSObject, WKScriptMessageHandler {
 
 /// Shared `WKWebViewConfiguration`. `allowsInlineMediaPlayback = true` plus
 /// `mediaTypesRequiringUserActionForPlayback = []` let the muted hero clip autoplay inline without a tap;
-/// the user content controller carries the failure message handler.
+/// the user content controller carries the failure message handler. A `WKURLSchemeHandler` for the
+/// custom `vortx-yt://` scheme serves the player HTML as a real loaded document (so cross-origin
+/// subresource requests carry a network `Referer`, which `loadHTMLString` could not deliver), and a
+/// desktop-class `applicationNameForUserAgent` makes YouTube serve the standard web embed.
 private enum YouTubeEmbedConfig {
     static let handlerName = "vortxYT"
+    /// Custom scheme whose document the `WKURLSchemeHandler` serves. Lets the player HTML load as a real
+    /// resource instead of a synthetic `loadHTMLString` document, which is what restores the network
+    /// `Referer` on the iframe_api + player requests (WebKit bug 169846).
+    static let scheme = "vortx-yt"
+    /// Desktop Safari UA fragment so YouTube serves the standard web IFrame embed, not a degraded path.
+    static let desktopUserAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
 
-    static func make(_ coordinator: YouTubeEmbedCoordinator) -> WKWebViewConfiguration {
+    static func make(_ coordinator: YouTubeEmbedCoordinator, id: String, mode: YouTubeEmbedView.Mode) -> WKWebViewConfiguration {
         let config = WKWebViewConfiguration()
         #if canImport(UIKit)
         config.allowsInlineMediaPlayback = true
         #endif
         config.mediaTypesRequiringUserActionForPlayback = []
+        config.applicationNameForUserAgent = desktopUserAgent
         config.userContentController.add(coordinator, name: handlerName)
+        // The handler is retained by the configuration for the webview's lifetime; it serves the one
+        // player document for this id/mode with a youtube.com Referer attached.
+        config.setURLSchemeHandler(YouTubeSchemeHandler(html: YouTubeEmbedHTML.page(id: id, mode: mode)), forURLScheme: scheme)
         return config
     }
 }
 
+// MARK: - Scheme handler (real document + network Referer)
+
+/// Serves the single player HTML document for the custom `vortx-yt://` scheme. Responding from a real
+/// loaded resource (rather than `loadHTMLString`) is what makes WebKit attach a network `Referer` to the
+/// subsequent cross-origin `iframe_api` and player requests, which YouTube's July-2025 enforcement
+/// requires. The `<base>` + `<meta name="referrer">` in the HTML set that Referer to `https://www.youtube.com/`.
+final class YouTubeSchemeHandler: NSObject, WKURLSchemeHandler {
+    private let html: String
+
+    init(html: String) { self.html = html }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        guard let url = urlSchemeTask.request.url else {
+            urlSchemeTask.didFailWithError(URLError(.badURL))
+            return
+        }
+        let data = Data(html.utf8)
+        let headers = [
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": String(data.count),
+            "Access-Control-Allow-Origin": "*"
+        ]
+        let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)
+            ?? HTTPURLResponse()
+        urlSchemeTask.didReceive(response)
+        urlSchemeTask.didReceive(data)
+        urlSchemeTask.didFinish()
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+}
+
 // MARK: - HTML
 
-/// Builds the IFrame Player API page for every mode. Loading this HTML with `https://www.youtube.com`
-/// as the document origin (and passing the same origin to the player via `origin=`) is what makes the
-/// player accept playback. `onError` and a no-duration `onReady` both post `failed` to native so an
-/// embed-restricted or removed video fails soft instead of showing YouTube's error card.
+/// Builds the IFrame Player API page for every mode. The page is served by `YouTubeSchemeHandler` from
+/// the custom `vortx-yt://` scheme and loaded via `webView.load(documentRequest)`; the `<base href>` +
+/// `<meta name="referrer" content="origin">` make the browser attach `Referer: https://www.youtube.com/`
+/// to the cross-origin iframe_api + player requests (the July-2025 enforcement), which the old
+/// `loadHTMLString` path could never deliver. `onError` and a no-duration `onReady` both post `failed`
+/// to native so an embed-restricted or removed video fails soft instead of showing YouTube's error card.
 private enum YouTubeEmbedHTML {
-    /// The embedding origin. Must be a real https URL for the IFrame player to validate.
-    static let baseURL = URL(string: "https://www.youtube.com")
+    /// The embedding origin the iframe_api + player requests must carry as their network Referer.
+    static let embedOrigin = "https://www.youtube.com"
+
+    /// The request that loads the player document from the custom scheme. The `Referer` header here covers
+    /// the top document; the in-HTML `<base>`/referrer-policy cover the cross-origin subresource requests.
+    static var documentRequest: URLRequest {
+        var request = URLRequest(url: URL(string: "\(YouTubeEmbedConfig.scheme)://player/index.html")!)
+        request.setValue("\(embedOrigin)/", forHTTPHeaderField: "Referer")
+        return request
+    }
 
     static func page(id: String, mode: YouTubeEmbedView.Mode) -> String {
-        let origin = "https://www.youtube.com"
+        let origin = embedOrigin
         // Mode -> player vars + the onReady body (clip windowing vs plain autoplay).
         let vars: String
         let onReady: String
@@ -199,6 +269,10 @@ private enum YouTubeEmbedHTML {
         <html>
         <head>
           <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+          <!-- base + referrer policy: the browser attaches Referer: https://www.youtube.com/ to the
+               cross-origin iframe_api + player requests, which YouTube's July-2025 enforcement requires. -->
+          <base href="\(origin)/">
+          <meta name="referrer" content="origin">
           <style>
             * { margin: 0; padding: 0; }
             html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
@@ -209,32 +283,58 @@ private enum YouTubeEmbedHTML {
           <div id="player"></div>
           <script src="https://www.youtube.com/iframe_api"></script>
           <script>
-            var START = \(start), WIN = \(win), loop, failed = false;
+            var START = \(start), WIN = \(win), loop, failed = false, started = false, player = null;
+            function log(m) {
+              try { window.webkit.messageHandlers.\(YouTubeEmbedConfig.handlerName).postMessage('log:' + m); } catch (err) {}
+            }
             function fail() {
               if (failed) return; failed = true;
+              log('fail');
               try { window.webkit.messageHandlers.\(YouTubeEmbedConfig.handlerName).postMessage('failed'); } catch (err) {}
             }
             function onYouTubeIframeAPIReady() {
-              new YT.Player('player', {
+              player = new YT.Player('player', {
                 videoId: '\(id)',
                 playerVars: { \(vars), enablejsapi: 1, origin: '\(origin)' },
                 events: {
                   onReady: function (e) {
                     // A removed / region-blocked video reports 0 duration on ready: treat as a failure so
                     // the caller can fall back even when no onError fires.
-                    if (!e.target.getDuration || e.target.getDuration() === 0) { /* may still load; guarded by timeout */ }
+                    if (!e.target.getDuration || e.target.getDuration() === 0) { /* may still load; guarded by watchdog */ }
                     \(onReady)
                   },
-                  onStateChange: function (e) { \(onStateChange) },
-                  // 2 invalid id, 5 HTML5 error, 100 removed/private, 101 & 150 embedding disabled.
-                  onError: function (e) { fail(); }
+                  // Record that playback actually began so the watchdog can distinguish a real start from a
+                  // stuck player that never errors (e.g. an embedder-verification block that shows the 152
+                  // card without firing onError). PLAYING (1) or BUFFERING (3) both count as a live start.
+                  onStateChange: function (e) {
+                    if (e.data === YT.PlayerState.PLAYING || e.data === YT.PlayerState.BUFFERING) { started = true; }
+                    \(onStateChange)
+                  },
+                  // 2 invalid param, 5 HTML5 error, 100 removed/private, 101 & 150 embedding disabled,
+                  // 151/152/153 the post-2025 embedder-verification family (the "Error code: 152-4" card).
+                  // Codes 2 and 5 fire SPURIOUSLY under WKWebView's synthetic origin (often within ~0.5s of
+                  // onReady) even for perfectly embeddable videos, so treating any code as fatal killed EVERY
+                  // trailer. Only the truly-fatal codes (removed / embedding-disabled / embedder-verification)
+                  // fall back; transient 2/5 are logged and ignored. The playback watchdog below still
+                  // catches a player that loads but never actually starts.
+                  onError: function (e) {
+                    log('onError code=' + e.data);
+                    if (e.data === 100 || e.data === 101 || e.data === 150 ||
+                        e.data === 151 || e.data === 152 || e.data === 153) { fail(); }
+                  }
                 }
               });
             }
-            // Safety net: if the API never loads or the player never reaches a playable state, fail soft.
+            // Watchdog: if the API never loads, OR the player loaded but never actually started playing
+            // within the window (the embedder-verification 152 card can sit there WITHOUT firing onError),
+            // fail soft so the caller restores the still backdrop / hands off to the YouTube app instead of
+            // leaving the error card on screen. A non-zero getCurrentTime() also counts as a real start.
             setTimeout(function () {
-              if (!window.YT || !window.YT.Player) { fail(); }
-            }, 6000);
+              if (!window.YT || !window.YT.Player) { fail(); return; }
+              var playing = started;
+              try { if (player && player.getCurrentTime && player.getCurrentTime() > 0) { playing = true; } } catch (err) {}
+              if (!playing) { fail(); }
+            }, 7000);
           </script>
         </body>
         </html>

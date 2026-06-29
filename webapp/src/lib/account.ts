@@ -7,9 +7,22 @@
 // vault.ts is the source of truth for crypto + persistence; this module never touches localStorage
 // directly, it goes through vault's saveSession/loadSession/clearSession.
 
-import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, type Session } from "./vault";
-import { mergeInstalledAddons, mergeLibrary } from "./store";
-import { updateSettings } from "./settings";
+import { loadSession, clearSession, validateSession, saveSession, getSyncDoc, mutateSyncDoc, type Session } from "./vault";
+import {
+  mergeInstalledAddons,
+  applyAddonOrder,
+  registerAddonsSyncPusher,
+  installedUrls,
+  mergeLibrary,
+  mergeContinueWatching,
+  mergeLibraryForScope,
+  mergeContinueWatchingForScope,
+  type CWEntry,
+} from "./store";
+import { mergeSyncedProfiles, type SyncedProfile } from "./profiles";
+import { updateSettings, onSettingsChange, type Settings } from "./settings";
+import { settingsPatchFromDoc, mergeWebappSettingsIntoProfile, effectiveMainSettings, mainProfileId } from "./syncSettings";
+import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
 
 // The in-memory cache. `undefined` = not yet hydrated from storage; `null` = hydrated, signed out.
@@ -83,6 +96,81 @@ function addonUrl(a: unknown): string | null {
   return null;
 }
 
+/** Coerce an unknown to an array of plain objects (the loose synced-doc shape). */
+function asObjArr(v: unknown): Record<string, unknown>[] {
+  return Array.isArray(v) ? (v.filter((x) => x && typeof x === "object") as Record<string, unknown>[]) : [];
+}
+
+/** Map synced library items (carrying t/d seconds + lastWatched + v resumeId) to CW entries. Shared by
+ *  the owner library and each per-profile (byProfile) library so the logic stays in one place. */
+function cwEntriesFrom(items: unknown): CWEntry[] {
+  const arr = asObjArr(items);
+  const out: CWEntry[] = [];
+  arr.forEach((it, i) => {
+    if (typeof it.id !== "string" || typeof it.type !== "string" || typeof it.name !== "string") return;
+    const t = Number(it.t);
+    const d = Number(it.d);
+    if (!(t > 0) || !(d > 0) || t / d >= 0.95) return; // not started / already finished
+    // lastWatched may be an ISO string OR an epoch (seconds or ms). When it is missing or unparseable,
+    // fall back to the source ORDER (earlier in the list = more recently watched) so the rail matches the
+    // app's order instead of collapsing every item to updatedAt 0 and scrambling the order.
+    let updatedAt = NaN;
+    if (typeof it.lastWatched === "string") updatedAt = Date.parse(it.lastWatched);
+    else if (typeof it.lastWatched === "number") updatedAt = it.lastWatched < 1e12 ? it.lastWatched * 1000 : it.lastWatched;
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) updatedAt = Date.now() - i * 1000;
+    out.push({
+      id: it.id,
+      type: it.type,
+      name: it.name,
+      poster: typeof it.poster === "string" ? it.poster : undefined,
+      resumeId: typeof it.v === "string" && it.v ? it.v : it.id, // overlay items carry the resume episode id
+      position: t,
+      duration: d,
+      updatedAt,
+    });
+  });
+  return out;
+}
+
+/** Build the web profile roster from the synced doc, mirroring the dashboard's normalizeDoc essentials:
+ *  read vortx.profiles, collapse duplicate "main" rows (the duplicate-Main bug), drop deletedProfiles
+ *  tombstones unconditionally, and overlay doc.profileEdits ONLY when it is newer than the mirror
+ *  (editedAt > vortx.updatedAt) so a stale web edit never masks a newer device change. Returns the slim
+ *  roster the web store needs. */
+function rosterFromDoc(vortx: Record<string, unknown>, doc: Record<string, unknown>): SyncedProfile[] {
+  let roster: SyncedProfile[] = asObjArr(vortx.profiles)
+    .filter((p) => p.id != null)
+    .map((p, i) => {
+      const st = p.settings && typeof p.settings === "object" ? (p.settings as Record<string, unknown>) : {};
+      const avatar = typeof st.avatar === "string" && st.avatar.trim() ? st.avatar.trim() : undefined;
+      return { id: String(p.id), name: String(p.name ?? `Profile ${i + 1}`), main: !!p.main || i === 0, avatar };
+    });
+  const mains = roster.filter((p) => p.main);
+  if (mains.length > 1) {
+    const drop = new Set(mains.slice(1).map((p) => p.id));
+    roster = roster.filter((p) => !drop.has(p.id));
+  }
+  const tombIds = new Set((Array.isArray(vortx.deletedProfiles) ? vortx.deletedProfiles : []).map((x) => String(x)));
+  if (tombIds.size) roster = roster.filter((p) => !tombIds.has(p.id));
+  const edits = doc.profileEdits && typeof doc.profileEdits === "object" ? (doc.profileEdits as Record<string, unknown>) : null;
+  if (edits && (Number(edits.editedAt) || 0) > (Number(vortx.updatedAt) || 0) && Array.isArray(edits.roster)) {
+    const byId = new Map(roster.map((p) => [p.id, p] as const));
+    for (const raw of edits.roster) {
+      if (!raw || typeof raw !== "object") continue;
+      const e = raw as Record<string, unknown>;
+      if (e.id == null) continue;
+      const id = String(e.id);
+      if (tombIds.has(id)) continue;
+      if (e.deleted) { byId.delete(id); continue; }
+      const base = byId.get(id);
+      if (base) byId.set(id, { ...base, name: typeof e.name === "string" && e.name ? e.name : base.name });
+      else byId.set(id, { id, name: String(e.name ?? "Profile"), main: false });
+    }
+    roster = [...byId.values()];
+  }
+  return roster;
+}
+
 /** Apply a decrypted sync document to local state (READ-ONLY merge: add-ons, library, metadata keys).
  *  Pure (no network) so it is unit-testable; hydrateFromAccount fetches the doc then calls this. Tolerant
  *  of any missing/odd key - a partial or foreign doc never throws. */
@@ -90,14 +178,22 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
   if (!doc || typeof doc !== "object") return;
   const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
 
-  // Metadata API keys (the app stores them under doc.apiKeys; Keychain on native, settings here).
+  // Settings read-down: metadata API keys (doc.apiKeys) + the app/dashboard per-profile appearance,
+  // playback and stream-filter settings (doc.vortx.profiles[main].settings / doc.profileEdits). Applied
+  // through updateSettings so the theme + player prefs take effect live. Wrapped in suppressUp so this
+  // hydration does not immediately bounce back up as a web-authored change (see the write-up below).
   const keys = (doc.apiKeys && typeof doc.apiKeys === "object" ? doc.apiKeys : {}) as Record<string, unknown>;
-  const patch: Record<string, string> = {};
+  const patch: Partial<Settings> = {};
   if (typeof keys.tmdb === "string" && keys.tmdb) patch.tmdbKey = keys.tmdb;
   if (typeof keys.mdblist === "string" && keys.mdblist) patch.mdblistKey = keys.mdblist;
-  if (Object.keys(patch).length) updateSettings(patch);
+  const settingsPatch = settingsPatchFromDoc(doc);
+  if (Object.keys(settingsPatch).length) settingsSyncArmed = true; // the account carries settings: web->up is now safe
+  Object.assign(patch, settingsPatch);
+  if (Object.keys(patch).length) withSuppressedUp(() => updateSettings(patch));
 
   // Add-ons: the app summary (vortx.addons: [{transportUrl,name}]) + the web Stremio import (doc.addons).
+  // Membership union first (never drops a local add-on), then apply the synced ORDER (vortx order wins,
+  // Cinemeta stays pinned first).
   const urls: string[] = [];
   for (const a of Array.isArray(vortx.addons) ? vortx.addons : []) {
     const u = addonUrl(a);
@@ -108,15 +204,42 @@ export function applySyncDoc(doc: Record<string, unknown> | null | undefined): v
     if (u) urls.push(u);
   }
   const addonsChanged = mergeInstalledAddons(urls);
+  const orderChanged = applyAddonOrder(urls);
 
-  // Owner library (vortx.library: [{id,name,type,poster,...}]).
-  mergeLibrary((Array.isArray(vortx.library) ? vortx.library : []) as MetaItem[]);
+  // Owner library (vortx.library: [{id,name,type,poster,t,d,lastWatched,v,...}]). The app emits t/d in
+  // seconds (the dashboard + now the web app derive Continue Watching from each item's progress).
+  const libItems = (Array.isArray(vortx.library) ? vortx.library : []) as Array<Record<string, unknown>>;
+  mergeLibrary(libItems as unknown as MetaItem[]);
 
-  // The running app loaded its add-on list at boot; newly-merged add-ons are only in localStorage. Tell
-  // main.ts to reload them + re-render so they appear immediately (Library reads storage fresh, so it
-  // already shows - this closes the "library shows but add-ons don't" gap after sign-in hydration).
-  if (addonsChanged && typeof window !== "undefined") {
-    window.dispatchEvent(new Event("vortx:addons-changed"));
+  // Continue Watching for the OWNER: derive from the synced library items' t/d progress, plus any explicit
+  // vortx.continueWatching the app emits. cwEntriesFrom is shared with the per-profile hydration below.
+  const cwChanged = mergeContinueWatching([...cwEntriesFrom(vortx.continueWatching), ...cwEntriesFrom(libItems)]);
+
+  // Profiles roster + per-profile (byProfile) library/CW. Without this the webapp only ever showed the
+  // local "You" profile and never the user's real synced roster, and secondary profiles had empty
+  // libraries. Ports the dashboard normalizeDoc essentials (roster + tombstones + profileEdits overlay)
+  // and writes each profile's library/CW into its own scoped store keys. Read-only: never deletes.
+  const rosterChanged = mergeSyncedProfiles(rosterFromDoc(vortx, doc));
+  let byProfileChanged = false;
+  const byProfile = vortx.byProfile && typeof vortx.byProfile === "object" ? (vortx.byProfile as Record<string, unknown>) : null;
+  if (byProfile) {
+    for (const pid of Object.keys(byProfile)) {
+      const bp = byProfile[pid];
+      if (!bp || typeof bp !== "object") continue;
+      const rec = bp as Record<string, unknown>;
+      if (mergeLibraryForScope(pid, asObjArr(rec.library) as unknown as MetaItem[])) byProfileChanged = true;
+      const cwSrc = Array.isArray(rec.continueWatching) ? rec.continueWatching : rec.library;
+      if (mergeContinueWatchingForScope(pid, cwEntriesFrom(cwSrc))) byProfileChanged = true;
+    }
+  }
+
+  // Re-render: any add-on/library/CW change reloads the nav; a roster change repaints the profile switcher
+  // and the scoped Home/Library/Continue-Watching for the active profile.
+  if (typeof window !== "undefined") {
+    if (addonsChanged || orderChanged || cwChanged || rosterChanged || byProfileChanged) {
+      window.dispatchEvent(new Event("vortx:addons-changed"));
+    }
+    if (rosterChanged) window.dispatchEvent(new Event("vortx:profile-changed"));
   }
 }
 
@@ -130,6 +253,115 @@ export async function hydrateFromAccount(session: Session): Promise<void> {
     // network / decrypt failure: sign-in still succeeds with local state.
   }
 }
+
+// --- Two-way sync: push web-authored changes back to the account --------------------------------
+// The webapp writes ONLY web-owned sibling keys: doc.profileEdits (the main profile's settings) and
+// doc.addons (the installed add-on list). It NEVER writes doc.vortx.* (app-authoritative). Every write
+// goes through mutateSyncDoc (optimistic concurrency: read version, merge, PUT version+1, retry on a
+// stale-version rejection) so a concurrent app/device write is never clobbered.
+
+// Guard so settings applied by read-down hydration do not immediately echo back up as a "web edit".
+let suppressUp = false;
+// Gate settings write-up: only push web settings UP once read-down has seen that the account already
+// carries per-profile settings (i.e. an app/dashboard participates in settings sync). Otherwise the
+// webapp's first edit would push its DEFAULTS into profileEdits and could override the app's real
+// settings. Stays false on accounts whose app has not synced settings yet (e.g. older app builds), so
+// settings only flow web->account once it is safe; read-down works regardless.
+let settingsSyncArmed = false;
+function withSuppressedUp(fn: () => void): void {
+  suppressUp = true;
+  try {
+    fn();
+  } finally {
+    suppressUp = false;
+  }
+}
+
+// Debounce settings pushes: the user may flip several toggles quickly; coalesce into one write.
+const SETTINGS_PUSH_DELAY = 800;
+let settingsPushTimer: ReturnType<typeof setTimeout> | undefined;
+
+/** Push the webapp's settings up to the MAIN profile via doc.profileEdits (dashboard-compatible shape).
+ *  Builds the full roster from the synced profiles (idempotent for unchanged ones, matching the dashboard
+ *  buildRoster: non-main entries are {id,name} so the app no-ops them) and merges the webapp-owned keys
+ *  over the main profile's existing settings, preserving keys the webapp does not model (avatar, isKids,
+ *  ...). No-op when there is no synced main profile yet. Fail-soft. */
+async function pushSettings(session: Session, s: Settings): Promise<void> {
+  try {
+    await mutateSyncDoc(session, (doc) => {
+      const mainId = mainProfileId(doc);
+      if (!mainId) return; // nothing to attach settings to; never invent a profile
+      const vortx = (doc.vortx && typeof doc.vortx === "object" ? doc.vortx : {}) as Record<string, unknown>;
+      const profiles = (Array.isArray(vortx.profiles) ? vortx.profiles : []) as Record<string, unknown>[];
+      const edits = (doc.profileEdits && typeof doc.profileEdits === "object" ? doc.profileEdits : {}) as Record<string, unknown>;
+      const base = effectiveMainSettings(doc); // freshest known main settings (app mirror + newer overlay)
+      const roster = profiles
+        .filter((p) => p.id != null)
+        .map((p) => {
+          const id = String(p.id);
+          const name = String(p.name ?? "Profile");
+          return id === mainId ? { id, name, settings: mergeWebappSettingsIntoProfile(base, s) } : { id, name };
+        });
+      doc.profileEdits = {
+        ...edits,
+        editedAt: Date.now(),
+        roster,
+        libraryAdds: (edits as Record<string, unknown>).libraryAdds ?? {},
+      };
+    });
+  } catch {
+    // fail-soft: the local change is already saved; the next change retries the push.
+  }
+}
+
+/** Push the webapp's installed add-ons up to the account (the doc.addons web sibling), so add-ons added
+ *  on the web reach the user's other devices. Cinemeta is excluded (a universal built-in, not a user
+ *  add-on). Fail-soft. */
+async function pushAddons(session: Session, urls: string[]): Promise<void> {
+  try {
+    // Resolve each add-on's FULL manifest so the synced entry is the descriptor the native app needs:
+    // {transportUrl, name, manifest}. The app DROPS doc.addons entries that lack a manifest (it installs
+    // them into the engine network-free, see VortXSyncManager.ownedAddons), so a URL-only entry would
+    // never reach the apps - that was the "add-ons added on web don't sync to the apps" bug. Cinemeta is a
+    // universal built-in and is excluded. Resolve in parallel; on a manifest-fetch failure fall back to a
+    // URL-only entry so at least web clients still record the membership.
+    const descriptors = await Promise.all(
+      urls
+        .filter((u) => u !== CINEMETA_URL)
+        .map(async (u) => {
+          try {
+            const a = await loadAddon(u);
+            return { transportUrl: a.transportUrl, name: a.manifest.name, manifest: a.manifest };
+          } catch {
+            return { transportUrl: u };
+          }
+        }),
+    );
+    await mutateSyncDoc(session, (doc) => {
+      doc.addons = descriptors;
+    });
+  } catch {
+    // fail-soft: the add-on is already installed locally; a later change re-pushes.
+  }
+}
+
+// Wire the write-up triggers once at module load:
+//  - add/remove on the web pushes the installed list up (store.ts calls this injected pusher).
+//  - any USER settings change (suppressUp gates out hydration) debounce-pushes the main profile's settings.
+registerAddonsSyncPusher(() => {
+  const s = currentSession();
+  if (s) void pushAddons(s, installedUrls());
+});
+onSettingsChange((next) => {
+  if (suppressUp) return; // hydration applied this, not the user; don't echo it back up
+  if (!settingsSyncArmed) return; // account has no settings mirror yet: keep web changes local (see flag)
+  if (!currentSession()) return; // signed out: settings stay local
+  if (settingsPushTimer) clearTimeout(settingsPushTimer);
+  settingsPushTimer = setTimeout(() => {
+    const cur = currentSession();
+    if (cur) void pushSettings(cur, next);
+  }, SETTINGS_PUSH_DELAY);
+});
 
 /** Sign out: clear storage, reset the cache, and notify subscribers so the nav drops back to signed-out. */
 export function signOut(): void {

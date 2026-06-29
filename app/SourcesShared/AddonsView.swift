@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreImage   // CIQRCodeGenerator for the Apple TV "Configure" QR
 
 /// Reachability of one installed add-on, from a lightweight manifest probe.
 enum AddonHealth: Equatable {
@@ -98,6 +99,8 @@ struct AddonsView: View {
     @State private var installing = false
     @State private var installMessage: String?
     @State private var installFailed = false
+    @State private var addonSheet: AddonSheet?   // the per-add-on Configure / Change-URL sheet
+    @State private var showUpdateConfirm = false   // "already installed -> update?" prompt
 
     var body: some View {
         NavigationStack {
@@ -144,6 +147,18 @@ struct AddonsView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .task(id: core.addons.count) { health.probe(core.addons.map(\.transportUrl)) }
+            .sheet(item: $addonSheet) { sheet in
+                switch sheet {
+                case .configure(let a): ConfigureAddonView(addon: a)
+                case .editURL(let a): EditAddonURLView(addon: a)
+                }
+            }
+            .confirmationDialog("Add-on already installed", isPresented: $showUpdateConfirm, titleVisibility: .visible) {
+                Button("Update") { runInstall(replacingExisting: true) }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This add-on is already installed. Update it to its latest manifest?")
+            }
         }
     }
 
@@ -189,30 +204,58 @@ struct AddonsView: View {
     }
 
     private func install() {
+        // Already installed? Offer to UPDATE (re-fetch the manifest) instead of erroring (owner request).
+        if let normalized = core.normalizedAddonURL(newAddonURL),
+           core.addons.contains(where: { $0.transportUrl == normalized }) {
+            showUpdateConfirm = true
+            return
+        }
+        runInstall(replacingExisting: false)
+    }
+
+    private func runInstall(replacingExisting: Bool) {
         installing = true
         installMessage = nil
         let url = newAddonURL
         Task { @MainActor in
-            let error = await core.installAddon(urlString: url)
+            let error = await core.installAddon(urlString: url, replacingExisting: replacingExisting)
             installing = false
             installFailed = error != nil
             if let error {
                 installMessage = error
             } else {
-                installMessage = "Installed."
+                installMessage = replacingExisting ? "Updated." : "Installed."
                 newAddonURL = ""
             }
+        }
+    }
+
+    /// The add-on's icon: its `manifest.logo` (so an AIOManager-set custom logo renders), falling back to
+    /// the capability SF Symbol when there is no logo or it fails to load.
+    @ViewBuilder private func addonIcon(_ addon: CoreDescriptor, isOff: Bool) -> some View {
+        let symbol = addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill"
+        let tint = isOff ? Theme.Palette.textTertiary
+                         : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary)
+        if let logo = addon.manifest.logo, let url = URL(string: logo) {
+            AsyncImage(url: url) { phase in
+                if let image = phase.image {
+                    image.resizable().scaledToFit()
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card / 2, style: .continuous))
+                        .opacity(isOff ? 0.5 : 1)
+                } else {
+                    Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint)
+                }
+            }
+            .frame(width: 56, height: 56)
+        } else {
+            Image(systemName: symbol).font(.system(size: 36)).foregroundStyle(tint).frame(width: 56)
         }
     }
 
     private func addonRow(_ addon: CoreDescriptor) -> some View {
         let isOff = profiles.isAddonDisabledForActive(base: addon.transportUrl)
         return HStack(alignment: .top, spacing: Theme.Space.md) {
-            Image(systemName: addon.providesStreams ? "play.rectangle.on.rectangle.fill" : "puzzlepiece.extension.fill")
-                .font(.system(size: 36))
-                .foregroundStyle(isOff ? Theme.Palette.textTertiary
-                                       : (addon.providesStreams ? Theme.Palette.accent : Theme.Palette.textTertiary))
-                .frame(width: 56)
+            addonIcon(addon, isOff: isOff)
             VStack(alignment: .leading, spacing: 8) {
                 Text(addon.manifest.name).font(Theme.Typography.cardTitle)
                     .foregroundStyle(isOff ? Theme.Palette.textTertiary : Theme.Palette.textPrimary)
@@ -227,7 +270,19 @@ struct AddonsView: View {
                 }
             }
             Spacer(minLength: Theme.Space.sm)
+            // Configurable add-ons (Torrentio, debrid configs, …) expose a web settings page. Available
+            // regardless of protected state; protected defaults are not configurable anyway.
+            if addon.isConfigurable {
+                Button { addonSheet = .configure(addon) } label: { Label("Configure", systemImage: "slider.horizontal.3") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
+            }
             if !addon.isProtected {
+                // Change the add-on's manifest URL in place (e.g. after reconfiguring it): installs the new
+                // URL first, then removes the old, so a bad URL never leaves you with neither.
+                Button { addonSheet = .editURL(addon) } label: { Image(systemName: "link") }
+                    .buttonStyle(ChipButtonStyle(selected: false))
+                    .fixedSize()
                 // Per-profile on/off (local overlay). Distinct from Remove, which uninstalls account-wide.
                 Button { profiles.toggleAddon(base: addon.transportUrl) } label: {
                     Image(systemName: isOff ? "eye.slash" : "eye")
@@ -250,5 +305,158 @@ struct AddonsView: View {
             .foregroundStyle(Theme.Palette.textSecondary)
             .frame(maxWidth: 820, alignment: .leading)
             .padding(.top, Theme.Space.sm)
+    }
+}
+
+/// Configure a configurable add-on. On iPhone, iPad, and Mac it opens the add-on's web configuration
+/// page in the browser; on Apple TV (which has no browser) it shows that page as a QR to finish on a
+/// phone, or points to the web dashboard. After configuring, the add-on hands back a NEW manifest URL,
+/// which the user pastes into Add an add-on to install their configured copy (the Stremio configure flow).
+private struct ConfigureAddonView: View {
+    let addon: CoreDescriptor
+    @Environment(\.openURL) private var openURL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: Theme.Space.lg) {
+            VStack(spacing: Theme.Space.xs) {
+                Text("Configure").font(.title2).fontWeight(.bold)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(addon.manifest.name).font(.subheadline)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            if let url = addon.configureURL {
+                #if os(tvOS)
+                if let qr = Self.qrImage(url.absoluteString) {
+                    Image(decorative: qr, scale: 1)
+                        .interpolation(.none).resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(Theme.Space.md)
+                        .background(.white)
+                        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                }
+                Text("Scan with your phone to open this add-on's settings, then paste the configured add-on link back into Add an add-on. You can also configure it on the web dashboard at vortx.tv.")
+                    .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 640)
+                #else
+                Button { openURL(url) } label: {
+                    Label("Open configuration page", systemImage: "safari")
+                        .frame(maxWidth: .infinity).padding(.vertical, 4)
+                }
+                .buttonStyle(PrimaryActionStyle())
+                Text("Configure the add-on in your browser, then copy the configured add-on link it gives you and paste it into Add an add-on to install your version.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center).frame(maxWidth: 460)
+                #endif
+            }
+            Button("Done") { dismiss() }
+                .buttonStyle(.bordered)
+                .tint(Theme.Palette.textPrimary)
+                .foregroundStyle(Theme.Palette.textPrimary)
+        }
+        .padding(Theme.Space.xl)
+        #if os(macOS)
+        .frame(width: 460)
+        .background(Theme.Palette.canvas)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #endif
+    }
+
+    #if os(tvOS)
+    private static func qrImage(_ string: String) -> CGImage? {
+        guard let data = string.data(using: .utf8),
+              let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(data, forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: 12, y: 12))
+        return CIContext().createCGImage(scaled, from: scaled.extent)
+    }
+    #endif
+}
+
+/// Which per-add-on sheet is open (Configure or Change-URL). One sheet binding avoids SwiftUI's
+/// multiple-`.sheet` conflict.
+private enum AddonSheet: Identifiable {
+    case configure(CoreDescriptor)
+    case editURL(CoreDescriptor)
+    var id: String {
+        switch self {
+        case .configure(let a): return "cfg-" + a.transportUrl
+        case .editURL(let a): return "url-" + a.transportUrl
+        }
+    }
+}
+
+/// Change an installed add-on's manifest URL in place, e.g. after reconfiguring it (a configurable add-on
+/// hands back a NEW URL with your options baked in). Installs the new URL FIRST, then removes the old, so
+/// a failed install never leaves you with neither add-on.
+private struct EditAddonURLView: View {
+    let addon: CoreDescriptor
+    @Environment(\.dismiss) private var dismiss
+    @State private var url: String
+    @State private var working = false
+    @State private var message: String?
+
+    init(addon: CoreDescriptor) {
+        self.addon = addon
+        _url = State(initialValue: addon.transportUrl)
+    }
+
+    var body: some View {
+        VStack(spacing: Theme.Space.lg) {
+            VStack(spacing: Theme.Space.xs) {
+                Text("Change add-on URL").font(.title2).fontWeight(.bold)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text(addon.manifest.name).font(.subheadline)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            Text("Replace this add-on's manifest URL, for example after reconfiguring it. The new URL is installed first, then the old one removed.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 520)
+            TextField("https://…/manifest.json", text: $url)
+                .font(.system(size: 16, design: .monospaced))
+                .disableAutocorrection(true)
+                .frame(maxWidth: 560)
+            if let message {
+                Text(message).font(Theme.Typography.label).foregroundStyle(Theme.Palette.danger)
+                    .multilineTextAlignment(.center)
+            }
+            HStack(spacing: Theme.Space.md) {
+                Button("Cancel") { dismiss() }
+                    .buttonStyle(.bordered)
+                    .tint(Theme.Palette.textPrimary)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Button(working ? "Updating…" : "Update") { update() }
+                    .buttonStyle(PrimaryActionStyle())
+                    .disabled(working || url.trimmingCharacters(in: .whitespaces).isEmpty || url == addon.transportUrl)
+            }
+        }
+        .padding(Theme.Space.xl)
+        #if os(macOS)
+        .frame(width: 520)
+        .background(Theme.Palette.canvas)
+        #else
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.Palette.canvas.ignoresSafeArea())
+        #endif
+    }
+
+    private func update() {
+        working = true
+        message = nil
+        let newURL = url.trimmingCharacters(in: .whitespaces)
+        Task { @MainActor in
+            if let error = await CoreBridge.shared.installAddon(urlString: newURL) {
+                message = error; working = false; return
+            }
+            // Change-URL is a REPLACE, not a removal: drop the old URL but do NOT tombstone it, so the
+            // same URL stays re-addable on every device (a removal tombstone would wrongly suppress it).
+            CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+            working = false
+            dismiss()
+        }
     }
 }

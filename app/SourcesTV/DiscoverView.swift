@@ -6,8 +6,16 @@ struct DiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
     @StateObject private var focusModel = FocusedItemModel()
-    private let columns = Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+    /// Cinematic landscape cards (TMDB key required) are wider, so fewer per row; portrait keeps 6-up.
+    private var columns: [GridItem] {
+        catalogPrefs.landscapeCards && apiKeys.hasTMDB
+            ? Array(repeating: GridItem(.fixed(kLandscapeCardWidth), spacing: Theme.Space.lg), count: 3)
+            : Array(repeating: GridItem(.fixed(kPosterWidth), spacing: Theme.Space.lg), count: 6)
+    }
 
     var body: some View {
         NavigationStack {
@@ -46,9 +54,12 @@ struct DiscoverView: View {
     }
 
     private func typeChips(_ types: [CoreSelectableType]) -> some View {
-        ScrollView(.horizontal, showsIndicators: false) {
+        // With Live TV turned off, hide its content types (tv / channel / events / ...) from the Discover
+        // type filter too, so a disabled Live surface leaves no orphan "Channel" pill (owner report).
+        let shown = hideLiveTab ? types.filter { !LiveTypes.contains($0.type) } : types
+        return ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: Theme.Space.sm) {
-                ForEach(types) { type in
+                ForEach(shown) { type in
                     Button { core.selectDiscover(type.request) } label: { Text(type.type.capitalized) }
                         .buttonStyle(ChipButtonStyle(selected: type.selected))
                 }
@@ -76,7 +87,7 @@ struct DiscoverView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: Theme.Space.sm) {
                     ForEach(genre.options) { option in
-                        Button { core.selectDiscover(option.request) } label: { Text(option.label).lineLimit(1) }
+                        Button { core.selectDiscover(option.request) } label: { Text(AddonTerms.localize(option.label)).lineLimit(1) }
                             .buttonStyle(ChipButtonStyle(selected: option.selected))
                     }
                 }

@@ -15,13 +15,29 @@ struct TrailerRequest: Identifiable, Equatable {
     let youTubeID: String?
     /// A non-YouTube `trailerStreams` url, if the meta carried a direct stream.
     let directURL: URL?
+    /// Release year (4 digits) + media type ("movie"/"series"): the key the `/clip` resolver matches a
+    /// trailer on (Apple iTunes preview, by title+year), since iTunes has no id we can pass. Defaulted so
+    /// callers that lack a year/type (e.g. a home board-row hero) still build a title-only /clip request.
+    var year: String? = nil
+    var mediaType: String = "movie"
 
-    /// Prefer a direct stream; else the embedded server's `/yt` redirect. Nil when neither a
-    /// direct URL nor a (proxiable) YouTube id is available.
+    /// The libmpv-playable URL: a direct (non-YouTube) trailer stream when the meta carried one, else the
+    /// public `trailer.vortx.tv/yt/{id}` resolver URL for a YouTube id. The resolver 302-redirects to a
+    /// playable MP4 (libmpv follows the redirect); it is FAIL-SOFT: a 404 / timeout / undeployed resolver
+    /// surfaces to the player as `endFileError`, and every consumer view falls back to the still backdrop on
+    /// that. A direct stream is always preferred over the resolver. This URL is only consumed on tvOS
+    /// (`TVInHeroTrailerView` via the detail `heroTrailerLayer` + `HomeHeroTrailerModel`), which has no web
+    /// view; iOS/Mac ignore this and play YouTube ids through the WKWebView IFrame (`YouTubeEmbedView`) using
+    /// `youTubeID` directly, reading `directURL` (not this) for their own libmpv path.
     var playableURL: URL? {
         if let directURL { return directURL }
-        guard let youTubeID, StremioServer.canProxy else { return nil }
-        return URL(string: "\(StremioServer.base)/yt/\(youTubeID)")
+        var c = URLComponents(string: "https://trailer.vortx.tv/clip")
+        c?.queryItems = [
+            URLQueryItem(name: "title", value: title),
+            URLQueryItem(name: "year", value: year),
+            URLQueryItem(name: "type", value: mediaType),
+        ].filter { ($0.value?.isEmpty == false) }
+        return c?.url
     }
 
     /// The public YouTube watch link, for surfaces that open trailers externally.
@@ -38,6 +54,11 @@ struct TrailerRequest: Identifiable, Equatable {
             .first
         let yt = meta.trailerYouTubeID
         guard direct != nil || yt != nil else { return nil }
-        return TrailerRequest(title: meta.name, youTubeID: yt, directURL: direct)
+        // 4-digit year from releaseInfo ("2024", "2024-2025", "2024-") so /clip can disambiguate the right
+        // film/series; nil if not parseable. type is movie/series.
+        let yr = (meta.releaseInfo?.prefix(4)).map(String.init)
+        let year = (yr?.count == 4 && yr?.allSatisfy(\.isNumber) == true) ? yr : nil
+        return TrailerRequest(title: meta.name, youTubeID: yt, directURL: direct,
+                              year: year, mediaType: meta.type)
     }
 }

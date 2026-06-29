@@ -2,6 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- Build-time edge-signing secret for the hardened VortX edge workers. Xcode substitutes
+	     $(VORTX_EDGE_SECRET) from the build setting (gitignored Config/VortXEdge.xcconfig, empty
+	     default), so the real 64-char hex value is NEVER in the tracked tree. VortXEdgeAuth.swift
+	     reads this at runtime via Bundle.main.object(forInfoDictionaryKey:). Empty = signing no-op
+	     (workers run in OBSERVE mode). The repo is public; do not hardcode a value here. -->
+	<key>VortXEdgeSecret</key>
+	<string>$(VORTX_EDGE_SECRET)</string>
 	<!-- Base Info.plist (Xcode merges its generated keys on top). Allow plain-http connections: the
 	     native client's URLSession reaches the embedded streaming server at http://127.0.0.1:11470
 	     (cleartext loopback) to create torrents, AND add-ons commonly serve POSTER images over plain

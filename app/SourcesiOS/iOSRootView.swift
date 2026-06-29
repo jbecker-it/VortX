@@ -69,6 +69,9 @@ struct iOSRootView: View {
     /// when a still-newer build ships.
     @ObservedObject private var updates = UpdateChecker.shared
     @AppStorage("stremiox.update.dismissedVersion") private var dismissedUpdateVersion = ""
+    /// Hide the Live TV tab for users who do not use it (Settings toggle). The Live screen is not mounted
+    /// and the tab is dropped from the bar; selection falls back to Home if it was on Live.
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @Environment(\.openURL) private var openURL
     /// Post-update highlights, shown once when the build increases (never on a fresh install). See WhatsNew.
     @State private var showWhatsNew = false
@@ -85,7 +88,7 @@ struct iOSRootView: View {
                 // Only the visible tab contributes its wordmark (#46 regression).
                 iOSHomeView(isActive: tab == .home).opacity(tab == .home ? 1 : 0)
                 iOSDiscoverView(isActive: tab == .discover).opacity(tab == .discover ? 1 : 0)
-                iOSLiveView().opacity(tab == .live ? 1 : 0)
+                if !hideLiveTab { iOSLiveView().opacity(tab == .live ? 1 : 0) }
                 iOSLibraryView(isActive: tab == .library).opacity(tab == .library ? 1 : 0)
                 iOSSearchView(isActive: tab == .search).opacity(tab == .search ? 1 : 0)
                 AddonsView().opacity(tab == .addons ? 1 : 0)
@@ -105,6 +108,9 @@ struct iOSRootView: View {
         // hourly re-check finds a still-newer one), so users learn about updates without opening Settings.
         .sheet(item: $updates.prompt) { release in
             UpdatePromptView(release: release) { updates.dismissPrompt() }
+        }
+        .onChange(of: hideLiveTab) { hidden in
+            if hidden, tab == .live { tab = .home }   // never leave the bar pointing at a hidden screen
         }
         .onAppear {
             WhatsNew.recordFreshInstallIfNeeded()
@@ -129,9 +135,14 @@ struct iOSRootView: View {
     /// Brand-styled bottom bar: seven equal items, each a small SF Symbol over a caption label. The
     /// selected item is tinted with the app accent; the rest read as tertiary text. A hairline +
     /// surface fill separates it from the content, and it respects the safe-area bottom inset.
+    /// Tabs shown in the bar; the Live tab is dropped when the user hides it in Settings.
+    private var visibleTabs: [Tab] {
+        hideLiveTab ? Tab.allCases.filter { $0 != .live } : Tab.allCases
+    }
+
     private var customTabBar: some View {
         HStack(spacing: 0) {
-            ForEach(Tab.allCases, id: \.rawValue) { item in
+            ForEach(visibleTabs, id: \.rawValue) { item in
                 tabButton(item)
             }
         }
@@ -256,7 +267,13 @@ struct iOSHomeView: View {
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
+    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
+    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails on Home (needs a TMDB key)
+    @StateObject private var groups = HomeGroupsModel()   // nested collections: grouped Streaming / Genres / Top New / New rails
+    @AppStorage("vortx.home.showCollectionGroups") private var showCollectionGroups = true   // toggle the whole nested-collection section (mostly TMDB-backed)
     @State private var path: [FeaturedHeroItem] = []
     /// A Continue-Watching card's direct resume launches the player straight from Home (#11).
     @State private var player: iOSPlayerLaunch?
@@ -290,8 +307,80 @@ struct iOSHomeView: View {
                      background: $0.background, description: $0.description, releaseInfo: $0.releaseInfo,
                      imdbRating: $0.imdbRating, genres: $0.genres)
         }
-        out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        if showCuratedRails {
+            out += curated.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        }
+        if showStreamingRails {
+            out += streaming.collections.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        }
+        if showCollectionGroups {
+            out += groups.groups.flatMap { $0.rails }.flatMap { $0.items }.map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
+        }
         return out
+    }
+
+    /// The Home rails as (title, item-ids) in display order, keyed by the SAME titles the cards focus on
+    /// (`MacBrowseFocus.card(rail:item:)`), so arrow nav can step within a row and between rows.
+    private var macRails: [(title: String, ids: [String])] {
+        var rails: [(String, [String])] = []
+        if !continueWatchingItems.isEmpty { rails.append(("Continue Watching", continueWatchingItems.map(\.id))) }
+        if !topPicks.items.isEmpty { rails.append(("Top Picks for you", topPicks.items.map(\.id))) }
+        for row in core.boardRows where !row.items.isEmpty { rails.append((row.title, row.items.map(\.id))) }
+        if showCuratedRails {
+            for c in curated.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
+        }
+        if showStreamingRails && !showCollectionGroups {
+            for c in streaming.collections where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
+        }
+        if showCollectionGroups {
+            for g in groups.groups {
+                for c in g.rails where !c.items.isEmpty { rails.append((c.title, c.items.map(\.id))) }
+            }
+        }
+        return rails
+    }
+
+    /// Translate an arrow key into a focus move across `macRails`: Left/Right within a row, Up/Down between
+    /// rows (keeping the column where possible). Seeds the first card when nothing is focused yet. This is
+    /// what makes arrows actually MOVE on macOS - `.focusable()` + `.focusSection()` join the Tab loop but
+    /// never bind arrows to focus movement the way tvOS does, so the ring used to show on a clicked card and
+    /// then sit there dead.
+    private func advanceMacFocus(_ direction: MoveCommandDirection) {
+        let rails = macRails
+        guard !rails.isEmpty else { return }
+        var r = 0, i = 0
+        if case let .card(railTitle, itemID) = macFocus,
+           let ri = rails.firstIndex(where: { $0.title == railTitle }),
+           let ii = rails[ri].ids.firstIndex(of: itemID) {
+            r = ri; i = ii
+        } else {
+            macFocus = .card(rail: rails[0].title, item: rails[0].ids[0]); return
+        }
+        switch direction {
+        case .left:  i = max(0, i - 1)
+        case .right: i = min(rails[r].ids.count - 1, i + 1)
+        case .up:    if r > 0 { r -= 1; i = min(i, rails[r].ids.count - 1) }
+        case .down:  if r < rails.count - 1 { r += 1; i = min(i, rails[r].ids.count - 1) }
+        @unknown default: break
+        }
+        macFocus = .card(rail: rails[r].title, item: rails[r].ids[i])
+    }
+
+    /// Changes whenever the Home rails gain/lose content, so focus-seeding can retry once rails hydrate.
+    private var macRailSeedKey: Int {
+        continueWatchingItems.count + topPicks.items.count + core.boardRows.count
+            + (showCuratedRails ? curated.collections.count : 0)
+            + (showStreamingRails ? streaming.collections.count : 0)
+            + (showCollectionGroups ? groups.groups.reduce(0) { $0 + $1.rails.count } : 0)
+    }
+
+    /// Seed keyboard focus onto the first card once the rails exist, so a card is the first responder and the
+    /// ScrollView's `.onMoveCommand` actually receives arrows. Without a seeded responder macOS has nothing
+    /// focused at launch and arrows do nothing (the "Mac arrow-key nav dead" report). Idempotent: seeds only
+    /// when nothing is focused yet, once rails have hydrated.
+    private func seedMacFocusIfNeeded() {
+        guard macFocus == nil, let first = macRails.first, let firstID = first.ids.first else { return }
+        macFocus = .card(rail: first.title, item: firstID)
     }
     #endif
 
@@ -346,6 +435,19 @@ struct iOSHomeView: View {
                                             },
                                             onTap: handleTap))
                     }
+                    // "Upcoming Episodes": the next-airing episode of each series in the library within the
+                    // next 45 days, soonest first (see ReleaseCalendarModel). Each card is the SERIES (so a
+                    // tap opens its detail page like any catalog card) with an "S2E5 · Jun 30" caption.
+                    // Hidden when there is nothing upcoming, so the default path renders nothing.
+                    if !releaseCalendar.upcoming.isEmpty {
+                        homeRail(PosterRail(title: "Upcoming Episodes",
+                                            items: releaseCalendar.upcoming.map {
+                                                RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
+                                                         poster: $0.video.thumbnail, progress: 0,
+                                                         caption: "\($0.episodeLabel) · \($0.airDateLabel)")
+                                            },
+                                            onTap: handleTap))
+                    }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
                             homeRail(PosterRail(title: row.title,
@@ -356,7 +458,9 @@ struct iOSHomeView: View {
                                                              releaseInfo: $0.releaseInfo, imdbRating: $0.imdbRating,
                                                              genres: $0.genres)
                                                 },
-                                                onTap: handleTap))
+                                                onTap: handleTap,
+                                                // #95: horizontal infinite scroll for THIS catalog row.
+                                                onReachEnd: { core.loadBoardRowNextPage(engineIndex: row.engineIndex) }))
                                 // Vertical infinite scroll: reaching the last populated catalog row loads the
                                 // next page of Home catalogs (no-op past the end / while one is in flight).
                                 .onAppear {
@@ -370,13 +474,47 @@ struct iOSHomeView: View {
                     // Cinemeta catalogs, rendered BELOW the add-on catalog rows. They give Home an
                     // opinionated shape even with no extra catalog add-ons installed, and each fails soft
                     // (an empty collection is dropped; an empty section renders nothing, no error state).
-                    ForEach(curated.collections) { collection in
-                        homeRail(PosterRail(title: collection.title,
-                                            items: collection.items.map {
-                                                RailItem(id: $0.id, type: $0.type, name: $0.name,
-                                                         poster: $0.poster, progress: 0)
-                                            },
-                                            onTap: handleTap))
+                    if showCuratedRails {
+                        ForEach(curated.collections) { collection in
+                            homeRail(PosterRail(title: collection.title,
+                                                items: collection.items.map {
+                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                             poster: $0.poster, progress: 0)
+                                                },
+                                                onTap: handleTap))
+                        }
+                    }
+                    // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service in the
+                    // viewer's region, from TMDB watch providers. Discovery only - cards play through the engine
+                    // like any other. Each rail fails soft / drops when empty; the whole section needs a TMDB key.
+                    // Suppressed when the nested-collection section is on, since its "Streaming" GROUP reproduces
+                    // these exact rails (group 1) — showing both would duplicate the rows and their focus keys.
+                    if showStreamingRails && !showCollectionGroups {
+                        ForEach(streaming.collections) { collection in
+                            homeRail(PosterRail(title: collection.title,
+                                                items: collection.items.map {
+                                                    RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                             poster: $0.poster, progress: 0)
+                                                },
+                                                onTap: handleTap))
+                        }
+                    }
+                    // Nested collections (grouped rails): a big group header per group (Streaming / Genres /
+                    // Top New / New) over its child rails, BELOW every flat rail above. Additive + empty-state
+                    // safe — a group with no rails is never built; the section is mostly TMDB-backed, so with no
+                    // key + no network it renders nothing and the Home is unchanged.
+                    if showCollectionGroups {
+                        ForEach(groups.groups) { group in
+                            iOSGroupHeader(eyebrow: group.eyebrow, title: group.title)
+                            ForEach(group.rails) { rail in
+                                homeRail(PosterRail(title: rail.title,
+                                                    items: rail.items.map {
+                                                        RailItem(id: $0.id, type: $0.type, name: $0.name,
+                                                                 poster: $0.poster, progress: 0)
+                                                    },
+                                                    onTap: handleTap))
+                            }
+                        }
                     }
                     // Use the profile-aware CW source so an overlay profile WITH history never reads as
                     // empty, and one with none still shows the empty state honestly.
@@ -390,6 +528,11 @@ struct iOSHomeView: View {
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
             #if os(macOS)
+            // Arrow keys MOVE the keyboard-browse selection. On plain SwiftUI/macOS, .focusable() +
+            // .focusSection() join the Tab loop but do NOT bind arrows to focus movement (unlike tvOS), so
+            // without this the accent ring shows on a clicked card but arrows do nothing (the "Mac arrow-key
+            // nav dead" report). advanceMacFocus walks the rails and sets macFocus.
+            .onMoveCommand { advanceMacFocus($0) }
             // Escape steps focus up a level: drop the focused card so the keyboard browse returns to a
             // neutral state (the bottom tab strip is its own focus space, reachable via Tab / arrows).
             .onExitCommand { macFocus = nil }
@@ -402,9 +545,17 @@ struct iOSHomeView: View {
                     hero.noteInteraction()
                 }
             }
+            // Seed focus onto the first card so a responder exists and arrows start moving: once on appear,
+            // and again when the rails first hydrate (boardRows / CW arrive async after onAppear).
+            .onAppear { seedMacFocusIfNeeded() }
+            .onChange(of: macRailSeedKey) { _ in seedMacFocusIfNeeded() }
             #endif
             .background(Theme.Palette.canvas.ignoresSafeArea())
             .stremioWordmarkTitle(String(localized: "Home"), isActive: isActive)
+            // iOS-only: a runtime insert/remove of this trailing toolbar item when sign-in flips also
+            // trips the shared-window NSToolbar on macOS (same crash class as the principal item). On
+            // macOS sign-in lives in Settings -> Account ("VortX account & sync").
+            #if os(iOS)
             .toolbar {
                 if !account.isSignedIn {
                     ToolbarItem(placement: .primaryAction) {
@@ -412,6 +563,7 @@ struct iOSHomeView: View {
                     }
                 }
             }
+            #endif
             .sheet(isPresented: $showSignIn) { iOSSignInView() }
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
@@ -429,17 +581,29 @@ struct iOSHomeView: View {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
+            refreshReleaseCalendar()
             // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
             // already loaded or in flight, and retries on the next appearance if the first fetch failed.
-            curated.load()
+            if showCuratedRails { curated.load() }
+            if showStreamingRails { streaming.load() }
+            if showCollectionGroups { groups.load() }
         }
-        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
+        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks(); refreshReleaseCalendar() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
+        // once they arrive (same input set as the notification sweep).
+        .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
+        // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
+        // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
+        .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
+        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
+        .onChange(of: showCollectionGroups) { show in if show { groups.load() } else { groups.clear() } }
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
-        // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
-        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
+        // tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
+        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshReleaseCalendar() }
         .onDisappear { hero.stop() }
     }
 
@@ -471,6 +635,17 @@ struct iOSHomeView: View {
         let cw = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         let library = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
+    }
+
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
+    /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
+    private func refreshReleaseCalendar() {
+        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
+        guard !series.isEmpty else { releaseCalendar.clear(); return }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
     }
 
     /// Continue-Watching one-tap direct resume (#11): play the exact last-played stream straight away
@@ -516,9 +691,14 @@ struct iOSLibraryView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
+    @EnvironmentObject private var account: StremioAccount  // progress-recording wiring for play-from-local (#30)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @State private var path: [FeaturedHeroItem] = []
+    #if !os(tvOS)
+    @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
+    @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
+    #endif
 
     /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
     /// own private watch overlay (every watched title), never the account.
@@ -527,6 +707,16 @@ struct iOSLibraryView: View {
         return source.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
         }
+    }
+
+    /// True when there is at least one offline download — keeps the empty-Library placeholder from
+    /// showing when a user has downloads but no saved titles. Always false on tvOS (downloads deferred).
+    private var hasDownloads: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !downloads.records.isEmpty
+        #endif
     }
 
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
@@ -539,6 +729,15 @@ struct iOSLibraryView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
+                #if !os(tvOS)
+                // Offline downloads (#30): a section at the top of Library, hidden when empty. Plays from
+                // the local file, with pause/resume/cancel/delete + total storage used.
+                if !downloads.records.isEmpty {
+                    DownloadsView(onPlay: { launch in downloadPlayer = launch })
+                        .padding(.horizontal, Theme.Space.md)
+                        .padding(.bottom, Theme.Space.lg)
+                }
+                #endif
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
                 // `selectable` so the filter chips are omitted. Both gate on the profile-aware
@@ -566,7 +765,9 @@ struct iOSLibraryView: View {
                     // Pin the column to the viewport width (same fix as Discover): the adaptive PosterGrid
                     // can report an over-wide ideal that the LazyVStack adopts, shifting the column left.
                     .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
+                } else if !hasDownloads {
+                    // Only show the "Library empty" placeholder when there are ALSO no downloads — a user
+                    // with downloads but no saved titles still sees their offline section above.
                     ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
                         message: "Titles you add to your library in Stremio show up here.")
                         .frame(minHeight: 420)
@@ -578,6 +779,9 @@ struct iOSLibraryView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            #if !os(tvOS)
+            .iOSPlayerCover($downloadPlayer, account: account, core: core)
+            #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
         }
         .onAppear {
@@ -607,10 +811,10 @@ struct iOSLibraryView: View {
         // soft-accent pill with accent ink, so on-chip text follows onAccent and stays legible on
         // light accents (#39) — the old solid-accent + hardcoded-white chip went invisible.
         chipScroll { ForEach(selectable.types) { t in
-            Button(t.label) { core.selectLibrary(t.request) }
+            Button(AddonTerms.localize(t.label)) { core.selectLibrary(t.request) }
                 .buttonStyle(ChipButtonStyle(selected: t.selected)) } }
         chipScroll { ForEach(selectable.sorts) { s in
-            Button(s.label) { core.selectLibrary(s.request) }
+            Button(AddonTerms.localize(s.label)) { core.selectLibrary(s.request) }
                 .buttonStyle(ChipButtonStyle(selected: s.selected)) } }
     }
 
@@ -621,6 +825,144 @@ struct iOSLibraryView: View {
         }
     }
 }
+
+#if !os(tvOS)
+/// The offline-downloads section shown at the top of the Library tab (#30). Lists every download with
+/// live progress, plays a completed one from its LOCAL file (so it works offline), and offers
+/// pause/resume/cancel/delete plus a total-storage footer. Device-local only; nothing here syncs or
+/// touches the account library.
+struct DownloadsView: View {
+    /// Hand a ready-to-play local-file launch up to the Library view, which presents the player cover.
+    let onPlay: (iOSPlayerLaunch) -> Void
+
+    @ObservedObject private var store = DownloadStore.shared
+    private let manager = DownloadManager.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack {
+                Text("Downloads")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Spacer(minLength: 0)
+                Text(store.formattedTotalSize())
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            ForEach(store.records) { record in
+                row(record)
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ record: DownloadRecord) -> some View {
+        HStack(alignment: .top, spacing: Theme.Space.md) {
+            leadingGlyph(record)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.displayTitle)
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(2)
+                subtitle(record)
+                if record.state == .downloading || record.state == .paused {
+                    ProgressView(value: record.fractionComplete)
+                        .tint(Theme.Palette.accent)
+                        .padding(.top, 2)
+                }
+            }
+            Spacer(minLength: 0)
+            controls(record)
+        }
+        .padding(Theme.Space.sm)
+        .background(Theme.Palette.surface1.opacity(0.6),
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { if record.state == .completed { play(record) } }
+    }
+
+    @ViewBuilder private func leadingGlyph(_ record: DownloadRecord) -> some View {
+        let symbol: String = {
+            switch record.state {
+            case .completed: return "play.circle.fill"
+            case .failed:    return "exclamationmark.triangle.fill"
+            case .paused:    return "pause.circle"
+            default:         return "arrow.down.circle"
+            }
+        }()
+        Image(systemName: symbol)
+            .font(.system(size: 26))
+            .foregroundStyle(record.state == .failed ? Theme.Palette.textTertiary : Theme.Palette.accent)
+    }
+
+    @ViewBuilder private func subtitle(_ record: DownloadRecord) -> some View {
+        let parts: [String] = {
+            switch record.state {
+            case .completed:
+                let size = ByteCountFormatter.string(fromByteCount: max(record.bytesDone, record.bytesTotal), countStyle: .file)
+                return [record.qualityText, size].compactMap { $0 }
+            case .downloading:
+                let pct = Int(record.fractionComplete * 100)
+                return ["Downloading \(pct)%"]
+            case .paused:
+                return ["Paused"]
+            case .failed:
+                return [record.errorText ?? "Failed"]
+            case .queued:
+                return ["Queued"]
+            }
+        }()
+        if !parts.isEmpty {
+            Text(parts.joined(separator: "  ·  "))
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder private func controls(_ record: DownloadRecord) -> some View {
+        HStack(spacing: Theme.Space.sm) {
+            switch record.state {
+            case .downloading:
+                iconButton("pause.fill", "Pause") { manager.pause(id: record.id) }
+            case .paused, .failed:
+                iconButton("arrow.clockwise", "Resume") { manager.resume(id: record.id) }
+            case .completed:
+                iconButton("play.fill", "Play") { play(record) }
+            case .queued:
+                EmptyView()
+            }
+            iconButton("trash", "Delete") { manager.cancel(id: record.id) }
+        }
+    }
+
+    private func iconButton(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
+    /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
+    /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
+    /// missing (purged out from under us) — drop the row.
+    private func play(_ record: DownloadRecord) {
+        guard record.state == .completed, store.fileExists(for: record) else {
+            if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
+            return
+        }
+        let url = store.fileURL(for: record)
+        let launch = iOSPlayerLaunch(url: url, title: record.displayTitle, headers: nil,
+                                     resume: 0, meta: record.playbackMeta,
+                                     qualityText: record.qualityText, isTorrent: false)
+        onPlay(launch)
+    }
+}
+#endif
 
 /// Search across every installed add-on, on the engine (debounced). Mirrors the tvOS `SearchView`:
 /// results are grouped into Movies / Series / Other rail sections (#16) rather than one flat grid, a
@@ -824,6 +1166,7 @@ struct iOSDiscoverView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false   // also hide Live types from the Discover type filter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @State private var path: [FeaturedHeroItem] = []
@@ -855,7 +1198,7 @@ struct iOSDiscoverView: View {
                         // own line with consistent spacing so a row's pills can never be drawn on top
                         // of the row above it (#7).
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                            chipScroll { ForEach(discover.selectable.types) { t in
+                            chipScroll { ForEach(hideLiveTab ? discover.selectable.types.filter { !LiveTypes.contains($0.type) } : discover.selectable.types) { t in
                                 Button(t.type.capitalized) { core.selectDiscover(t.request) }
                                     .buttonStyle(ChipButtonStyle(selected: t.selected)) } }
                             chipScroll { ForEach(discover.selectable.catalogs) { c in
@@ -864,7 +1207,7 @@ struct iOSDiscoverView: View {
                             if let genre = discover.selectable.extra.first(where: { $0.name.caseInsensitiveCompare("genre") == .orderedSame }),
                                !genre.options.isEmpty {
                                 chipScroll { ForEach(genre.options) { o in
-                                    Button(o.label) { core.selectDiscover(o.request) }
+                                    Button(AddonTerms.localize(o.label)) { core.selectDiscover(o.request) }
                                         .buttonStyle(ChipButtonStyle(selected: o.selected)) } }
                             }
                         }
@@ -956,6 +1299,9 @@ struct RailItem: Identifiable {
     /// direct resume can confirm the remembered link still matches the episode the engine
     /// is parked on (mirrors the tvOS `directResume` series guard). Nil for catalog/library cards.
     var cwVideoId: String? = nil
+    /// A small secondary caption shown UNDER the card title (e.g. "S2E5 · Jun 30" on the Upcoming
+    /// Episodes rail). Nil on every other rail, so their cards are byte-for-byte unchanged.
+    var caption: String? = nil
 }
 
 // MARK: - Poster context menu (#14, ported from tvOS PosterCard.menuItems)
@@ -1049,6 +1395,13 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
     }
     LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
+    // Re-prime the torrent engine before resuming: the stored loopback URL carries NO trackers, so without
+    // this the server opens a peerless DHT-only engine that never sends data (the "sources didn't load" red
+    // triangle on most CW torrent resumes). POST /{hash}/create with reachable trackers first; /create is
+    // idempotent, so an already-warm engine is untouched. Only loopback torrents (debrid/direct skip it).
+    if entry.torrent == true, let hash = url.pathComponents.dropFirst().first, hash.count == 40 {
+        StremioServer.primeTorrent(hash: hash.lowercased())
+    }
     let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
                             name: entry.name, poster: entry.poster,
                             season: entry.season, episode: entry.episode)
@@ -1060,6 +1413,15 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         resume = engine
     } else {
         resume = await account.resumeOffset(for: meta)
+    }
+    // For a MOVIE, kick off loading the title's streams in the background so a stale stored link (debrid URLs
+    // are time-limited and expire between sessions) can AUTO-HOP to a freshly-resolved source instead of
+    // dead-ending on the "sources didn't load" overlay (the debrid CW-resume failure). Non-blocking: the
+    // stored link still plays immediately; if it fails, the player's failover now has FRESH sources to pick.
+    // (Series loads its episode streams below; this gives movies the same hop-on-failure safety net.)
+    if entry.type == "movie",
+       core.metaDetails?.meta?.id != item.id || core.streamGroups(forStreamId: entry.videoId).isEmpty {
+        core.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
     }
     // For a series, give the player the season's episode list + a resolver so the CW resume has the same
     // in-player Next / Prev / episode-list as the detail page. The CW item's videos may not be resident,
@@ -1118,6 +1480,7 @@ private struct iOSOpenLinkView: View {
     @State private var status: String?
     @State private var resolveTask: Task<Void, Never>?   // in-flight magnet resolution; cancelled if the sheet closes
     @State private var fileChoices: [OpenLinkMagnet.TorrentFile]? = nil   // multi-file pack → show the picker
+    @State private var magnetLink: String? = nil                         // the magnet the open picker belongs to (#81)
     @State private var saved: [SavedLinksStore.Entry] = []               // saved magnets/links for this profile (#81)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
 
@@ -1217,6 +1580,18 @@ private struct iOSOpenLinkView: View {
     }
 
     private func playSaved(_ entry: SavedLinksStore.Entry) {
+        // #81: a magnet bound to an exact file replays THAT file directly, skipping re-resolution and the
+        // Cinemeta re-match (which could land on a different show / re-show the picker / play the biggest
+        // file). Direct/debrid links and not-yet-bound magnets fall through to the normal resolve path.
+        if entry.isMagnet, !PlaybackSettings.torrentsDisabled,
+           let infoHash = entry.infoHash, let fileIdx = entry.fileIdx,
+           let url = URL(string: "\(StremioServer.base)/\(infoHash)/\(fileIdx)") {
+            if let magnet = OpenLinkMagnet.parse(entry.link) {
+                OpenLinkMagnet.warmUp(magnet)   // re-create the torrent on the server so the file endpoint is ready
+            }
+            onPlay(iOSPlayerLaunch(url: url, title: entry.name, isTorrent: true))
+            return
+        }
         input = entry.link
         play()
     }
@@ -1237,7 +1612,7 @@ private struct iOSOpenLinkView: View {
                 status = "That magnet link has no usable info hash."
                 return
             }
-            playMagnet(magnet)
+            playMagnet(magnet, link: text)
             return
         }
         // Recognise a streaming-service link (0.3.9 Phase 1: Twitch resolves in-app to HLS; YouTube is
@@ -1288,7 +1663,7 @@ private struct iOSOpenLinkView: View {
         }
     }
 
-    private func playMagnet(_ magnet: OpenLinkMagnet.Magnet) {
+    private func playMagnet(_ magnet: OpenLinkMagnet.Magnet, link: String) {
         working = true
         status = "Fetching torrent info… this can take up to a minute"
         resolveTask = Task { @MainActor in
@@ -1305,8 +1680,13 @@ private struct iOSOpenLinkView: View {
                 let savedName = magnet.name ?? fileName
                 onPlay(iOSPlayerLaunch(url: url, title: savedName))
                 Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: savedName) }   // #81
+                // #81: if this magnet is in the user's Saved list, bind it to the exact file it just
+                // resolved to, so re-opening rebuilds the play URL directly instead of re-resolving.
+                SavedLinksStore.bindPlayedFile(magnetLink: link, playURL: url,
+                                               profileID: ProfileStore.shared.activeID)
             case .choose(let files):
                 status = nil
+                magnetLink = link     // remember which magnet this picker belongs to, for the exact-file bind
                 fileChoices = files   // a multi-file pack: show the picker, the user taps a file to play
             }
         }
@@ -1325,6 +1705,10 @@ private struct iOSOpenLinkView: View {
                 VStack(spacing: Theme.Space.sm) {
                     ForEach(files) { file in
                         Button {
+                            if let link = magnetLink {   // #81: bind the saved magnet to this chosen file
+                                SavedLinksStore.bindPlayedFile(magnetLink: link, playURL: file.url,
+                                                               profileID: ProfileStore.shared.activeID)
+                            }
                             onPlay(iOSPlayerLaunch(url: file.url, title: file.name))
                             Task { await PlayedLinkLibrary.savePlayedTorrent(displayName: file.name) }   // #81
                         } label: {
@@ -1446,6 +1830,26 @@ private enum OpenLinkMagnet {
         return .single(url: url, fileName: best.element.name ?? "Torrent")
     }
 
+    /// #81: re-create the torrent on the embedded server (fire-and-forget) so a saved magnet's already
+    /// bound file endpoint `/{infoHash}/{fileIdx}` is ready to serve. The engine ignores peerSearch on a
+    /// torrent it already has, so this is a no-op if it's still alive and a cheap re-arm if it was reaped.
+    static func warmUp(_ magnet: Magnet) {
+        guard !PlaybackSettings.torrentsDisabled,
+              let url = URL(string: "\(StremioServer.base)/\(magnet.infoHash)/create") else { return }
+        let sources = TorrentTrackers.sources(forHash: magnet.infoHash, streamSources: nil,
+                                              addonTrackers: magnet.trackers)
+        let payload: [String: Any] = [
+            "torrent": ["infoHash": magnet.infoHash],
+            "peerSearch": ["sources": sources, "min": 40, "max": 150],
+        ]
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = body
+        URLSession.shared.dataTask(with: request).resume()
+    }
+
     /// RFC 4648 base32 (the older magnet info-hash encoding) to lowercase hex.
     private static func base32ToHex(_ raw: String) -> String? {
         let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
@@ -1484,14 +1888,18 @@ private struct PosterGrid: View {
     /// The grid stays generic; the caller decides whether and what to load next. nil = no pagination.
     var onReachEnd: (() -> Void)? = nil
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
-    // Center the adaptive tracks so the cards distribute evenly across the available width instead of
-    // packing to the leading edge. Min track matches the 120pt card + a little breathing room.
-    private let columns = [GridItem(.adaptive(minimum: 116), spacing: Theme.Space.sm, alignment: .center)]
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+    // Center the adaptive tracks so the cards distribute evenly across the available width. Min track
+    // matches the card width: 168pt landscape pills (TMDB key required), else 116pt portrait.
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: catalogPrefs.landscapeCards && apiKeys.hasTMDB ? 168 : 116), spacing: Theme.Space.sm, alignment: .center)]
+    }
     var body: some View {
         LazyVGrid(columns: columns, alignment: .center, spacing: Theme.Space.md) {
             ForEach(items) { item in
                 Button { onTap(item) } label: {
-                    PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
+                    PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
                                   progress: item.progress, menu: menu)
                 }
                 .buttonStyle(.plain)
@@ -1510,6 +1918,36 @@ private struct PosterGrid: View {
     }
 }
 
+/// The BIG header for a nested collection GROUP (Streaming / Genres / Top New / New) on iOS / Mac: an
+/// optional accent eyebrow over a screen-title-weight name with a short accent rule beneath, so a group
+/// reads as a tier ABOVE its child rails (whose own headers use `PosterRail`'s `cardTitle`). Mirrors the
+/// tvOS `GroupHeader`. `@EnvironmentObject theme` so the fonts repaint live with the text-scale setting.
+struct iOSGroupHeader: View {
+    var eyebrow: String? = nil
+    let title: String
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if let eyebrow {
+                Text(eyebrow)
+                    .font(Theme.Typography.eyebrow).tracking(1.5).textCase(.uppercase)
+                    .foregroundStyle(Theme.Palette.accent)
+            }
+            Text(title)
+                .font(Theme.Typography.screenTitle).tracking(-1)
+                .foregroundStyle(Theme.Palette.textPrimary)
+            Rectangle()
+                .fill(Theme.Palette.accent)
+                .frame(width: 48, height: 3)
+                .clipShape(Capsule())
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, Theme.Space.md)
+        .padding(.top, Theme.Space.sm)
+    }
+}
+
 private struct PosterRail: View {
     let title: String
     let items: [RailItem]
@@ -1518,6 +1956,9 @@ private struct PosterRail: View {
     var menu: iOSPosterMenu = .none
     /// Opens a card's detail page (used by the Continue Watching menu's Details item, since a CW tap resumes).
     var onDetails: ((RailItem) -> Void)? = nil
+    /// Horizontal infinite scroll: fired when the LAST card appears, so a Home catalog row loads its next
+    /// page of items (#95). nil on rails that do not paginate (Continue Watching, editorial collections).
+    var onReachEnd: (() -> Void)? = nil
     #if os(macOS)
     /// macOS keyboard browse: when Home passes its `@FocusState` binding, the rail's cards become
     /// `.focusable()` and join the native focus traversal (arrows move within / between rails, Enter
@@ -1543,6 +1984,9 @@ private struct PosterRail: View {
                     LazyHStack(spacing: Theme.Space.sm) {
                         ForEach(items) { item in
                             railCard(item, proxy: proxy)
+                                // #95: horizontal infinite scroll. The last card pages the catalog (no-op
+                                // on rails without onReachEnd: Continue Watching, editorial collections).
+                                .onAppear { if item.id == items.last?.id { onReachEnd?() } }
                         }
                     }
                     .padding(.horizontal, Theme.Space.md)
@@ -1554,11 +1998,10 @@ private struct PosterRail: View {
                     if showArrows && pageIndex < items.count - 1 { railArrow(forward: true) { page(by: 1, proxy) } }
                 }
             }
-            #if os(macOS)
-            // Group the rail's cards so native directional focus resolves Left/Right WITHIN the row and
-            // Up/Down BETWEEN rows geometrically, only when this rail opts into keyboard focus (Home).
-            .modifier(MacRailFocusSection(enabled: macFocus != nil))
-            #endif
+            // NOTE: the per-rail `.focusSection()` (MacRailFocusSection) was removed - it grouped cards for
+            // NATIVE geometric arrow nav, which CONSUMED arrows before they could bubble to the ScrollView's
+            // `.onMoveCommand` (advanceMacFocus). With it gone, advanceMacFocus is the single arrow-movement
+            // authority and cards stay `.focusable()` only to show the ring. (Mac arrow-key nav; device-verify.)
         }
         .onHover { hovering = $0 }
     }
@@ -1568,7 +2011,7 @@ private struct PosterRail: View {
     /// into view, all additive modifiers so touch / VoiceOver / the existing tap + long-press are unchanged.
     @ViewBuilder private func railCard(_ item: RailItem, proxy: ScrollViewProxy) -> some View {
         let base = Button { onTap(item) } label: {
-            PosterCardiOS(id: item.id, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
+            PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
                           progress: item.progress, menu: menu,
                           onDetails: onDetails.map { od in { od(item) } })
         }
@@ -1694,13 +2137,108 @@ struct CachedPosterImage: View {
     }
 }
 
+/// iOS/Mac cinematic landscape (16:9) catalog art, the touch twin of tvOS `LandscapeArt`: a clean
+/// TEXTLESS TMDB backdrop resolved by id via `LandscapeBackdropCache`. With no TMDB backdrop (no key
+/// set, or none on TMDB) it does NOT crop a 2:3 poster into an ugly slab: it fills with a heavily
+/// blurred + darkened copy of the poster behind a fit copy, so the 16:9 frame always looks intentional.
+private struct LandscapeArtiOS: View {
+    let id: String
+    let type: String
+    let title: String
+    let poster: String?
+    @State private var image: PlatformPosterImage?
+    @State private var logo: PlatformPosterImage?
+    @State private var usedBackdrop = false
+    @State private var failed = false
+
+    var body: some View {
+        Group {
+            if let image {
+                if usedBackdrop {
+                    imageView(image).resizable().scaledToFill()
+                        .overlay { titleLayer }
+                } else {
+                    imageView(image).resizable().scaledToFill()
+                        .blur(radius: 18).opacity(0.55)
+                        .overlay(Color.black.opacity(0.35))
+                        .overlay(imageView(image).resizable().scaledToFit())
+                }
+            } else if failed {
+                Theme.Palette.surface1.overlay(
+                    Image(systemName: "film").font(.system(size: 24)).foregroundStyle(Theme.Palette.textTertiary))
+            } else {
+                Theme.Palette.surface1
+            }
+        }
+        .task(id: id) { await load() }
+    }
+
+    /// The title ON the backdrop: the clean TMDB clearlogo when one resolves, else styled text, over a
+    /// bottom scrim. GeometryReader so the logo scales to the (small) card.
+    @ViewBuilder private var titleLayer: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .bottomLeading) {
+                LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .center, endPoint: .bottom)
+                if let logo {
+                    imageView(logo).resizable().scaledToFit()
+                        .frame(maxWidth: geo.size.width * 0.62, maxHeight: geo.size.height * 0.44, alignment: .bottomLeading)
+                        .padding(8)
+                } else {
+                    Text(title)
+                        .font(.system(size: 13, weight: .bold)).lineLimit(2)
+                        .foregroundStyle(.white).shadow(color: .black.opacity(0.6), radius: 3, y: 1)
+                        .padding(8)
+                }
+            }
+        }
+    }
+
+    private func imageView(_ img: PlatformPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
+    }
+
+    private func load() async {
+        failed = false; logo = nil
+        let backdrop = await LandscapeBackdropCache.backdrop(id: id, type: type)
+        usedBackdrop = backdrop != nil
+        let raw = backdrop ?? PosterArtwork.poster(id: id, fallback: poster)
+        guard let raw, !raw.isEmpty, let u = URL(string: raw) else { failed = true; return }
+        guard let img = await fetchImage(u) else { if !Task.isCancelled { failed = true }; return }
+        image = img
+        // On a real backdrop, resolve the title clearlogo for the overlay (titleLayer falls back to text).
+        if usedBackdrop, let lg = await LandscapeBackdropCache.logo(id: id, type: type), let lu = URL(string: lg) {
+            logo = await fetchImage(lu)
+        }
+    }
+
+    private func fetchImage(_ u: URL) async -> PlatformPosterImage? {
+        if let cached = posterMemoryCacheiOS.object(forKey: u as NSURL) { return cached }
+        var req = URLRequest(url: u)
+        req.cachePolicy = .returnCacheDataElseLoad   // immutable art: prefer the shared disk cache
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            guard !Task.isCancelled, let img = PlatformPosterImage(data: data) else { return nil }
+            posterMemoryCacheiOS.setObject(img, forKey: u as NSURL)
+            return img
+        } catch { return nil }
+    }
+}
+
 private struct PosterCardiOS: View {
     let id: String
+    let type: String
     let name: String
     let poster: String?
     /// Backdrop to fall back to when an add-on item carries no `poster` (AIOMetadata sometimes omits it),
     /// so the tile shows the title's art cropped to the card instead of a blank surface. Nil = no fallback.
     var fallbackArt: String? = nil
+    /// A small secondary caption under the title (e.g. "S2E5 · Jun 30" on Upcoming Episodes). Nil hides it,
+    /// so every other rail's card is unchanged.
+    var caption: String? = nil
     /// IMDb rating to show as a small star badge on the poster, when the catalog item carries one. Nil hides it.
     var imdbRating: String? = nil
     let progress: Double
@@ -1708,7 +2246,16 @@ private struct PosterCardiOS: View {
     var menu: iOSPosterMenu = .none
     /// Per-card "open details" action, wired into the Continue Watching menu's Details item.
     var onDetails: (() -> Void)? = nil
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+
+    /// Cinematic 16:9 landscape pill vs legacy 2:3 portrait poster, per the Appearance setting. Gated on
+    /// a TMDB key so keyless users keep the clean portrait grid (no backdrop = degraded composite).
+    private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
+    private var cardW: CGFloat { landscape ? 168 : 120 }
+    private var cardH: CGFloat { landscape ? 95 : 180 }   // 168 * 9/16 ≈ 95
+
     var body: some View {
         card.modifier(PosterContextMenu(id: id, menu: menu, onDetails: onDetails))
     }
@@ -1717,17 +2264,22 @@ private struct PosterCardiOS: View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack(alignment: .bottom) {
                 // Cached, self-retrying loader (not raw AsyncImage, which cancels on cell recycle and never
-                // retries, the blank-poster cause). scaledToFill inside CachedPosterImage keeps the source
-                // proportions and CROPS to the card, so non-2:3 add-on posters fill cleanly (F37), and a
-                // missing poster falls back to the title's backdrop before a plain film placeholder.
-                CachedPosterImage(url: XRDB.imageURL(id: id, fallback: poster ?? fallbackArt))
-                    .frame(width: 120, height: 180)
+                // retries, the blank-poster cause). Landscape uses a clean TMDB backdrop (LandscapeArtiOS);
+                // portrait crops the poster to the card so non-2:3 add-on posters fill cleanly (F37).
+                Group {
+                    if landscape {
+                        LandscapeArtiOS(id: id, type: type, title: name, poster: poster ?? fallbackArt)
+                    } else {
+                        CachedPosterImage(url: PosterArtwork.poster(id: id, fallback: poster ?? fallbackArt))
+                    }
+                }
+                    .frame(width: cardW, height: cardH)
                     .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                     .overlay(alignment: .topTrailing) {
-                        // When the poster service is on, the rating is baked into the image, so skip the
-                        // native overlay to avoid a double badge.
-                        if let rating = imdbRating, !rating.isEmpty, !XRDB.isEnabled {
+                        // When a poster service bakes the rating into the image (VortX/XRDB or ERDB), skip
+                        // the native overlay to avoid a double badge.
+                        if let rating = imdbRating, !rating.isEmpty, !PosterArtwork.bakesRatings {
                             HStack(spacing: 2) {
                                 Image(systemName: "star.fill").font(.system(size: 8))
                                 Text(rating).font(.system(size: 10, weight: .semibold))
@@ -1748,18 +2300,25 @@ private struct PosterCardiOS: View {
                     .frame(height: 4)
                 }
             }
-            .frame(width: 120, height: 180)
+            .frame(width: cardW, height: cardH)
             Text(name)
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
-                .lineLimit(1).frame(width: 120, alignment: .leading)
+                .lineLimit(1).frame(width: cardW, alignment: .leading)
+            // Optional secondary caption (Upcoming Episodes: "S2E5 · Jun 30"); absent on every other rail.
+            if let caption {
+                Text(caption)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1).frame(width: cardW, alignment: .leading)
+            }
         }
         // One contiguous tap + long-press target over the whole card (poster, the 6pt gap, and title).
         // Without it the .buttonStyle(.plain) label hit-tests as the UNION of its subview shapes, so the
         // inter-child gap and rounded-corner regions are dead zones that fall through to the adjacent
-        // grid cell — the reported "tap a card in row 1, the row-2 item opens". Rectangle (not the
+        // grid cell, the reported "tap a card in row 1, the row-2 item opens". Rectangle (not the
         // poster's RoundedRectangle) so the title and gap are inside the target and corners aren't dead.
-        .frame(width: 120, alignment: .leading)
+        .frame(width: cardW, alignment: .leading)
         .contentShape(Rectangle())
     }
 }
@@ -1853,16 +2412,22 @@ extension View {
     func stremioWordmarkTitle(_ pageTitle: String, isActive: Bool = true) -> some View {
         navigationTitle(pageTitle)
             .navigationBarTitleDisplayModeInlineCompat()
+            // The brand wordmark in the navigation bar's PRINCIPAL slot is iOS-only. On macOS a
+            // `.principal` item is hoisted into the single shared window titlebar, and all seven tab
+            // screens stay mounted at once (opacity-switched to preserve state), so every browse screen
+            // would stamp its own wordmark into the one principal slot and NSToolbar crashes inserting a
+            // duplicate principal item (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, the Beta 7 Mac
+            // crash; the old `isActive` content-toggle did not stop the four ITEMS coexisting). Compile-
+            // gating the whole toolbar out on macOS removes the collision; the Mac keeps the native
+            // `navigationTitle(pageTitle)` in its titlebar. A compile-time gate (not a runtime branch)
+            // leaves the NavigationStack's structural identity unchanged, so there is no scroll/path reset.
+            #if os(iOS)
             .toolbar {
-                // Keep the toolbar item identity STABLE and toggle its CONTENT, rather than adding/removing
-                // the item when isActive flips. On macOS, inserting/removing a `.principal` item mid-update
-                // crashes NSToolbar (EXC_BREAKPOINT in _insertNewItemWithItemIdentifier, Bug 12).
                 ToolbarItem(placement: .principal) {
                     if isActive {
-                        // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (the mark follows
-                        // the theme accent). Sized down for the nav bar. VortXWordmark is already
-                        // fixedSize'd; the horizontal padding widens the measured bounds so macOS's
-                        // unified-titlebar capsule clears the lockup.
+                        // Brand lockup: serif "Vort" + the gold vortex mark as the "X" (follows the theme
+                        // accent). Sized down for the nav bar; the horizontal padding widens the measured
+                        // bounds so the chrome capsule clears the lockup.
                         VortXWordmark(fontSize: 26)
                             .padding(.horizontal, Theme.Space.xs)
                             .accessibilityAddTraits(.isHeader)
@@ -1870,9 +2435,7 @@ extension View {
                 }
             }
             // #4: a translucent (frosted) top bar, so the hero and content read as scrolling under a
-            // blurred chrome rather than a flat opaque strip. iOS-only — macOS hoists the principal
-            // wordmark into the unified window titlebar, which has no navigation-bar background to style.
-            #if os(iOS)
+            // blurred chrome rather than a flat opaque strip.
             .toolbarBackground(.ultraThinMaterial, for: .navigationBar)
             .toolbarBackground(.visible, for: .navigationBar)
             #endif

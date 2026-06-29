@@ -4,6 +4,185 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## Unreleased
+
+## 0.3.8 Beta 14 - 2026-06-29 (pre-release)
+
+The big one: the Apple TV crash/hang fix you asked for, offline downloads, our own skip database with an in-player editor, community scrub-preview thumbnails, grouped Home collections, a configurable streaming cache, and a wave of sync and add-on improvements. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV stability on real hardware.
+
+### Fixed
+
+- **Apple TV no longer hangs the whole device after finishing or stopping a title and opening another.** This is the main crash, and it hit debrid (and direct-link) playback, not just torrents. When you left a title, the player kept its full video buffer and decoder alive until the system happened to clean it up later, so the moment you opened the next title there were briefly two players running, which pushed a 2 GB Apple TV past its memory limit and the system killed the whole app (menu bar frozen, Back drops to Home, server shown offline on reopen). The player now shuts down immediately when you leave a title, before the next one starts, so the two never overlap. The 2 GB Apple TV also keeps a smaller rewind buffer for extra headroom.
+- **Apple TV no longer hangs the whole device after watching a torrent.** A separate path: the streaming server keeps a memory cap that protects the Apple TV from running out of memory, but it was only set once at startup, with no confirmation it actually took. On a slow start it could silently miss, and the server then ran with a 2 GB cache that pushes the app past the Apple TV's memory limit. The cap is now confirmed and retried until it sticks, and re-applied right before each torrent starts.
+- **A finished movie leaves Continue Watching on every profile.** A movie watched to the end could stay pinned in Continue Watching, most often on a second profile. It clears now.
+- **Smoother second profile.** Watch progress was nudging the cross-device sync on every tick while you watched; it now waits until you pause or stop, which keeps a second profile from feeling laggy.
+- **Apple TV: a movie's page opens on Watch Now again, not the Trailer button.** When you opened a movie while its sources were still loading, the focus landed on the Trailer chip instead of Watch Now. The page now seats focus on Watch Now from the moment it appears and keeps it there as the sources settle.
+- **The player's top-right now shows the episode title, not just the season and episode number.**
+- **Mac: arrow keys move focus on Home again.**
+
+### Added
+
+- **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It uses the same air-date data the new-episode reminders already gather, routes to the show when you open a card, and simply does not appear when nothing is upcoming.
+- **Offline downloads.** Download movies and episodes to your iPhone, iPad, or Mac and play them with no connection, from debrid, direct links, or torrents. Downloads live in their own section with progress, pause and resume, and storage management.
+- **Self-hosted skip database with an in-player editor.** Skip-intro, recap, and credits times are now fetched first from VortX's own database, then the open community sources. You can mark and submit segments yourself from a built-in player editor, and a submission goes to VortX and the open SkipDB at the same time. You can also add an API key for any other compatible provider to contribute there too.
+- **Community scrub-preview thumbnails.** Seek-preview thumbnails are now shared across devices: once anyone has generated a title's previews, everyone else sees them instantly with no local work. It always falls back to your device's own capture, so there is never a regression.
+- **Play straight from a cached debrid link.** If a source is already cached on your debrid account (Real-Debrid, AllDebrid, Premiumize, or TorBox), VortX now plays it directly from the cached link instead of starting the torrent, and cached sources show a "cached" chip and rank higher in the list. Without a debrid key nothing changes.
+- **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It routes to the show when you open a card, and simply does not appear when nothing is upcoming.
+- **Grouped Home collections.** Home rails are now grouped (streaming services, genres, top new, and just new) for a cleaner browse, with a browse-by-streaming-service view.
+- **Configurable streaming cache.** A new Settings option lets you set an on-disk streaming cache size (default off), so seeking back in a long title stays instant.
+- **Add-on improvements.** Removing an add-on on one device now removes it everywhere, like settings sync. Add-ons also gained a Configure button, a change-URL option, drag-to-reorder on iPhone, iPad, and Mac, and better compatibility with manager add-ons (logo, order, and update-on-reinstall).
+- **Logos on more art.** fanart.tv clearlogos now show across Apple TV, iPhone, and Mac.
+
+### In progress
+
+- **Trailers and hero clips** play where they resolve today; broader coverage is still rolling out.
+- **Jellyfin media-server support** is groundwork only and not usable yet.
+
+## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
+
+The big bug-fix wave, plus the cinematic catalog rebuilt the right way. Trailers play again, Home rows keep loading, the catalog goes wide and cinematic, and a batch of Apple TV audio and HDR fixes are in that I need your help testing on real hardware. In-place update, nothing resets. This is a beta, so please install it and report anything off, especially the Apple TV sound and HDR notes at the bottom.
+
+### Fixed
+
+- **Trailers play again, on Apple TV, iPhone, iPad, and Mac.** The in-app trailer resolver used a YouTube path that YouTube quietly shut off, so trailers silently failed. It now uses a current path that returns the actual video and plays it inline in the app's own player. The same fix makes trailer add-ons (like Streailer) playable, and a trailer can never be picked as the movie's source by mistake.
+- **Home catalog rows keep loading.** A catalog row on Home (for example MyTraktSync) stopped after about 20 titles instead of scrolling on. It now loads more as you reach the end of the row, the same as the Discover grid already does (#95).
+- **The Live TV filter is gone when Live TV is off.** Turning Live TV off left a stray "Channel" type filter on the Discover screen. With Live TV off, its content types no longer appear there.
+
+### Added
+
+- **Cinematic landscape catalog cards.** Catalog rows and the Discover and Library grids now show wide 16:9 cards built from clean, textless TMDB artwork, across Apple TV, iPhone, iPad, and Mac. It is on by default, with a switch in Settings, Appearance, "Cinematic catalog cards," to return to the classic portrait posters any time. It uses your TMDB key (set one under API keys); without a key the catalog stays on portrait posters so it never falls back to a worse-looking card. When a title has no TMDB backdrop, the card fills with a softly blurred copy of the poster behind a fit copy, so the frame still looks intentional.
+
+### Please test on your Apple TV (fixes I cannot verify without the hardware)
+
+- **No sound under Dolby Atmos.** If you set the Apple TV audio to Dolby Atmos or Best Available and a title was silent, this build has the fix. Please test it, and if it is still silent, send me the Console log line that starts with `[#78 audio]`.
+- **HDR10 plus Dolby Vision.** A file that carries both should now play Dolby Vision, not just HDR10. Please confirm the Dolby Vision badge shows on your TV.
+- **AirPods Spatial Audio.** Head-tracked Spatial Audio with AirPods should work in the player now. Please confirm.
+
+## 0.3.8 Beta 12 - 2026-06-28 (pre-release)
+
+The Beta 11 follow-up. A focused pass on the bugs you reported: trailers that actually play, Continue Watching that behaves, a Home you can tidy up, sharper resolution labels, and working keyboard navigation on the Mac. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+
+### Fixed
+
+- **Trailers play the real trailer again, on iPhone, iPad, and Mac.** The Trailer button was loading a fragile path that often failed and then fell through to playing the actual movie. It now plays the official YouTube trailer inside the app the way the rest of the ecosystem does, and it finds a trailer for many more titles (it also looks them up on TMDB now). Apple TV is unchanged.
+- **Finished titles leave Continue Watching.** A movie or episode watched to the end and then closed by hand used to stay in the row at its end position. It clears now, the same as when it plays out on its own.
+- **Resuming from Continue Watching works far more often.** A title resumed straight from the Continue Watching row often showed "sources didn't load" and made you reopen it and pick a source again, most often with debrid, whose links expire between sessions. The resume now loads fresh sources in the background and, if the saved link has expired, switches to a working one on its own.
+- **The resolution label is right on widescreen 4K.** A cinematic 4K film (a wide 2.40:1 frame) was labeled 1440p because the label read the picture height. It reads the width now, so 4K shows as 4K.
+- **A tiny file can no longer pose as 4K.** A small stream that merely carries "2160p" or "4K" in its title is no longer trusted as real 4K, so it stops topping the source list and showing a 4K badge it cannot back up.
+- **Mac: arrow keys move the selection on Home.** The keyboard highlight used to appear on a clicked card and then sit there; the arrow keys now move it across a row and between rows.
+
+### Added
+
+- **Hide the built-in Home rows.** The editorial rows (Critically Acclaimed, Hidden Gems, Modern Classics, Award Winners) are built in and used to show no matter what. A new switch in Settings, Appearance, "Show editorial Home rows," turns them off.
+- **SkipDB for skip timestamps.** A new open skip-segment source you can pick in Settings, Playback, "Skip timestamps source," alongside the existing one. Thanks to OrigamiSpace for contributing this (#98).
+
+## 0.3.8 Beta 11 - 2026-06-25 (pre-release)
+
+The Beta 10 fixes release. It works through the reports that came back from Beta 10. In-place update, nothing resets.
+
+### Fixed
+
+- **The catalog goes back to poster cards.** The wide landscape cards from Beta 10 showed cropped and sometimes wrong art, so the catalogs return to the reliable poster grid while a proper cinematic treatment is built on a dependable art source.
+- **The ERDB and fanart toggles stay off.** Turning them off used to flip back on within a second, because an incoming sync could overwrite a setting you just changed. Your toggle sticks now.
+- **Title logos are back on the hero and detail pages.** They had dropped to plain text; with the toggles fixed, the add-on logos return.
+- **Duplicate and reappearing profiles are cleaned up.** A second copy that a delete could not clear is removed and stays removed, and a deleted profile no longer comes back from a sync. Your main account profile stays non-deletable by design; you can rename it instead.
+- **Settings sync no longer fights you.** The cause behind the toggles and the profiles was a sync change that could re-apply your account's old values over a change you just made; the guard that protects an in-flight edit is restored.
+- **The Settings screen is fully translated** across all supported languages.
+
+### Note
+
+- **Dolby Vision plays through the built-in player on Apple TV,** confirmed on device, so you do not need anything else for true Dolby Vision.
+
+## 0.3.8 Beta 10 - 2026-06-25 (pre-release)
+
+The Beta 9 cleanup release. Beta 9 landed the account and playback wave, and this release works through the report that came back from it. The headline is a cinematic redesign of the catalogs into wide landscape cards on every platform, plus trailers that now play inside the app on iPhone, iPad, and Mac, settings that sync across your devices again, and a batch of Apple TV navigation and focus fixes. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+
+### Changed
+
+- **Landscape catalog cards everywhere.** The catalog rows changed from tall portrait posters to wide, cinematic landscape cards on Apple TV, iPhone, iPad, and Mac. Each card shows the title backdrop, and titles that ship only a poster fall back to a clean blurred composite so the row always looks intentional.
+
+### Fixed
+
+- **Settings sync across your devices again.** Toggling a setting such as the Stremio mirror or the player engine on one device now reaches your other devices. A device was echoing every applied change straight back, which starved its own sync so a peer's settings never took; that loop is closed, and a strictly newer change always wins.
+- **Trailers play inside the app on iPhone, iPad, and Mac.** The detail Trailer button no longer flashes an error and jumps out to the YouTube app; it plays the trailer in the built-in player. The home hero now autoplays a muted clip for the featured title after a short settle, the same as Apple TV. (#44)
+- **Apple TV: Back returns to Home before it exits.** Pressing Menu on a non-Home tab used to drop you out to the tvOS home screen. It now returns to the VortX Home tab first, and only exits from Home. Pushed pages still step back one level at a time.
+- **Apple TV: the Log Out button is reachable.** Moving down through the account settings no longer skips past Log Out.
+- **Apple TV: the poster and ratings settings labels are readable.** Those toggles drew their label in the accent color over an accent fill, so the text vanished when unfocused. They are normal switches with a readable label now.
+- **Apple TV: the Discover add-ons list takes focus and looks right.** Pressing down from the search field now moves into the results instead of getting stuck, and the focused row uses the app's own highlight rather than a plain white block.
+- **Apple TV: the built-in player steps in faster.** When AVPlayer accepts a stream but never starts (some Dolby Vision debrid streams), it now hands off to the built-in player within a few seconds instead of stalling for about half a minute.
+- **iPhone: a few screens stopped clipping.** What's New no longer cuts off at the top and bottom, debrid and source names read on one line instead of stacking a couple of letters per line, and the Discover add-ons screen no longer runs off both edges.
+- **Catalog row names translate.** Compound names such as "Popular Movies" and "Top Series" now localize using the existing per-word vocabulary, so far fewer rows read as English in other languages.
+
+### Added
+
+- **ERDB posters with no token.** The optional VortX poster, backdrop, and logo art is now a simple on or off toggle. Our service is keyless, so you no longer need to paste a token; a token is only for a self-hosted setup. It stays opt-in.
+- **Use fanart posters.** With ERDB on, a new toggle pulls posters from fanart.tv instead of the default source. It uses your own fanart key from the metadata key settings if you have set one, otherwise our service key.
+- **The Show Live TV tab control is easier to find.** It now sits near the top of Appearance on iPhone, iPad, and Mac, and reads "Show Live TV tab" on Apple TV.
+
+### What we're working on now
+
+- Localizing the Settings labels across every language (the catalog names are done; the settings strings are next).
+- Household sharing of add-ons and library across separate accounts, and finishing the two-way real-time sync.
+- The precise Dolby Atmos fix that needs an on-device log capture.
+
+## 0.3.8 Beta 9 - 2026-06-25 (pre-release)
+
+The account and playback release. Two big steps land here. First, your VortX account now genuinely owns your add-ons, library, and sources, so the app loads them straight from your account and no longer goes empty or traps you when your Stremio session is logged out or slow. Second, Apple TV gets a first-class AVPlayer with the full player chrome, so true Dolby Vision, AirPlay, and Picture-in-Picture play through it on Auto, with the built-in player as a true fallback. Plus trailers play again on iPhone, iPad, and Mac, an Apple TV in-hero trailer on the detail page, posters now served by our own art service, and a batch of fixes. In-place update, nothing resets. This is a beta, so please install it and report anything off.
+
+### Added
+
+- **Your account owns your add-ons, library, and sources.** The app now hydrates them from your VortX account into the engine, so a logged-out or degraded Stremio session no longer shows zero sources and add-ons, and it no longer blocks you from logging out. Your full add-on list is held in your encrypted account, and the first time you import from Stremio it takes a snapshot. New per-category "Mirror from Stremio" toggles let you choose whether your add-ons, library, and Continue Watching stay in step with Stremio; they default off, so VortX keeps its own copy.
+- **A first-class player on Apple TV.** The same player that runs on the other platforms now runs on Apple TV under the full player chrome. On Auto, Dolby Vision and HLS play through it with AirPlay, Picture-in-Picture, and true Dolby Vision, and the built-in player steps in only as a last resort. The old bare Apple TV playback path is gone.
+- **A trailer on the Apple TV detail page.** The detail page now plays a muted trailer in the hero, so you get a moving preview while you decide. (#44)
+- **Posters from our own art service.** The optional poster, backdrop, and logo art now comes from VortX's own service at erdb.vortx.tv instead of a third party. It stays opt-in and you set it up the same way.
+- **A fanart.tv key.** You can add a fanart.tv API key in Settings for richer artwork; it syncs across your devices alongside your TMDB and MDBList keys.
+
+### Fixed
+
+- **Trailers play again on iPhone, iPad, and Mac.** YouTube began requiring a real referrer in July 2025, which silently broke embedded trailers. VortX now serves the embed so a proper referrer reaches YouTube, and trailers play again. Apple TV was never affected.
+- **Your synced TMDB key no longer disappears.** Signing in on another device could blank out the TMDB key you had saved. Synced keys are now merged in rather than overwritten, so the key sticks.
+- **Profile deletes stick across devices.** Deleting a profile could see it reappear after a sync from another device. Deletes are now durable tombstones that survive the merge, so a deleted profile stays gone. Your main account profile is never removed.
+- **A saved magnet reopens the right file.** A saved magnet or playlist now reopens the exact file you saved, instead of fuzzy-matching and landing on the wrong show. (#81)
+- **Apple TV stays audible under Dolby Atmos, and never freezes.** Multichannel audio is now driven by what your output device reports, with a safety net so the video never freezes if an audio route cannot open. A diagnostic log is in place to pin down the precise Atmos fix from an on-device capture. (#78)
+- **Discover keeps paginating past a tricky catalog.** A catalog whose cursor went empty partway through a list (for example MyTraktSync) could stop loading more in Discover; it now keeps paginating. (#95)
+
+### What we're working on now
+
+- The remaining Apple TV audio work: a precise fix for Dolby Atmos that needs an on-device log capture.
+- Carrying the account-owns-everything work the rest of the way, so the library is complete on the account and the same model reaches the dashboard, Android, and desktop.
+- A home-screen hero trailer on Apple TV, and per-rail "load more" on the home screen.
+- More of the in-app player and discovery experience landing on the web and desktop apps.
+
+## 0.3.8 Beta 8 - 2026-06-25 (pre-release)
+
+The Beta 7 cleanup release. Beta 7 shipped a big playback and discovery wave, and with it a batch of bugs. This release fixes them: the Mac crash, Apple TV playback, the add-on store, the duplicate "Main" profile, the language setting, the invisible buttons, and the trailer. It also makes the seek-bar styles actually come alive and brings the player-engine choice to Apple TV and Mac. In-place update, nothing resets.
+
+### Fixed
+
+- **Mac no longer crashes.** The Mac app could quit the instant you switched tabs, resized the window, or changed the language. Several browse screens were each trying to place the VortX wordmark into the single shared window title bar at once. The wordmark is now iPhone and iPad only; the Mac keeps its native title and the crash is gone. This also unsticks Mac language changes and keyboard navigation, which the crash had been swallowing.
+- **Apple TV plays again.** Some streams opened to a black screen with no way out. When the native AVPlayer cannot open a stream, VortX now hands it straight to the built-in player instead of dead-ending, so playback always starts. You can also force the built-in player from Settings (see Added).
+- **The duplicate "Main" profile is gone.** Signing in or reinstalling could leave a second "Main" profile behind, and it kept coming back. The account owner now has one fixed identity across every device and install, so it can never be duplicated again, and any existing duplicate is cleaned up automatically on launch. Your real profiles and your synced data are untouched; this was a profile-identity bug in the app.
+- **The add-on store scrolls on Apple TV.** The Discover add-ons list could get stuck at the top because the already-installed rows that head the list were not focusable. Every row is reachable now, so the list scrolls all the way down.
+- **Add-on names read normally on iPhone.** In the add-on store, long names like "Torrentio" could stack one letter per line. Names now stay on a single line beside their type tags and the Install button.
+- **The language setting works, and you can find it.** Picking a language such as Hindi appeared to do nothing, because the app must relaunch to switch language and never offered to. It now offers to quit and reopen so the change actually applies, the picker sits near the top of Settings on iPhone, iPad, and Mac, and Apple TV finally has a language picker too, under Appearance.
+- **Invisible buttons are visible again.** The "Install all add-ons" button and the update prompt's "Get the update" button showed white text on the gold accent, so the labels vanished. They now use the correct on-accent color.
+- **Trailers play.** The in-hero and detail trailer errored within half a second and fell back to the still image for almost every title. It now ignores the transient errors that fire under the hood and only falls back when a video genuinely cannot be embedded.
+
+### Added
+
+- **A player-engine choice on Apple TV and Mac.** Settings, Playback now lets you choose how streams play: Auto, Always built-in, or Prefer AVPlayer for HLS and Dolby Vision. If a stream will not start in one engine, switch to Always built-in. iPhone and iPad already had this; now every platform does.
+- **Seek-bar styles that actually move.** The fourteen seek-bar styles were nearly identical and sat still. They are genuinely distinct and animated now: the Wave flows, the Equalizer bounces, the Comet trails a glow, the Heartbeat sweeps like a monitor, Liquid sloshes, Ripple rings out from the playhead, and more. Pick yours in Settings, Playback, Seek bar style; each preview animates the real design.
+
+### Dashboard (vortx.tv/dashboard)
+
+- **One "Main" on the dashboard too.** The dashboard now collapses any leftover duplicate owner profile on sight, so your account shows a single "Main" while your devices update to the fixed app.
+
+### What we're working on now
+
+- True Dolby Vision and the full player chrome reaching more places, and the remaining Apple TV audio work.
+- Bringing your add-ons, library, and sources fully into your VortX account so the app works from your account alone, independent of a live Stremio session.
+- More of the in-app player and discovery experience landing on the web and desktop apps.
+
 ## 0.3.8 Beta 7 - 2026-06-21 (pre-release)
 
 The playback and discovery release. The headline: the "Prefer AVPlayer (HLS/DV)" engine, with its true Dolby Vision and clean adaptive HLS, now reaches Apple TV and Mac, and on Apple TV it brings in-player Episodes and Sources panels so you can change what you are watching without leaving the player. There is also a new in-app add-on store, source pinning, a plain-language reason for every auto-picked source, and ratings baked onto your posters with no key to set up. In-place update, nothing resets. This is a beta, so please install it and report anything off.

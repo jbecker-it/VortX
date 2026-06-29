@@ -51,6 +51,14 @@ final class MPVMetalViewController: PlatformViewController {
     var playUrlLive = false
     var onSingleTap: (() -> Void)?
     var hdrAvailable : Bool = false
+    /// Hero-preview only (#44): start muted with no audio output and loop the file forever. Set BEFORE
+    /// viewDidLoad / setupMpv so the options apply at init time. The in-hero trailer layer (tvOS
+    /// `TVInHeroTrailerView`) uses this for an ambient, soundless background clip; the main player never
+    /// sets it, so its audio + transport behaviour is unchanged. When muted, the route-aware audio-session
+    /// machinery is skipped entirely so this lightweight preview instance never claims `.playback` or
+    /// disturbs the main player's audio session.
+    var startMuted = false
+    var loopPlayback = false
     private let mpvLog = Logger(subsystem: "com.stremiox.app", category: "mpv")
     private var configuredLiveMode = false
     /// The dynamic range currently applied to the output chain (mpv transfer curve, Metal layer
@@ -252,16 +260,24 @@ final class MPVMetalViewController: PlatformViewController {
             try session.setActive(true)
             // Read the route FIRST: the multichannel decision below depends on it.
             outputPortType = session.currentRoute.outputs.first?.portType
+            // #78 DIAGNOSTIC: the reporter's Apple TV is silent under Dolby Atmos but plays fine under Dolby
+            // Digital 5.1, and there is no Atmos hardware here to reproduce against. Log the route's port
+            // type, intrinsic max channels, and rate in BOTH states so the discriminator (what the session
+            // reports differently under Atmos vs working 5.1) is visible in the device log. Read the
+            // intrinsic max BEFORE opting into multichannel content, so it reflects the route itself.
+            let intrinsicMaxChannels = session.maximumOutputNumberOfChannels
+            NSLog("[#78 audio] route=\(outputPortType?.rawValue ?? "nil") maxOutChannels=\(intrinsicMaxChannels) sampleRate=\(session.sampleRate)")
             // #88 / #78: advertise multichannel content ONLY on routes that can actually OPEN a multichannel
-            // layout — AirPods (system head-tracked Spatial Audio) and real receivers over HDMI/eARC. On the
-            // TV's built-in speakers / AirPlay with the system audio format set to Atmos / Best-Available,
-            // advertising multichannel makes the session present a spatial format that mpv's audiounit AO
-            // CANNOT open, so it falls back to the null AO and the movie is SILENT — even when the viewer
-            // picks Stereo, because the AO never opens before the channel choice matters (#78 reporter,
-            // Beta 5 still silent). Keeping those routes on a plain stereo session lets the AO open and play.
-            // Set before reading the channel count so `maximumOutputNumberOfChannels` reflects the decision.
+            // layout. AirPods take a system head-tracked Spatial Audio layout. For wired/receiver routes we
+            // now drive this off the route's OWN reported capability (intrinsic max > 2) instead of trusting
+            // the port type alone: an Apple TV outputs over HDMI and reports `.HDMI` even when its system
+            // audio format is plain stereo or an Atmos layout the audiounit AO cannot open, which advertised
+            // multichannel and left the movie SILENT (#78). A route reporting only 2 intrinsic channels now
+            // stays stereo so the AO opens. Forced stereo routes (TV built-in speakers / AirPlay) stay stereo
+            // exactly as before, preserving the working path.
+            let routeIsMultichannelCapable = !routeIsStereoOnly && (routeIsAirPods || intrinsicMaxChannels > 2)
             if #available(iOS 15.0, tvOS 15.0, *) {
-                try? session.setSupportsMultichannelContent(!routeIsStereoOnly)
+                try? session.setSupportsMultichannelContent(routeIsMultichannelCapable)
             }
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
@@ -291,12 +307,21 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func setupMpv() {
-        configureAudioSession()
+        // The in-hero trailer preview (#44) is silent, so it must NOT claim the `.playback` audio
+        // session: doing so would interrupt other audio and fight the main player's session. Only the
+        // real player configures the route-aware audio policy.
+        if !startMuted { configureAudioSession() }
         mpv = mpv_create()
         if mpv == nil {
             print("failed creating context\n")
             exit(1)
         }
+
+        // Hero-preview options (#44), set before mpv_initialize so they take at init time. `mute=yes`
+        // gives a soundless ambient clip (no audio output is ever opened); `loop-file=inf` makes mpv
+        // re-play the trailer forever with no app-side EOF handling. The main player sets neither.
+        if startMuted { checkError(mpv_set_option_string(mpv, "mute", "yes")) }
+        if loopPlayback { checkError(mpv_set_option_string(mpv, "loop-file", "inf")) }
 
         // Do NOT apply mpv's "fast" profile by default. It overrides gpu-next/libplacebo's sharp default
         // upscaler (lanczos) with bilinear and disables debanding/dither, which made upscaled video look
@@ -387,6 +412,22 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
+        // Configurable ON-DISK streaming/seek cache (Settings → "Streaming cache"). When enabled, the
+        // big forward buffer is backed by a Caches subdirectory instead of RAM, so a viewer can pick a
+        // large cache (seek minutes ahead with no re-buffer, pre-cache) WITHOUT spending the jetsam-bound
+        // in-process RAM budget. The actual byte budget is the clamped `demuxer-max-bytes` applied per
+        // file in loadFile (DiskCacheSetting.resolvedMaxBytes — always bounded by free disk, never
+        // unlimited). The hero-preview (#44) is a tiny silent loop, so it stays on the in-memory cache.
+        //
+        // `cache-on-disk` is a stable libmpv option (mpv 0.30+, present in MPVKit 0.41); if a future
+        // build ever drops it, these lines no-op and mpv falls back to the in-memory cache that the same
+        // clamped `demuxer-max-bytes` already bounds — so the safety guarantee holds either way.
+        if !startMuted, DiskCacheSetting.diskCacheEnabled, let cacheDir = DiskCacheSetting.ensureCacheDirectory() {
+            checkError(mpv_set_option_string(mpv, "cache-on-disk", "yes"))
+            checkError(mpv_set_option_string(mpv, "cache-dir", cacheDir))
+            mpvLog.log("disk cache armed at \(cacheDir, privacy: .public), budget \(DiskCacheSetting.resolvedMaxBytes(), privacy: .public) bytes")
+        }
+
         // HLS: pick the HIGHEST-bandwidth variant of an adaptive master playlist. mpv's documented
         // default is already `max`, but add-ons that serve a single adaptive master (e.g. KhmerHub's
         // OK.ru streams) were starting at the lowest rendition — the "144p instead of 720p" report —
@@ -422,12 +463,21 @@ final class MPVMetalViewController: PlatformViewController {
         if !routeIsStereoOnly, !routeIsAirPods, let spdif = AudioOutputMode.current.spdifCodecs {
             checkError(mpv_set_option_string(mpv, "audio-spdif", spdif))
         }
-        // AO-open failure handling, route-aware. On a real external route (HDMI/ARC/eARC, USB, line
-        // out) keep `no` so a soundbar mis-negotiation surfaces as a log instead of silent death and
-        // stays diagnosable. On a stereo-only route (TV built-in / AirPlay) the failure mode is the
-        // user being stranded silent or the file freezing, so allow the null AO: playback keeps
-        // running (video continues) instead of wedging, the graceful fallback for #78.
-        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", routeIsStereoOnly ? "yes" : "no"))
+        // AO-open failure handling, route-aware. On a stereo-only route (TV built-in / AirPlay) the
+        // failure mode is the user being stranded silent or the file freezing, so allow the null AO:
+        // playback keeps running (video continues) instead of wedging, the graceful fallback for #78.
+        // #78 SAFETY NET: tvOS always outputs over HDMI to a TV / AVR, and the reported Atmos failure is
+        // the audiounit AO failing to open the negotiated layout -> silent + frozen. Allow the null AO on
+        // every tvOS route too, so a failed open degrades to no-audio-but-video-keeps-playing instead of a
+        // dead player. This is the lowest-risk mitigation; it does not change a route where the AO opens
+        // fine (working 5.1 / stereo keep their audio). iOS/macOS keep `no` on a real external route so a
+        // soundbar mis-negotiation still surfaces as a diagnosable log rather than silently dropping audio.
+        #if os(tvOS)
+        let fallbackToNull = "yes"
+        #else
+        let fallbackToNull = routeIsStereoOnly ? "yes" : "no"
+        #endif
+        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", fallbackToNull))
         // THE soundbar fix: resample to the route's actual rate so a rate mismatch over a fixed-rate
         // HDMI-ARC link can't drop to silence (mpv's audiounit AO does not resample to the route).
         if let rate = sampleRatePolicy {
@@ -722,7 +772,18 @@ final class MPVMetalViewController: PlatformViewController {
             readAhead = isLocalStream ? "96MiB" : "128MiB"
             #endif
         }
-        mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
+        // With the on-disk cache armed (Settings → Streaming cache), the forward buffer is backed by the
+        // Caches dir, not RAM, so grow `demuxer-max-bytes` to the viewer's chosen budget — but only for a
+        // REMOTE (debrid/direct CDN) VOD stream, which is where a big seek-ahead buffer actually helps. A
+        // LOCAL torrent already buffers into the embedded server's own disk cache, and live must stay
+        // small (configureLiveMode owns its tight buffers), so those keep the RAM-safe read-ahead above.
+        // resolvedMaxBytes is always clamped to a fraction of FREE disk (and to a hard ceiling on the
+        // constrained Apple TV HD), so this can never fill the device even on "Unlimited".
+        if DiskCacheSetting.diskCacheEnabled, !live, !isLocalStream {
+            mpv_set_property_string(mpv, "demuxer-max-bytes", String(DiskCacheSetting.resolvedMaxBytes()))
+        } else {
+            mpv_set_property_string(mpv, "demuxer-max-bytes", readAhead)
+        }
 
         if !options.isEmpty {
             args.append(options.joined(separator: ","))
@@ -1002,9 +1063,9 @@ final class MPVMetalViewController: PlatformViewController {
 
     /// Current media summary for the player's metadata line: encoded video height (e.g. 2160) and the
     /// active audio codec (e.g. "eac3"). Both can be 0/"" early in load, before the first frame.
-    func mediaSummary() -> (height: Int, audioCodec: String) {
-        guard mpv != nil else { return (0, "") }
-        return (getInt("video-params/h"), getString("audio-codec-name") ?? "")
+    func mediaSummary() -> (width: Int, height: Int, audioCodec: String) {
+        guard mpv != nil else { return (0, 0, "") }
+        return (getInt("video-params/w"), getInt("video-params/h"), getString("audio-codec-name") ?? "")
     }
 
     /// Persisted video-size mode, read at startup so the first frame already uses it.

@@ -24,9 +24,32 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
-    private var lastSyncedVersion = 0   // newest doc version this device has pushed or applied
-    private var lastAppliedProfileEditsAt: Double = 0  // LWW stamp of the last web profileEdits applied (in-memory; re-apply is idempotent)
+    /// Newest doc version this device has pushed or applied. Persisted to UserDefaults (kVersionKey) so the
+    /// version-wins guard stays consistent across relaunches: an in-memory 0 after a cold launch would treat
+    /// the account's current doc as "newer" and re-apply it once on every launch (harmless but wasteful, and
+    /// it re-runs the restore). Seeded from UserDefaults at init.
+    private static let kVersionKey = "vortx.sync.lastSyncedVersion"
+    private var lastSyncedVersion = UserDefaults.standard.integer(forKey: VortXSyncManager.kVersionKey)
+    private func persistLastSyncedVersion() {
+        UserDefaults.standard.set(lastSyncedVersion, forKey: Self.kVersionKey)
+    }
+    /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
+    /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
+    /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
+    private static let kEditsAtKey = "vortx.sync.lastAppliedProfileEditsAt"
+    private var lastAppliedProfileEditsAt: Double {
+        get { UserDefaults.standard.double(forKey: Self.kEditsAtKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.kEditsAtKey) }
+    }
     private var hasPendingPush = false  // a debounced syncUp is queued; don't pull over it
+    /// Set while syncDown is applying a remote pull (the SettingsBackup.restore + apiKeys + overlays +
+    /// tombstones region) and while ProfileStore is doing touch:false launch housekeeping. The global
+    /// UserDefaults.didChangeNotification observer early-returns while this is true, so applying a pull
+    /// (which rewrites every stremiox.* key) no longer self-echoes into requestSyncSoon() — which would
+    /// re-arm hasPendingPush and push the just-applied peer values straight back, starving syncDown's
+    /// guard at line ~471 so a receiving device never applies a peer's settings. A genuine user edit
+    /// (touch:true) is NEVER wrapped in this, so real settings toggles still push and sync.
+    private var isApplyingRemote = false
 
     // MARK: - Real-time sync state (WebSocket + while-active poll)
     /// The live SyncRoom socket; nil whenever disconnected. Receives {"type":"updated","version":N}
@@ -45,8 +68,16 @@ final class VortXSyncManager: ObservableObject {
         restore()
         // Auto-sync: profiles and settings persist to UserDefaults, so one observer catches every change
         // and schedules a debounced push (no-op when signed out). Metadata keys (Keychain) push via ApiKeys.
+        // SUPPRESSION: while isApplyingRemote is true the write came from applying a remote pull or from
+        // routine touch:false launch housekeeping, NOT a user edit, so it must not arm a push. Without this,
+        // the receiving device's syncDown re-arms hasPendingPush (self-echo) and starves its own pull guard,
+        // so peer settings never apply (the Beta 8/9 settings-sync regression). The notification is delivered
+        // on the main queue, so reading the @MainActor flag here is safe.
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.requestSyncSoon() }
+            Task { @MainActor in
+                guard let self, !self.isApplyingRemote else { return }
+                self.requestSyncSoon()
+            }
         }
     }
 
@@ -236,13 +267,20 @@ final class VortXSyncManager: ObservableObject {
               let ct = VortXSyncCrypto.seal(key: dataKey, pt) else { return false }
         let version = Int(Date().timeIntervalSince1970 * 1000)
         let (code, _) = await request("PUT", "/v1/backup", body: ["document": ct, "version": version], auth: true)
-        if code == 200 { lastSyncedVersion = max(lastSyncedVersion, version) }
+        if code == 200 {
+            lastSyncedVersion = max(lastSyncedVersion, version)
+            persistLastSyncedVersion()   // survive relaunch so the version guard stays consistent
+        }
         return code == 200
     }
 
     /// A small JSON view of local state the website dashboard can read (the binary-plist `settings`
     /// blob is opaque to a browser). Profiles let the dashboard show the family roster + the real count.
-    private func vortxSummary() -> [String: Any] {
+    /// `existingVortx` is the `doc["vortx"]` just pulled from the account (nil on a fresh/empty doc). It
+    /// is used for the READ-SIDE UNION GUARD: a momentarily-degraded engine (no add-ons / empty library)
+    /// must never SHRINK the account-owned set on push. Mirrors the existing roster-union and apiKeys
+    /// read-merge guards.
+    private func vortxSummary(existingVortx: [String: Any]? = nil) -> [String: Any] {
         let store = ProfileStore.shared
         let profiles: [[String: Any]] = store.profiles.map { p in
             // pinHash is the salted SHA-256 (salt = the profile id, already here), never the raw PIN,
@@ -293,23 +331,117 @@ final class VortXSyncManager: ObservableObject {
         // from the dashboard, which only received the byProfile overlay libraries above. Emit it as
         // vortx.library from the engine's account library so the dashboard's main-profile Library is
         // populated (excluding removed/temp, which are not "in the library"). Safe here: this type is
-        // @MainActor, so reading CoreBridge's @Published state is on the main actor.
-        let ownerLibrary: [[String: Any]] = (CoreBridge.shared.library?.catalog ?? [])
+        // @MainActor, so reading CoreBridge's @Published state is on the main actor. Enriched with
+        // `lastWatched`+`videoId` (Step 4) so another device can rebuild CW resume, not just membership.
+        let engineLibrary: [[String: Any]] = (CoreBridge.shared.library?.catalog ?? [])
             .filter { !($0.removed ?? false) && !($0.temp ?? false) }
             .map { item in
                 ["id": item.id, "name": item.name, "type": item.type, "poster": item.poster ?? "",
-                 "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000)]
+                 "t": Int(item.state.timeOffset / 1000), "d": Int(item.state.duration / 1000),
+                 "v": item.state.videoId ?? ""]
             }
-        // Installed add-ons, so the dashboard Add-ons page is populated: it reads vortx.addons (and the
-        // web Stremio import under doc.addons), neither of which the app emitted before.
-        let addonList: [[String: Any]] = CoreBridge.shared.addons.map { desc in
-            ["transportUrl": desc.transportUrl, "name": desc.manifest.name]
+        // FLOOR vs MIRROR for the owner library, per the "Mirror library from Stremio" toggle. FLOOR (OFF,
+        // default) = UNION the account's already-owned `doc.vortx.library` with the engine library, so a
+        // Stremio removal never removes from VortX and an empty/degraded engine can never SHRINK it. The
+        // `mirror CW` toggle, when OFF, is what keeps a prior in-progress item's t/d from being zeroed by a
+        // Stremio drop (the union preserves it). MIRROR (ON) = REPLACE: the live Stremio set is authoritative
+        // so removals propagate - but ONLY with a live Stremio session AND a non-empty engine library, so a
+        // logged-out / mid-pull shrunken set can never propagate the shrink to every device (the add-on
+        // guard's clobber fix; the library has no official-defaults concept, so no `!engineIsDefaultOnly`).
+        var libraryByID: [String: [String: Any]] = [:]
+        let mirrorReplaceLibrary = MirrorSettings.mirrorLibrary && !engineLibrary.isEmpty && CoreBridge.shared.isLoggedIn()
+        if !mirrorReplaceLibrary, let prior = (existingVortx?["library"] as? [[String: Any]]) {
+            for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
+        for entry in engineLibrary { if let id = entry["id"] as? String { libraryByID[id] = entry } }
+        let ownerLibrary = Array(libraryByID.values)
+        // Installed add-ons, so the dashboard Add-ons page is populated AND the account can re-hydrate
+        // the engine network-free. We now emit the FULL descriptor `{transportUrl, name, manifest,
+        // flags}` (Step 2) instead of the old `{transportUrl, name}`: hydration needs the manifest +
+        // flags to InstallAddon without a fetch. dash-ui keeps reading transportUrl/name (extra keys are
+        // additive and ignored). The Stremio token never enters this; only descriptors do (they already
+        // ride doc.addons + apiKeys E2E today).
+        let engineAddons: [[String: Any]] = CoreBridge.shared.rawAddonDescriptorsOrdered().compactMap { raw in
+            guard let url = raw["transportUrl"] as? String, !url.isEmpty else { return nil }
+            var entry = raw
+            // The dashboard reads `name`; lift it out of the manifest so the old summary shape is a subset.
+            if entry["name"] == nil, let manifest = raw["manifest"] as? [String: Any], let n = manifest["name"] as? String {
+                entry["name"] = n
+            }
+            return entry
+        }
+        // READ-SIDE GUARD on the owned add-on set. Two modes, decided per the owner's per-category
+        // "Mirror add-ons from Stremio" toggle:
+        //   FLOOR (toggle OFF, the default) = UNION: union the live engine descriptors with the account's
+        //   already-owned `doc.vortx.addons` by transportUrl, so a Stremio removal NEVER removes from VortX
+        //   and a degraded engine can never SHRINK the owned set.
+        //   MIRROR (toggle ON) = REPLACE: the engine (which reflects the live Stremio set after a pull) is
+        //   authoritative, so a Stremio removal propagates (adds AND removes tracked).
+        // NEVER-ZERO, independent of the toggle: REPLACE only applies when the engine actually has a
+        // non-empty add-on set; a degraded/empty engine falls back to UNION so a failed pull can never
+        // zero the category. Engine entries win on conflict in both modes (freshest descriptor).
+        // ORDER-PRESERVING merge (AIOManager-compat: the AddonCollectionSet array order = Stremio
+        // priority, so sync must not scramble it). The engine collection order is authoritative and is
+        // the spine; in UNION mode the VortX-doc-only add-ons (in the prior sync but not the engine)
+        // append after, in their own order. The engine descriptor wins on a URL in both (freshest).
+        // CLOBBER GUARD (data-loss fix): a Stremio logout / token-expiry resets the engine to the DEFAULT
+        // official add-ons - a NON-EMPTY set - so "non-empty" is the wrong REPLACE signal: REPLACE would
+        // overwrite the owned mirror with defaults and propagate that loss to every device. Only let
+        // REPLACE (the live-Stremio-is-authoritative path) win when there IS a live Stremio session AND the
+        // engine holds a genuinely user-owned set (not the official defaults). Otherwise UNION preserves the
+        // owned mirror, so a logout can never shrink doc.vortx.addons to defaults.
+        let engineIsDefaultOnly = engineAddons.allSatisfy { (($0["flags"] as? [String: Any])?["official"] as? Bool) == true }
+        let mirrorReplaceAddons = MirrorSettings.mirrorAddons && !engineAddons.isEmpty
+            && CoreBridge.shared.isLoggedIn() && !engineIsDefaultOnly
+        // SUBTRACT the durable removal tombstones from the union (the add-on analogue of subtracting
+        // deletedProfiles from the roster union): an add-on the user removed must NOT come back, even if
+        // the engine still briefly holds it OR a peer device's prior doc.vortx.addons still carries it.
+        // Official/protected stubs are never tombstoned, so this never drops a default. Compared on the
+        // same normalized (trim+lowercase) transportUrl the tombstone is stored under.
+        let removedAddons = AddonTombstones.all()
+        var addonList: [[String: Any]] = []
+        var seenAddonURLs = Set<String>()
+        for entry in engineAddons {
+            guard let url = entry["transportUrl"] as? String,
+                  !removedAddons.contains(AddonTombstones.normalize(url)),
+                  seenAddonURLs.insert(url).inserted else { continue }
+            addonList.append(entry)
+        }
+        if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
+            for entry in prior {
+                guard let url = entry["transportUrl"] as? String, !url.isEmpty,
+                      !removedAddons.contains(AddonTombstones.normalize(url)),
+                      seenAddonURLs.insert(url).inserted else { continue }
+                addonList.append(entry)
+            }
+        }
+
         var v: [String: Any] = ["profiles": profiles, "updatedAt": Int(Date().timeIntervalSince1970 * 1000)]
         if !byProfile.isEmpty { v["byProfile"] = byProfile }
         if !ownerLibrary.isEmpty { v["library"] = ownerLibrary }
-        if !addonList.isEmpty { v["addons"] = addonList }
+        if !addonList.isEmpty {
+            v["addons"] = addonList
+            // addonsOwnedAt distinguishes "owns an empty set" from "never snapshotted". Set ONCE, the
+            // first time a non-empty owned set is written; preserved verbatim thereafter (carried from the
+            // pulled doc), so it anchors ownership age without being reset on every push.
+            if let priorOwnedAt = existingVortx?["addonsOwnedAt"] {
+                v["addonsOwnedAt"] = priorOwnedAt
+            } else {
+                v["addonsOwnedAt"] = Int(Date().timeIntervalSince1970 * 1000)
+            }
+        } else if let priorOwnedAt = existingVortx?["addonsOwnedAt"] {
+            v["addonsOwnedAt"] = priorOwnedAt   // never lose the anchor even on an empty push
+        }
         if let active = store.activeID { v["activeProfile"] = active.uuidString }
+        // Durable cross-device delete tombstones (the app owns this; the dashboard only READS it). Carries
+        // the set of deleted profile ids so a peer device drops them on its next union-merge instead of
+        // resurrecting them. Empty set is omitted so a fresh account never writes the key.
+        let deleted = store.deletedProfileIDs
+        if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
+        // Durable cross-device add-on REMOVAL tombstones (app-authoritative, exactly like deletedProfiles;
+        // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
+        // device uninstalls them on its next pull instead of re-hydrating them. Empty set is omitted.
+        if !removedAddons.isEmpty { v["deletedAddons"] = Array(removedAddons) }
         return v
     }
 
@@ -352,12 +484,21 @@ final class VortXSyncManager: ObservableObject {
         guard let data = try? SettingsBackup.makeBackup() else { return false }
         doc["settings"] = data.base64EncodedString()
         doc["format"] = 1
-        doc["vortx"] = vortxSummary()   // JSON the dashboard can read (profiles, active selection)
-        var keys: [String: String] = [:]
+        // Pass the PULLED vortx block so vortxSummary can union the account-owned add-on set (never
+        // shrink it from a degraded engine) and preserve addonsOwnedAt.
+        doc["vortx"] = vortxSummary(existingVortx: doc["vortx"] as? [String: Any])
+        // READ-MERGE, never wholesale-rebuild. Start from the PULLED apiKeys and only SET the keys this
+        // device actually holds; never DELETE a key this device did not author. A device without a TMDB
+        // key (or with no keys at all) used to drop the whole object on push, and because pushes version
+        // with epoch-ms wall-clock they win last-writer-wins over the dashboard's save, wiping the
+        // dashboard's TMDB key. Mirrors the asymmetric read-side debrid guard in syncDown.
+        var keys = (doc["apiKeys"] as? [String: String]) ?? [:]
         if let t = ApiKeys.tmdbKey() { keys["tmdb"] = t }
         if let m = ApiKeys.mdblistKey() { keys["mdblist"] = m }
+        if let f = ApiKeys.fanartKey() { keys["fanart"] = f }
         // Debrid keys ride the same encrypted apiKeys channel so they follow the account across devices
         // (they live in the Keychain, which SettingsBackup deliberately excludes, so they need this mirror).
+        // Set only when configured locally; do NOT remove a key absent locally (another device authored it).
         let debrid = DebridKeys.shared
         if debrid.isConfigured(.realDebrid) { keys["realDebrid"] = debrid.key(for: .realDebrid) }
         if debrid.isConfigured(.allDebrid)  { keys["allDebrid"]  = debrid.key(for: .allDebrid) }
@@ -387,11 +528,29 @@ final class VortXSyncManager: ObservableObject {
     @discardableResult
     func syncDown(force: Bool = false) async -> Bool {
         guard isSignedIn else { return false }
+        // PENDING-EDIT GUARD. When a GENUINE local edit is queued (a settings toggle, a profile delete: the
+        // observer armed hasPendingPush), defer this pull until that edit's debounced push lands. Without it an
+        // interleaved pull re-applies the account's pre-edit value and the change the user just made flips back
+        // within a second: the ERDB / fanart toggle that would not stay off, and the deleted profile that came
+        // straight back. This is SAFE from the Beta 8/9 starvation now that routine touch:false launch
+        // housekeeping is suppressed and no longer arms hasPendingPush (see the observer + suppressHousekeeping):
+        // an idle receiving device has hasPendingPush == false, so it still applies a peer's newer settings. The
+        // queued push fires on its own debounce and syncUp read-merges, so deferring here never loses anything.
         if !force, hasPendingPush { return false }
         guard let pulled = await pullDocVersioned() else { return false }
+        // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
+        // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
+        // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
+        // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
+        // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
+        // schedules a push of the just-applied peer values straight back up (the self-echo). That keeps the
+        // receiving device permanently inside the hasPendingPush window, so its next syncDown bails at the
+        // guard and the peer's settings are never applied. The body is fully synchronous (no awaits), so the
+        // coalesced notifications drain on the next main-queue turn while the flag is still set.
+        withRemoteApplySuppressed {
         if let b64 = doc["settings"] as? String, let data = Data(base64Encoded: b64) {
             // Capture the LIVE roster BEFORE restore: SettingsBackup.restore overwrites the roster key
             // with the cloud blob wholesale, and a cloud blob with FEWER profiles would otherwise delete
@@ -402,18 +561,24 @@ final class VortXSyncManager: ObservableObject {
                 restored = true
                 ProfileStore.shared.reloadFromDefaults()              // apply the cloud roster to the LIVE store, no relaunch
                 ProfileStore.shared.mergeInRoster(localRosterBefore)  // cloud UNION local: keep every local-only profile
+                ProfileStore.shared.applyLocalTombstones()           // a profile deleted this session stays gone even if the pulled doc predates its tombstone (the resurrect window)
                 LastStreamStore.invalidateCache()                    // the restore wrote new lastStream behind the cache; re-read it
             }
         }
         if let keys = doc["apiKeys"] as? [String: String] {
             if let t = keys["tmdb"] { ApiKeys.shared.tmdb = t }
             if let m = keys["mdblist"] { ApiKeys.shared.mdblist = m }
+            if let f = keys["fanart"] { ApiKeys.shared.fanart = f }
             // Debrid keys: apply only when present so a doc without them never clears a locally-entered key.
             let debrid = DebridKeys.shared
             if let v = keys["realDebrid"], v != debrid.key(for: .realDebrid) { debrid.setKey(v, for: .realDebrid) }
             if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
             if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
             if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
+            // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
+            // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
+            // path explicitly). @MainActor hop because the coordinator is main-actor isolated.
+            Task { @MainActor in DebridCoordinator.shared.reload() }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {
@@ -431,6 +596,40 @@ final class VortXSyncManager: ObservableObject {
         // local overlay so a secondary profile's library + CW actually appear in the app on every device, not
         // just the dashboard. ProfileStore.applyRemoteOverlay merges last-writer-wins per item and only ever
         // touches overlay caches, never the owner/engine (account) library.
+        // Cross-device delete tombstones: fold any incoming doc.vortx.deletedProfiles into the local set
+        // FIRST (before applying the roster below), so a profile another device deleted is dropped here
+        // and the union-merge can never bring it back. mergeDeletedTombstones also prunes the live roster.
+        if let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
+            if ProfileStore.shared.mergeDeletedTombstones(deleted) { restored = true }
+        }
+        // Cross-device add-on REMOVAL tombstones (the add-on analogue of the deletedProfiles fold above).
+        // Reached ONLY inside this withRemoteApplySuppressed region, which runs after a STRICTLY-NEWER,
+        // SUCCESSFUL pullDocVersioned() — a .failed/.empty pull returns earlier, so a stale/partial sync
+        // can NEVER drive an uninstall. Fold the app-authored doc.vortx.deletedAddons AND a (future)
+        // web-authored doc.webAddonRemovals array into the durable local set, then uninstall any
+        // tombstoned add-on still installed in the engine. The uninstall is HARD-GATED to non-official,
+        // non-protected descriptors so a default stub is never removed; it passes tombstone: false because
+        // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
+        // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
+        // reinstalled on the next hydrate even before this uninstall runs.
+        var incomingAddonRemovals: [String] = []
+        if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
+            incomingAddonRemovals += removed
+        }
+        if let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
+            incomingAddonRemovals += webRemoved
+        }
+        if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
+        let removedAddonSet = AddonTombstones.all()
+        if !removedAddonSet.isEmpty {
+            Task { @MainActor in
+                for addon in CoreBridge.shared.addons
+                where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
+                    && !addon.isOfficial && !addon.isProtected {
+                    CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                }
+            }
+        }
         if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
             for (idStr, raw) in byProfile {
                 guard let uuid = UUID(uuidString: idStr),
@@ -465,8 +664,118 @@ final class VortXSyncManager: ObservableObject {
                 restored = true
             }
         }
+        // Stamp the applied version INSIDE the suppression window: persistLastSyncedVersion writes to
+        // UserDefaults, which would otherwise fire the observer and re-arm a push (another self-echo path).
         lastSyncedVersion = max(lastSyncedVersion, pulled.version)
+        persistLastSyncedVersion()
+        }   // end withRemoteApplySuppressed
         return restored
+    }
+
+    // MARK: - Account owns everything (hydrate-from-doc + snapshot-on-import)
+
+    /// Hydrate the engine from the VortX account's OWNED add-ons + recover the owner library, so a
+    /// logged-out / degraded Stremio session shows the account's add-ons + sources + library instead of
+    /// zero (the "post-update: 0 sources / 0 add-ons" fix). This is the load-bearing new capability.
+    ///
+    /// NEVER-ZERO INVARIANT: a `.failed` or `.empty` account pull does NOTHING (we never hydrate-then-
+    /// empty). Only a real `.doc` triggers hydration. Not gated by the mirror toggles — the VortX-owned
+    /// set always hydrates when the engine is empty/degraded; the toggles only control the snapshot
+    /// DIRECTION (Stremio -> VortX), not the floor.
+    ///
+    /// Owned add-ons = `doc.vortx.addons` UNION `doc.addons` (the website Stremio import) by transportUrl.
+    /// Hydration installs only descriptors the engine lacks (idempotent). Library recovery is gated to
+    /// "engine account library empty AND the account owns one" so it runs at most once per fresh install.
+    func hydrateEngineFromOwnedAddons() async {
+        guard isSignedIn else { return }
+        guard case let .doc(doc) = await pullSyncDocResult() else { return }   // .failed/.empty: do nothing
+        let owned = Self.ownedAddons(from: doc)
+        if !owned.isEmpty {
+            CoreBridge.shared.hydrateAddonsFromAccount(owned)
+        }
+        await recoverOwnerLibraryIfEmpty(from: doc)
+    }
+
+    /// Compute the account-owned add-on descriptors from a pulled doc: `doc.vortx.addons` (the app's
+    /// full descriptors) UNIONed with `doc.addons` (the website's Stremio import) by transportUrl.
+    /// vortx.addons wins on conflict (it carries the freshest app descriptor). Legacy `{transportUrl,
+    /// name}`-only entries (no manifest) are dropped: without a manifest the engine cannot InstallAddon.
+    static func ownedAddons(from doc: [String: Any]) -> [VortXOwnedAddon] {
+        var byUrl: [String: VortXOwnedAddon] = [:]
+        var order: [String] = []   // preserve install order (AIOManager-compat: collection order = priority)
+        // EXCLUDE durable removal tombstones so hydrateEngineFromOwnedAddons never REINSTALLS an add-on the
+        // user removed (the install-only hydrate was the gap that let a removal come back). The doc's
+        // deletedAddons subset was already folded into this local set on syncDown; we read the local set so
+        // even a doc that predates the removal is honored. Same normalized transportUrl the set is keyed by.
+        let removedAddons = AddonTombstones.all()
+        func add(_ a: VortXOwnedAddon) {
+            guard !removedAddons.contains(AddonTombstones.normalize(a.transportUrl)) else { return }
+            // First sight wins both the order slot AND the descriptor, so the app/engine-owned set (added
+            // first below) defines the order spine and its richer descriptor is kept for a shared URL.
+            if byUrl[a.transportUrl] == nil { order.append(a.transportUrl); byUrl[a.transportUrl] = a }
+        }
+        // doc.vortx.addons (the app/engine-owned set) FIRST, so it defines the order spine - matching the
+        // write-side spine in vortxSummary - and its richer descriptor wins a URL present in both; then the
+        // web-import-only URLs append after.
+        if let vortx = doc["vortx"] as? [String: Any], let appAddons = vortx["addons"] as? [[String: Any]] {
+            for raw in appAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
+        }
+        if let webAddons = doc["addons"] as? [[String: Any]] {
+            for raw in webAddons { if let a = VortXOwnedAddon(json: raw) { add(a) } }
+        }
+        return order.compactMap { byUrl[$0] }
+    }
+
+    /// Rebuild the OWNER (account) library on a cold Stremio-less device, ONLY when the engine's account
+    /// library is empty AND the account doc owns one. Goes exclusively through the engine
+    /// `AddToLibrary`/`addCatalogItemToAccount` path (real Cinemeta meta = schema-safe). NEVER writes app
+    /// data into a libraryItem doc (the poisoned-account incident). Owner-profile semantics only: items
+    /// land in the account library, which is the owner profile's history.
+    private func recoverOwnerLibraryIfEmpty(from doc: [String: Any]) async {
+        guard let vortx = doc["vortx"] as? [String: Any] else { return }
+        // doc.vortx.library is the owner library; fall back to doc.library (web Stremio import) if present.
+        let ownedLibrary = (vortx["library"] as? [[String: Any]]) ?? (doc["library"] as? [[String: Any]]) ?? []
+        guard !ownedLibrary.isEmpty else { return }
+        // Only recover when the engine's account library is genuinely empty (a fresh / cold device).
+        let engineLibrary = CoreBridge.shared.library?.catalog ?? []
+        let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
+        guard !engineHasLibrary else { return }
+        var recovered = 0
+        for item in ownedLibrary {
+            guard let id = item["id"] as? String, !id.isEmpty,
+                  // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
+                  id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
+            let type = (item["type"] as? String) == "series" ? "series" : "movie"
+            await CoreBridge.shared.addCatalogItemToAccount(id: id, type: type)
+            recovered += 1
+        }
+        if recovered > 0 {
+            DiagnosticsLog.log("sync", "recovered \(recovered) owner-library title(s) from the VortX account on a cold device")
+        }
+    }
+
+    /// Snapshot the engine's CURRENT add-ons (full descriptors) into the account doc, anchoring
+    /// ownership on Stremio sign-in (and once on an already-synced launch when addonsOwnedAt is unset).
+    /// UNION-not-shrink with the never-zero guard: only runs when the engine actually has add-ons, and a
+    /// `.failed` account pull aborts (never clobbers the account doc). The add-on union + addonsOwnedAt
+    /// are handled by vortxSummary's read-side guard; this just forces a push so the snapshot lands.
+    func snapshotOwnedFromEngine() async {
+        guard isSignedIn else { return }
+        guard !CoreBridge.shared.addons.isEmpty else { return }   // never-zero: nothing to anchor
+        // Confirm the account doc is reachable before pushing (a .failed pull means a degraded network:
+        // syncUp's own guard would already abort, but checking here avoids a wasted makeBackup).
+        if case .failed = await pullSyncDocResult() { return }
+        await syncUp()   // vortxSummary unions the engine descriptors into doc.vortx.addons + sets addonsOwnedAt
+    }
+
+    /// True when the account doc has NOT yet anchored an owned add-on set (`addonsOwnedAt` unset), so an
+    /// already-synced launch can snapshot-on-import exactly once. A `.failed`/`.empty` pull returns false
+    /// (nothing to do / no doc), so we never snapshot before the account is reachable.
+    func ownedAddonsNeverSnapshotted() async -> Bool {
+        guard isSignedIn else { return false }
+        guard case let .doc(doc) = await pullSyncDocResult() else { return false }
+        let vortx = doc["vortx"] as? [String: Any]
+        return vortx?["addonsOwnedAt"] == nil
     }
 
     // MARK: - Reconciliation (no blind last-writer-wins)
@@ -527,6 +836,13 @@ final class VortXSyncManager: ObservableObject {
     private var pendingSync: Task<Void, Never>?
     func requestSyncSoon() {
         guard isSignedIn else { return }
+        // Universal "do not schedule a push from this write" gate. While syncDown is applying a remote pull
+        // (isApplyingRemote), the writes it makes must NOT arm a push, or the receiving device re-pushes the
+        // peer values and starves its own pull guard (the Beta 8/9 settings-sync starvation). The
+        // UserDefaults.didChangeNotification observer already checks this, but apiKeys (ApiKeys.didSet) and
+        // debrid keys (DebridKeys.setKey) call requestSyncSoon() DIRECTLY, bypassing the observer, so the gate
+        // must live here too to cover every call path. A genuine user edit never runs inside the apply window.
+        guard !isApplyingRemote else { return }
         hasPendingPush = true
         pendingSync?.cancel()
         pendingSync = Task { [weak self] in
@@ -534,6 +850,35 @@ final class VortXSyncManager: ObservableObject {
             if Task.isCancelled { return }
             await self?.syncUp()
             self?.hasPendingPush = false
+        }
+    }
+
+    /// Run a SYNCHRONOUS block of UserDefaults writes that should NOT arm an auto-push: applying a remote
+    /// pull (the self-echo case) or routine touch:false launch housekeeping. Sets isApplyingRemote for the
+    /// duration AND across the next main-queue turn, because UserDefaults.didChangeNotification is delivered
+    /// asynchronously on the main queue (queue: .main): the notifications generated by the writes are
+    /// coalesced and run AFTER this returns, so the flag must stay set until they drain. Clearing it via a
+    /// trailing DispatchQueue.main.async keeps it true while the queued observer block runs, then clears it.
+    /// Must be called on the main actor with a synchronous body (no awaits inside, or notifications could
+    /// leak past the window).
+    func withRemoteApplySuppressed(_ body: () -> Void) {
+        let wasSuppressing = isApplyingRemote
+        isApplyingRemote = true
+        body()
+        // If we were already inside an outer suppression window, let the outer one clear it.
+        guard !wasSuppressing else { return }
+        DispatchQueue.main.async { [weak self] in self?.isApplyingRemote = false }
+    }
+
+    /// ProfileStore entry point: wrap a touch:false housekeeping persist so its UserDefaults writes do not
+    /// arm a push. Static + main-actor-hopped so the synchronous, possibly-off-main `persist(touch:false)`
+    /// can call it without itself being @MainActor; the actual flag flip + clear happen on the main actor
+    /// where the observer is delivered. touch:true persists are never routed here, so user edits still sync.
+    nonisolated static func suppressHousekeeping(_ writes: @escaping @MainActor () -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { shared.withRemoteApplySuppressed(writes) }
+        } else {
+            DispatchQueue.main.sync { shared.withRemoteApplySuppressed(writes) }
         }
     }
 

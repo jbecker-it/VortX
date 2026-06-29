@@ -173,6 +173,7 @@ struct PlayerScreen: View {
     @State private var audioTracks: [MPVTrack] = []
     @State private var subtitleTracks: [MPVTrack] = []
     @State private var appliedAutoTracks = false
+    @State private var videoWidth = 0           // from mediaSummary; resolution is by WIDTH (2.40:1 4K not mislabeled 1440p)
     @State private var videoHeight = 0          // from mediaSummary, for the metadata line (#20)
     @State private var audioCodec = ""
     @State private var isHDR = false
@@ -198,6 +199,22 @@ struct PlayerScreen: View {
     @State private var sleepDeadline: Date? = nil       // when the timed pause fires (for the countdown label)
     @State private var sleepTask: Task<Void, Never>?
     @State private var showExternalChooser = false   // "Play in another app" sheet
+    #if !os(tvOS)
+    // Skip-segment editor state (iOS/Mac only). Submits keyless to skip.vortx.tv; also to skipdb.tv
+    // when the user has a community key. The editor is available for any tt####### title.
+    @State private var showSkipDBEdit = false
+    @State private var skipDBEditType: SkipDBSubmitView.SegmentType = .intro
+    @State private var skipDBEditStart: Double = 0
+    @State private var skipDBEditEnd: Double = 30
+    @State private var skipDBSubmitting = false
+    @State private var skipDBSubmitResult: Bool? = nil
+    @State private var skipDBSubmitError: String? = nil
+    @State private var skipDBSubmittedKeys: Set<String> = []
+    @State private var skipDBPreviewing = false
+    @State private var skipDBShowEndTime = true
+    @State private var skipDBIntroEstimateMs: Int? = nil
+    @ObservedObject private var apiKeys = ApiKeys.shared
+    #endif
     @State private var externalLinkDead = false      // pre-flight probe found the stream URL dead before handoff
     @State private var subtitleLoadFailed = false    // an add-on subtitle download timed out / failed
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
@@ -211,6 +228,15 @@ struct PlayerScreen: View {
     @State private var switchingEpisode = false       // a Next/Prev/list switch is resolving its stream
     private var curMeta: PlaybackMeta? { curMetaState ?? recordMeta }
     private var curTitle: String { curTitleState ?? title }
+    /// True while the skip-segment editor bar is open. Always false on tvOS (the editor is iOS/Mac
+    /// only), so the EOF/auto-hide/up-next guards can reference it without per-call `#if` fences.
+    private var skipEditActive: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return showSkipDBEdit
+        #endif
+    }
 
     // Subtitle / audio sync + style (parity with tvOS), persisted per-profile like the tvOS player.
     @State private var subDelay = 0.0
@@ -231,6 +257,9 @@ struct PlayerScreen: View {
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
     #endif
     @State private var loadErrorMsg = ""
+    /// CW-resume only: set once we've waited for a freshly-loaded source after the stored link failed, so the
+    /// wait-and-hop runs at most once per playback (no unbounded loop). Reset on each new media load.
+    @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
     /// Latest mpv "seekable" flag. Defaults true so a VOD is never mis-flagged live before mpv reports;
     /// only consulted by `effectivelyLive` AFTER `hasStartedPlaying`. A true live feed stays false.
@@ -440,6 +469,10 @@ struct PlayerScreen: View {
             hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
             refreshTask?.cancel(); sleepTask?.cancel()
+            // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
+            // (first-writer-wins, background, gated; no-op if the community already had a set). Never
+            // touches the player teardown below.
+            scrubThumbnails.finishAndUploadIfNeeded()
             NowPlayingCenter.clear()   // drop the Lock Screen / Control Center now-playing on close
             #if os(iOS)
             UIApplication.shared.isIdleTimerDisabled = false  // let the screensaver / auto-lock resume once the player closes
@@ -529,6 +562,12 @@ struct PlayerScreen: View {
                 }
                 if !scrubbing {
                     currentTime = d
+                    #if !os(tvOS)
+                    if skipDBPreviewing, d >= skipDBEditStart {
+                        skipDBPreviewing = false
+                        coordinator.player?.seek(to: skipDBEditEnd)
+                    }
+                    #endif
                     updateCurrentSkip(at: d)
                     NowPlayingCenter.update(title: curTitle, elapsed: d, duration: duration, paused: isPaused)
                     maybeCaptureLocalTrickplay(at: d)
@@ -572,6 +611,11 @@ struct PlayerScreen: View {
                     }
                 }
                 refreshSkipSegments()
+                // Community trickplay: once the duration is known, fetch any shared sprite-sheet for this
+                // exact cut (fail-soft -> the existing local capture). Acts once per title.
+                if d > 0, let m = curMeta {
+                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode, duration: d)
+                }
             }
         case MPVProperty.seekable:
             // Runtime live-detection: a VOD turns seekable once playback starts, a live feed stays
@@ -588,7 +632,7 @@ struct PlayerScreen: View {
         case MPVProperty.trackList:
             refreshTracks()
             let summary = coordinator.player?.mediaSummary()
-            videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
+            videoWidth = summary?.width ?? 0; videoHeight = summary?.height ?? 0; audioCodec = summary?.audioCodec ?? ""
             metadataLine = computeMetadataLine()
             if !appliedAutoTracks, !audioTracks.isEmpty || !subtitleTracks.isEmpty {
                 appliedAutoTracks = true
@@ -614,21 +658,26 @@ struct PlayerScreen: View {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
                 // auto-advancing. The episode is already marked watched above, so Continue Watching
                 // rolls to the next episode on its own without yanking the viewer out of the credits.
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
-            } else if canNextEpisode, let i = episodeIndex {
-                goToEpisode(episodes[i + 1].id, autoAdvance: true)   // in-place advance to the next episode
-            } else if hasNext {
-                onNext()                                  // legacy non-episode caller
-            } else {
+            } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
+                // In-place advance to the next episode: KEEP the cache (the same player keeps playing).
+                // Suppressed while the skip editor is open so an end-of-credits edit isn't yanked away.
+                goToEpisode(episodes[i + 1].id, autoAdvance: true)
+            } else if hasNext, !skipEditActive {
+                onNext()                                  // legacy non-episode caller (in-place)
+            } else if !skipEditActive {
                 // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
                 // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
                 // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
                 if let m = curMeta { core.finishedWatching(libraryId: m.libraryId) }
+                DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             }
         default: break
@@ -787,6 +836,26 @@ struct PlayerScreen: View {
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
             if hopToNextSource(reason: "load failed") { return }
+            // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
+            // iOSDirectResume kicks off a background reload of the title's streams, but they may not have
+            // arrived yet, so the hop above found nothing. Wait briefly for the fresh streams and retry the
+            // hop, rather than dead-ending on the "sources didn't load" overlay and forcing a manual re-pick.
+            // One wait-cycle per playback; only for a metadata-backed (resumed) non-torrent play.
+            if recordMeta != nil, !curIsTorrent, !awaitedFreshSources {
+                awaitedFreshSources = true
+                reconnectMsg = "Finding a fresh source…"; withAnimation { reconnecting = true }
+                autoRetryTask?.cancel()
+                autoRetryTask = Task { @MainActor in
+                    for _ in 0 ..< 16 {   // up to ~4s for the background stream load to land
+                        try? await Task.sleep(for: .milliseconds(250))
+                        if Task.isCancelled { return }
+                        if hopToNextSource(reason: "fresh sources after wait") { reconnecting = false; return }
+                    }
+                    reconnecting = false
+                    withAnimation { loadFailed = true }
+                }
+                return
+            }
             withAnimation { loadFailed = true }
             return
         }
@@ -1009,6 +1078,16 @@ struct PlayerScreen: View {
     /// untried remains; the caller then shows the error overlay. Mirrors tvOS `hopToNextSource`.
     @discardableResult
     private func hopToNextSource(reason: String) -> Bool {
+        // A trailer has no content stream of its own; nextUntriedStream() would fall back to whatever the
+        // engine last loaded for this title, so a dead /yt route would silently play the ACTUAL movie.
+        // Mirror tvOS (TVPlayerView.hopToNextSource): show "Trailer unavailable" and stop. Return true so
+        // the caller treats the failure as handled and doesn't paint its own content-stream error.
+        if isTrailer {
+            DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
+            loadErrorMsg = "Trailer unavailable."
+            withAnimation { loadFailed = true }
+            return true
+        }
         guard sourceHops < maxSourceHops, let stream = nextUntriedStream(), let newURL = stream.playableURL else { return false }
         var tried = exhaustedURLs
         if let dead = curURL { tried.insert(dead) }
@@ -1038,7 +1117,7 @@ struct PlayerScreen: View {
         if resumeOverride != nil { currentTime = 0; duration = 0 }   // episode switch: brand-new media, reset the clock
         appliedSize = false; appliedAutoTracks = false
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
-        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
+        autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
         reconnectMsg = "Switching source…"
         loadIntoPlayer(newURL, headers: curHeaders, live: isLive)
@@ -1058,7 +1137,7 @@ struct PlayerScreen: View {
     /// episode queued, a real runtime, the play head in the final stretch, and the user hasn't chosen to
     /// sit through the credits. nil hides the band. The EOF handler does the actual advance at 0.
     private var upNextRemaining: Int? {
-        guard canNextEpisode, !upNextSuppressed, duration > 60, currentTime > 0 else { return nil }
+        guard canNextEpisode, !upNextSuppressed, !skipEditActive, duration > 60, currentTime > 0 else { return nil }
         let remaining = duration - currentTime
         guard remaining > 0, remaining <= 20 else { return nil }
         return Int(remaining.rounded(.up))
@@ -1220,12 +1299,15 @@ struct PlayerScreen: View {
     /// shown under the title so the user can tell what they actually got. Recomputed on track/HDR change.
     private func computeMetadataLine() -> String {
         var parts: [String] = []
-        switch videoHeight {
-        case 2000...:     parts.append("4K")
-        case 1300..<2000: parts.append("1440p")
-        case 900..<1300:  parts.append("1080p")
-        case 600..<900:   parts.append("720p")
-        case 1..<600:     parts.append("\(videoHeight)p")
+        // Resolution is defined by WIDTH (4K is ~3840 wide at ANY aspect), so a 2.40:1 4K film (3840x1600)
+        // is NOT mislabeled "1440p" off its 1600 height. Width when known, else a 16:9 height estimate.
+        let res = videoWidth > 0 ? videoWidth : Int(Double(videoHeight) * 16.0 / 9.0)
+        switch res {
+        case 3000...:     parts.append("4K")
+        case 2200..<3000: parts.append("1440p")
+        case 1500..<2200: parts.append("1080p")
+        case 1000..<1500: parts.append("720p")
+        case 1..<1000:    if videoHeight > 0 { parts.append("\(videoHeight)p") }
         default:          break
         }
         if isHDR { parts.append("HDR") }
@@ -1294,6 +1376,27 @@ struct PlayerScreen: View {
                     scheduleHide()
                 }
             }
+            #if !os(tvOS)
+            // Skip-segment editor: any tt####### title qualifies. Submission is keyless via our
+            // skip.vortx.tv worker, so no third-party key is required to open or use it.
+            if let m = curMeta,
+               m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil {
+                iconButton(showSkipDBEdit ? "checkmark.bubble.fill" : "checkmark.bubble",
+                           label: showSkipDBEdit ? "Close skip editor" : "Edit skip segments") {
+                    if !showSkipDBEdit {
+                        let snapped = (currentTime * 2).rounded() / 2
+                        skipDBEditStart = max(0, snapped)
+                        skipDBEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
+                        skipDBEditType = .intro
+                        skipDBShowEndTime = true
+                        skipDBSubmitResult = nil
+                        skipDBSubmitError = nil
+                        skipDBPreviewing = false
+                    }
+                    showSkipDBEdit.toggle()
+                }
+            }
+            #endif
             iconButton("gearshape", label: "Player settings") { openPanel(.playerSettings) }   // decoder toggle + playback info (tvOS parity #22)
             iconButton("arrow.up.forward.app", label: "Play in another app") {       // hand off to Infuse / VLC / Share
                 hideTask?.cancel()
@@ -1403,6 +1506,49 @@ struct PlayerScreen: View {
                             }
                             .allowsHitTesting(false)
                         }
+                        #if !os(tvOS)
+                        // Loaded skip segments: faint coloured bands.
+                        .overlay {
+                            if duration > 0 {
+                                ForEach(skipSegments) { seg in
+                                    let sf = CGFloat(seg.start / duration)
+                                    let ef = CGFloat(seg.end / duration)
+                                    let sx = sliderInset + sf * trackWidth
+                                    let w  = max(2, (ef - sf) * trackWidth)
+                                    Capsule().fill(seg.kind == .intro ? Color.cyan.opacity(0.45)
+                                                   : seg.kind == .recap ? Color.yellow.opacity(0.45)
+                                                   : seg.kind == .credits ? Color.purple.opacity(0.45)
+                                                   : Color.orange.opacity(0.45))
+                                        .frame(width: w, height: 5)
+                                        .position(x: sx + w / 2, y: geo.size.height / 2)
+                                }
+                                .allowsHitTesting(false)
+                            }
+                        }
+                        // Segment being edited: bright band + start/end markers.
+                        .overlay {
+                            if showSkipDBEdit, duration > 0 {
+                                let sf = CGFloat(skipDBEditStart / duration)
+                                let ef = CGFloat(skipDBEditEnd   / duration)
+                                let sx = sliderInset + sf * trackWidth
+                                let ex = sliderInset + ef * trackWidth
+                                let w  = max(2, ex - sx)
+                                let cy = geo.size.height / 2
+                                ZStack(alignment: .topLeading) {
+                                    Rectangle().fill(Color.white.opacity(0.35))
+                                        .frame(width: w, height: 6)
+                                        .position(x: sx + w / 2, y: cy)
+                                    Capsule().fill(Color.white)
+                                        .frame(width: 3, height: 14)
+                                        .position(x: sx, y: cy)
+                                    Capsule().fill(Color.white)
+                                        .frame(width: 3, height: 14)
+                                        .position(x: ex, y: cy)
+                                }
+                                .allowsHitTesting(false)
+                            }
+                        }
+                        #endif
                         // bottomLeading alignment: popup bottom anchors at slider bottom, grows upward.
                         // y: -28 lifts it 4 pt above the slider top (slider is 24 pt tall).
                         .overlay(alignment: .bottomLeading) {
@@ -1424,6 +1570,10 @@ struct PlayerScreen: View {
                     }
                 }
             }
+
+            #if !os(tvOS)
+            if showSkipDBEdit, let m = curMeta { skipDBEditBar(meta: m) }
+            #endif
 
             HStack(spacing: 0) {
                 controlButton("speedometer", speed == 1.0 ? "Speed" : speedLabel(speed)) { openPanel(.speed) }
@@ -1460,6 +1610,326 @@ struct PlayerScreen: View {
         }
         .padding(.horizontal).padding(.bottom, 22)
     }
+
+    #if !os(tvOS)
+    // MARK: - Skip segment edit bar (iOS/Mac)
+
+    @ViewBuilder private func skipDBEditBar(meta: PlaybackMeta) -> some View {
+        let submittedKey = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
+        let alreadySubmitted = skipDBSubmittedKeys.contains(submittedKey)
+        let segDuration = skipDBEditEnd - skipDBEditStart
+
+        VStack(spacing: 6) {
+            HStack(spacing: 8) {
+                // Left: type picker + chapter nav
+                HStack(spacing: 6) {
+                    Text("Skip")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.45))
+                    Menu {
+                        ForEach(SkipDBSubmitView.SegmentType.allCases) { t in
+                            Button {
+                                skipDBEditType = t
+                                skipDBSubmitResult = nil
+                                skipDBSubmitError = nil
+                                if t == .outro {
+                                    skipDBShowEndTime = false
+                                    skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
+                                } else {
+                                    skipDBShowEndTime = true
+                                }
+                            } label: {
+                                let k = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(t.rawValue)"
+                                Label(t.label, systemImage: skipDBSubmittedKeys.contains(k) ? "checkmark" : "")
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text(skipDBEditType.label).font(.caption.weight(.semibold))
+                            Image(systemName: "chevron.up.chevron.down").font(.caption2)
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(.white.opacity(0.15), in: Capsule())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+
+                    if hasChapters {
+                        let boundaries = chapterFractions.map { $0 * duration }
+                        let prevCh = boundaries.last(where: { $0 < currentTime - 1.0 })
+                        let nextCh = boundaries.first(where: { $0 > currentTime + 0.5 })
+                        HStack(spacing: 2) {
+                            Button {
+                                if let t = prevCh { coordinator.player?.seek(to: t) }
+                            } label: {
+                                Image(systemName: "backward.end.fill").font(.caption)
+                                    .foregroundStyle(prevCh != nil ? .white : .white.opacity(0.3))
+                                    .padding(4)
+                            }
+                            .buttonStyle(.plain).disabled(prevCh == nil)
+                            .skipDBTooltip("Previous chapter")
+                            Button {
+                                if let t = nextCh { coordinator.player?.seek(to: t) }
+                            } label: {
+                                Image(systemName: "forward.end.fill").font(.caption)
+                                    .foregroundStyle(nextCh != nil ? .white : .white.opacity(0.3))
+                                    .padding(4)
+                            }
+                            .buttonStyle(.plain).disabled(nextCh == nil)
+                            .skipDBTooltip("Next chapter")
+                        }
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+
+                Spacer()
+
+                // Middle: start / end time controls
+                HStack(spacing: 6) {
+                    skipDBTimeControl(label: "Start", seconds: $skipDBEditStart, isEnd: false)
+
+                    if skipDBEditType == .outro && !skipDBShowEndTime {
+                        Button {
+                            skipDBShowEndTime = true
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text("End").font(.caption2).foregroundStyle(.white.opacity(0.5))
+                                Text("episode end")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.white.opacity(0.35))
+                                Image(systemName: "plus.circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.55))
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .skipDBTooltip("Add a custom end time")
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+                    } else {
+                        Text(String(format: "%.1fs", max(0, segDuration)))
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(.white.opacity(0.4))
+                            .frame(minWidth: 34, alignment: .center)
+
+                        skipDBTimeControl(label: "End", seconds: $skipDBEditEnd, isEnd: true)
+
+                        if skipDBEditType == .outro {
+                            Button {
+                                skipDBShowEndTime = false
+                                skipDBEditEnd = duration > 0 ? duration : skipDBEditEnd
+                            } label: {
+                                Image(systemName: "xmark.circle")
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                            .buttonStyle(.plain)
+                            .skipDBTooltip("Use episode end instead")
+                        }
+
+                        if skipDBEditType == .intro, let estimateMs = skipDBIntroEstimateMs {
+                            let suggestedEnd = skipDBEditStart + Double(estimateMs) / 1000
+                            if abs(suggestedEnd - skipDBEditEnd) > 3 {
+                                Button {
+                                    skipDBEditEnd = (suggestedEnd * 10).rounded() / 10
+                                } label: {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "wand.and.stars").font(.caption2)
+                                        Text(skipDBFormatTime(suggestedEnd)).font(.caption2.monospacedDigit())
+                                    }
+                                    .foregroundStyle(.yellow.opacity(0.85))
+                                    .padding(.horizontal, 6).padding(.vertical, 3)
+                                    .background(.yellow.opacity(0.15), in: Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .skipDBTooltip("Typical intro end for this series (+\(Int(Double(estimateMs) / 1000))s from start)")
+                            }
+                        }
+                    }
+                }
+
+                Spacer()
+
+                // Right: preview + submit + close
+                HStack(spacing: 8) {
+                    Button {
+                        skipDBPreviewing = true
+                        coordinator.player?.seek(to: max(0, skipDBEditStart - 2))
+                        if isPaused { coordinator.player?.togglePause() }
+                    } label: {
+                        Image(systemName: skipDBPreviewing ? "stop.circle.fill" : "play.circle")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(skipDBPreviewing ? Color.yellow : .white)
+                            .padding(5)
+                    }
+                    .buttonStyle(.plain)
+                    .skipDBTooltip("Preview: plays 2s before start, jumps to end")
+
+                    if skipDBSubmitting {
+                        ProgressView().controlSize(.small).tint(.white).padding(.horizontal, 4)
+                    } else if skipDBSubmitResult == true {
+                        Label("Submitted!", systemImage: "checkmark.circle.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .onTapGesture { skipDBSubmitResult = nil }
+                    } else {
+                        Button {
+                            Task { await doSkipDBSubmit(meta: meta) }
+                        } label: {
+                            Text(alreadySubmitted ? "Resubmit" : "Submit")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.black)
+                                .padding(.horizontal, 10).padding(.vertical, 5)
+                                .background(alreadySubmitted ? Color.yellow : Color.white, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(skipDBEditStart >= skipDBEditEnd)
+                    }
+
+                    Button {
+                        showSkipDBEdit = false
+                        skipDBPreviewing = false
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.6))
+                            .padding(5)
+                    }
+                    .buttonStyle(.plain)
+                    .skipDBTooltip("Close editor")
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 2)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            if let err = skipDBSubmitError {
+                Text(err).font(.caption2).foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .padding(.horizontal, 8)
+    }
+
+    @ViewBuilder private func skipDBTimeControl(label: String, seconds: Binding<Double>, isEnd: Bool) -> some View {
+        HStack(spacing: 4) {
+            Button {
+                coordinator.player?.seek(to: seconds.wrappedValue)
+            } label: {
+                Text(label)
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            .buttonStyle(.plain)
+            .skipDBTooltip(isEnd ? "Jump to end" : "Jump to start")
+
+            Button {
+                let snapped = (currentTime * 10).rounded() / 10
+                seconds.wrappedValue = max(0, snapped)
+            } label: {
+                Image(systemName: "arrow.down.to.line")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .skipDBTooltip("Set to playhead")
+
+            Text(skipDBFormatTime(seconds.wrappedValue))
+                .font(.caption.monospacedDigit()).foregroundStyle(.white)
+                .frame(minWidth: 44, alignment: .center)
+
+            HStack(spacing: 2) {
+                skipDBNudgeButton(seconds: seconds, delta: -0.5, label: "−½")
+                skipDBNudgeButton(seconds: seconds, delta: -0.1, label: "−·")
+                skipDBNudgeButton(seconds: seconds, delta: +0.1, label: "+·")
+                skipDBNudgeButton(seconds: seconds, delta: +0.5, label: "+½")
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 4)
+        .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
+    }
+
+    @ViewBuilder private func skipDBNudgeButton(seconds: Binding<Double>, delta: Double, label: String) -> some View {
+        Button {
+            let cap = duration > 0 ? duration : Double.greatestFiniteMagnitude
+            seconds.wrappedValue = min(cap, max(0, seconds.wrappedValue + delta))
+        } label: {
+            Text(label)
+                .font(.system(size: 9, weight: .semibold).monospacedDigit())
+                .frame(width: 20, height: 20)
+                .background(.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+                .foregroundStyle(.white)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func skipDBFormatTime(_ sec: Double) -> String {
+        let total = max(0, sec)
+        let m = Int(total) / 60
+        let s = total - Double(m * 60)
+        return String(format: "%d:%04.1f", m, s)
+    }
+
+    fileprivate struct SkipDBHoverTooltip: ViewModifier {
+        let text: String
+        @State private var hovered = false
+        func body(content: Content) -> some View {
+            content
+                .onHover { hovered = $0 }
+                .overlay(alignment: .top) {
+                    if hovered {
+                        Text(text)
+                            .font(.system(size: 10))
+                            .lineLimit(1)
+                            .padding(.horizontal, 6).padding(.vertical, 3)
+                            .background(.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 4))
+                            .foregroundStyle(.white)
+                            .fixedSize()
+                            .offset(y: -20)
+                            .allowsHitTesting(false)
+                            .transition(.opacity)
+                            .zIndex(999)
+                    }
+                }
+        }
+    }
+
+    /// Submit the edited segment. Always goes keyless to skip.vortx.tv; also to skipdb.tv when the
+    /// user has a community key (best-effort, handled inside SkipDBClient). Credits map to "outro"
+    /// via the editor's SegmentType raw value.
+    private func doSkipDBSubmit(meta: PlaybackMeta) async {
+        skipDBSubmitting = true
+        skipDBSubmitError = nil
+        let effectiveEnd = (!skipDBShowEndTime && duration > 0) ? duration : skipDBEditEnd
+        let req = SkipDBClient.SubmitRequest(
+            imdb_id: meta.libraryId,
+            season: meta.season,
+            episode: meta.episode,
+            segment_type: skipDBEditType.rawValue,
+            start_ms: Int(skipDBEditStart * 1000),
+            end_ms: Int(effectiveEnd * 1000),
+            duration_ms: duration > 0 ? Int(duration * 1000) : nil
+        )
+        do {
+            try await SkipDBClient.submit(req)
+            await SkipDBClient.invalidateCache(imdbId: meta.libraryId, season: meta.season,
+                                               episode: meta.episode, durationSeconds: duration)
+            let key = "\(meta.libraryId):\(meta.season ?? 0):\(meta.episode ?? 0):\(skipDBEditType.rawValue)"
+            skipDBSubmittedKeys.insert(key)
+            skipDBSubmitResult = true
+            skipFetchKey = ""
+            fetchSkipTimestamps()
+        } catch {
+            skipDBSubmitResult = false
+            skipDBSubmitError = error.localizedDescription
+        }
+        skipDBSubmitting = false
+    }
+    #endif
 
     /// The Live position indicator shown in place of the scrubber: a pulsing red dot + "LIVE", and a
     /// running elapsed timer so the user can still see playback is advancing.
@@ -1562,6 +2032,11 @@ struct PlayerScreen: View {
             guard !Task.isCancelled, skipFetchKey == key else { return }
             apiSkipCandidates = found
             refreshSkipSegments()
+            #if !os(tvOS)
+            // Typical-intro-length hint (from the optional skipdb.tv read), surfaced as the editor's
+            // "magic" suggested end. Keyed like the skipDB cache entry.
+            skipDBIntroEstimateMs = await SkipTimestampStore.shared.introEstimate(for: "skipdb:\(key):\(Int(dur / 10) * 10)")
+            #endif
         }
     }
 
@@ -2020,7 +2495,19 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
-        if !effectivelyLive, duration > 0 { onProgress(currentTime, duration) }
+        if !effectivelyLive, duration > 0 {
+            onProgress(currentTime, duration)
+            // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The
+            // engine keeps any item with time_offset > 0 in the rail, so a title watched to the credits then
+            // closed by hand would linger there forever (the "CW never clears" report). Rewind it OUT of CW,
+            // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
+            if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
+        }
+        // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
+        // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
+        // guardrail). No-op when the disk cache is off or empty. Genuine-exit path only; additive,
+        // does not touch player teardown.
+        DiskCacheSetting.clearCache()
         onClose()
     }
 
@@ -2099,7 +2586,7 @@ struct PlayerScreen: View {
             // Never auto-hide before the first frame arrives: a stuck pre-start load must KEEP its
             // controls (and their close button) on screen so the player is never a trap. Also hold
             // while scrubbing, a panel is open, or paused.
-            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused else { return }
+            guard !Task.isCancelled, hasStartedPlaying, !scrubbing, panel == nil, !isPaused, !skipEditActive else { return }
             withAnimation(.easeInOut(duration: 0.2)) { controlsVisible = false }
         }
     }
@@ -2112,3 +2599,11 @@ struct PlayerScreen: View {
         return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
     }
 }
+
+#if !os(tvOS)
+private extension View {
+    func skipDBTooltip(_ text: String) -> some View {
+        modifier(PlayerScreen.SkipDBHoverTooltip(text: text))
+    }
+}
+#endif

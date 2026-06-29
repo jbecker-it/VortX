@@ -47,6 +47,12 @@ jobs:
           XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
           echo "Selecting $XCODE"
           sudo xcode-select -s "$XCODE"
+          # Pin it for EVERY later step via DEVELOPER_DIR (xcodebuild honors it over the global
+          # xcode-select state), so a runner-image default flip or the disk-free cleanup can never
+          # drop the build onto /Library/Developer/CommandLineTools (the Beta-13 build-126 failure).
+          # SELECTED_XCODE guards the cleanup step so it can't delete the Xcode we just selected.
+          echo "DEVELOPER_DIR=$XCODE/Contents/Developer" >> "$GITHUB_ENV"
+          echo "SELECTED_XCODE=$XCODE" >> "$GITHUB_ENV"
 
       - name: Show toolchain
         id: toolchain
@@ -55,6 +61,21 @@ jobs:
           xcrun --sdk appletvos --show-sdk-version
           echo "xcode_version=$(xcodebuild -version | tr ' \n' '-')" >> "$GITHUB_OUTPUT"
           echo "tvos_sdk=$(xcrun --sdk appletvos --show-sdk-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space (device-only build, no simulators needed)
+        run: |
+          echo "Before:"; df -h /
+          # The runner ships multiple Xcodes + every simulator runtime (tens of GB). We build for DEVICE
+          # only (never the simulator), so the simulator runtimes are pure dead weight, and only the active
+          # Xcode is used. Freeing them gives `hdiutil` room to build the macOS .dmg, which failed with
+          # "No space left on device" on the Beta-12 cut (four MPVKit-GPL apps fill the disk).
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/* || true
+          sudo rm -rf ~/Library/Developer/Xcode/DerivedData/* || true
+          # Keep the Xcode selected above ($SELECTED_XCODE from GITHUB_ENV); never delete the active one
+          # by re-deriving its path (the brittle string-compare that deleted it on build 126).
+          for x in /Applications/Xcode_*.app; do [ "$x" = "$SELECTED_XCODE" ] || sudo rm -rf "$x"; done
+          echo "After:"; df -h /
 
       - name: Install XcodeGen
         run: brew install xcodegen

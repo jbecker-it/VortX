@@ -20,6 +20,7 @@ struct iOSSettingsView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
     @ObservedObject private var pinStore = SourcePinStore.shared
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @State private var serverOnline: Bool?
     @State private var editingProfile: UserProfile?
     @State private var pendingDelete: UserProfile?   // context-menu delete confirmation target
@@ -47,10 +48,17 @@ struct iOSSettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
-    #if os(iOS)
+    // Streaming/seek cache budget, stored as a raw byte count (0 = Off, -1 = Unlimited). @AppStorage is
+    // Int-typed; Int is 64-bit on every Apple device this runs on, so the byte budgets are exact.
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
+    #if os(iOS) || os(macOS)
     @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     #endif
     @AppStorage("stremiox.autoSkip") private var autoSkip = false
+    @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true   // share/fetch scrub previews
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
     // Empty string == built-in libmpv player; otherwise an ExternalPlayer.Target id to auto-open in.
@@ -58,8 +66,16 @@ struct iOSSettingsView: View {
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip-button step in seconds; String to match the player + the picker tags
     @AppStorage(NewEpisodeNotifications.enabledKey) private var notifyNewEpisodes = true
     @AppStorage("stremiox.autoLandscapeInPlayer") private var autoLandscapeInPlayer = true
+    // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category
+    // and a Stremio removal never removes it from VortX; ON = VortX tracks Stremio for that category.
+    @AppStorage(MirrorSettings.addonsKey) private var mirrorAddons = false
+    @AppStorage(MirrorSettings.libraryKey) private var mirrorLibrary = false
+    @AppStorage(MirrorSettings.continueWatchingKey) private var mirrorCW = false
     /// App-language override ("system" = follow the device). Applied via AppLanguage; needs a relaunch.
     @State private var langSelection: String = AppLanguage.current ?? "system"
+    /// Shown after a language pick to offer the relaunch that actually applies it (the localized bundle is
+    /// chosen once at launch, so the change is invisible until the app quits and reopens).
+    @State private var pendingLangRestart = false
 
     // Backup & Restore: carry local settings across the StremioX -> VortX move (see SettingsBackup).
     @State private var showBackupExporter = false
@@ -81,13 +97,14 @@ struct iOSSettingsView: View {
                 // as warm dark surfaces with canvas showing between them, matching the rest of the app
                 // (and identical on iPadOS, which shares this view).
                 profilesSection.listRowBackground(Theme.Palette.surface1)
+                languageSection.listRowBackground(Theme.Palette.surface1)
                 accountSection.listRowBackground(Theme.Palette.surface1)
+                stremioMirrorSection.listRowBackground(Theme.Palette.surface1)
                 playbackSection.listRowBackground(Theme.Palette.surface1)
                 notificationsSection.listRowBackground(Theme.Palette.surface1)
                 streamsSection.listRowBackground(Theme.Palette.surface1)
                 serverSection.listRowBackground(Theme.Palette.surface1)
                 appearanceSection.listRowBackground(Theme.Palette.surface1)
-                languageSection.listRowBackground(Theme.Palette.surface1)
                 audioSubtitleSection.listRowBackground(Theme.Palette.surface1)
                 subtitleSection.listRowBackground(Theme.Palette.surface1)
                 advancedSection.listRowBackground(Theme.Palette.surface1)
@@ -112,10 +129,10 @@ struct iOSSettingsView: View {
                           contentType: .json, defaultFilename: SettingsBackup.defaultFilename()) { result in
                 switch result {
                 case .success:
-                    backupAlert = BackupAlert(title: "Backup Saved",
-                        message: "Keep this file safe. Restore it in VortX to bring your settings across.")
+                    backupAlert = BackupAlert(title: String(localized: "Backup Saved"),
+                        message: String(localized: "Keep this file safe. Restore it in VortX to bring your settings across."))
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Backup Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Backup Failed"), message: error.localizedDescription)
                 }
             }
             .fileImporter(isPresented: $showBackupImporter, allowedContentTypes: [.json]) { result in
@@ -125,13 +142,13 @@ struct iOSSettingsView: View {
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let count = try SettingsBackup.restore(from: try Data(contentsOf: url))
-                        backupAlert = BackupAlert(title: "Restore Complete",
+                        backupAlert = BackupAlert(title: String(localized: "Restore Complete"),
                             message: "\(count) settings restored. Relaunch the app to apply everything.")
                     } catch {
-                        backupAlert = BackupAlert(title: "Restore Failed", message: error.localizedDescription)
+                        backupAlert = BackupAlert(title: String(localized: "Restore Failed"), message: error.localizedDescription)
                     }
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Restore Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Restore Failed"), message: error.localizedDescription)
                 }
             }
             .fileExporter(isPresented: $showLibraryExporter, document: libraryDocument,
@@ -139,10 +156,10 @@ struct iOSSettingsView: View {
                           defaultFilename: LibraryPortability.defaultFilename(profile: profiles.active?.name ?? "Library")) { result in
                 switch result {
                 case .success:
-                    backupAlert = BackupAlert(title: "Library Exported",
-                        message: "Saved this profile's titles and watch history. Import it on another device or into another profile.")
+                    backupAlert = BackupAlert(title: String(localized: "Library Exported"),
+                        message: String(localized: "Saved this profile's titles and watch history. Import it on another device or into another profile."))
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Export Failed"), message: error.localizedDescription)
                 }
             }
             .fileImporter(isPresented: $showLibraryImporter, allowedContentTypes: [.json]) { result in
@@ -152,20 +169,20 @@ struct iOSSettingsView: View {
                         let scoped = url.startAccessingSecurityScopedResource()
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let items = try LibraryPortability.decode(from: try Data(contentsOf: url))
-                        let target = profiles.active?.name ?? "this profile"
+                        let target = profiles.active?.name ?? String(localized: "this profile")
                         Task {
                             let result = await profiles.importLibraryItems(items)
                             var message = "\(result.applied) \(result.applied == 1 ? "title" : "titles") added to \(target)."
                             if result.skipped > 0 {
                                 message += " \(result.skipped) \(result.skipped == 1 ? "title was" : "titles were") skipped: only standard catalog titles can be added to the main profile's account library."
                             }
-                            backupAlert = BackupAlert(title: "Library Imported", message: message)
+                            backupAlert = BackupAlert(title: String(localized: "Library Imported"), message: message)
                         }
                     } catch {
-                        backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
+                        backupAlert = BackupAlert(title: String(localized: "Import Failed"), message: error.localizedDescription)
                     }
                 case .failure(let error):
-                    backupAlert = BackupAlert(title: "Import Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Import Failed"), message: error.localizedDescription)
                 }
             }
             .alert(item: $backupAlert) { info in
@@ -295,11 +312,18 @@ struct iOSSettingsView: View {
             }
             .onChange(of: langSelection) { newValue in
                 AppLanguage.set(newValue == "system" ? nil : newValue)
+                pendingLangRestart = true
             }
         } header: {
             Text("Language")
         } footer: {
-            Text("Choose the app's language. \"System Default\" follows your device language. A change takes full effect the next time you quit and reopen VortX.")
+            Text("Choose the app's language. \"System Default\" follows your device language. VortX must quit and reopen to apply a new language.")
+        }
+        .confirmationDialog("Apply language?", isPresented: $pendingLangRestart, titleVisibility: .visible) {
+            Button("Quit Now", role: .destructive) { exit(0) }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("VortX needs to quit and reopen to display the app in the new language. Reopen it after it closes.")
         }
     }
 
@@ -312,7 +336,7 @@ struct iOSSettingsView: View {
             NavigationLink("VortX account & sync") { SyncSettingsView() }
             if account.isSignedIn {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(account.email ?? "Signed in")
+                    Text(account.email ?? String(localized: "Signed in"))
                     Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
@@ -327,7 +351,24 @@ struct iOSSettingsView: View {
             NavigationLink("Import from Stremio") { StremioImportView() }
             NavigationLink("Metadata (TMDB, MDBList)") { MetadataKeysView() }
             NavigationLink("Debrid services") { DebridKeysView() }
-            NavigationLink("Ratings on posters (XRDB)") { XRDBSettingsView() }
+            NavigationLink("Poster artwork (ERDB, ratings)") { XRDBSettingsView() }
+        }
+    }
+
+    // MARK: Stremio mirror
+
+    /// Per-category control of whether VortX mirrors a connected Stremio account. Default OFF for all
+    /// three = VortX owns its own add-ons / library / Continue Watching: Stremio removals never remove
+    /// them from VortX. Turn one ON to make VortX track Stremio for that category (adds and removes).
+    @ViewBuilder private var stremioMirrorSection: some View {
+        Section {
+            Toggle("Mirror add-ons from Stremio", isOn: $mirrorAddons).tint(Theme.Palette.accent)
+            Toggle("Mirror library from Stremio", isOn: $mirrorLibrary).tint(Theme.Palette.accent)
+            Toggle("Mirror Continue Watching from Stremio", isOn: $mirrorCW).tint(Theme.Palette.accent)
+        } header: {
+            Text("Stremio mirror")
+        } footer: {
+            Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
         }
     }
 
@@ -354,10 +395,15 @@ struct iOSSettingsView: View {
             Picker("Video upscaling", selection: $videoUpscaling) {
                 ForEach(VideoUpscaling.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
-            #if os(iOS)
+            Picker("Streaming cache", selection: $diskCacheBytes) {
+                ForEach(DiskCacheSetting.pickerOptions, id: \.id) { Text($0.label).tag(Int($0.id)) }
+            }
+            #if os(iOS) || os(macOS)
             Picker("Player engine", selection: $playerEngine) {
                 ForEach(PlayerEngineRouter.Override.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) }
             }
+            Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture) and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
+                .font(.caption).foregroundStyle(.secondary)
             #endif
             Picker("Skip step", selection: $seekStep) {
                 ForEach(["10", "15", "30"], id: \.self) { Text("\($0)s").tag($0) }
@@ -370,6 +416,10 @@ struct iOSSettingsView: View {
                 Text("Both").tag("both")
             }
             NavigationLink("Seek bar style") { SeekBarStylePicker() }
+            Toggle("Community scrub previews", isOn: $communityTrickplay)
+                .tint(Theme.Palette.accent)
+            Text("Share and reuse scrub-preview thumbnails across the community, so previews appear instantly without each device regenerating them. Only the generated thumbnails are shared, never any account data.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Autoplay trailers", isOn: $autoplayTrailers)
                 .tint(Theme.Palette.accent)
             #if os(iOS)
@@ -391,10 +441,11 @@ struct iOSSettingsView: View {
         } footer: {
             VStack(alignment: .leading, spacing: 4) {
                 Text(PlaybackSettings.directLinksOnlyForced
-                     ? "This build does not bundle the torrent engine. Only direct and debrid links can play."
-                     : "Hide torrent and magnet sources. Only direct and debrid links will play.")
+                     ? String(localized: "This build does not bundle the torrent engine. Only direct and debrid links can play.")
+                     : String(localized: "Hide torrent and magnet sources. Only direct and debrid links will play."))
                 Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
+                Text(diskCacheFooter)
                 if !installedExternalPlayers.isEmpty {
                     Text("Direct and debrid streams open straight in your chosen player, which then handles playback and resume. Torrents, header-protected sources, and trailers always use the built-in player.")
                 }
@@ -423,6 +474,15 @@ struct iOSSettingsView: View {
     private var installedExternalPlayers: [ExternalPlayer.Target] { ExternalPlayer.installed }
 
     private var effectiveDirectLinksOnly: Bool { PlaybackSettings.directLinksOnly }
+
+    /// Explains the streaming cache and, when on, shows the live on-disk usage. Unlimited is always
+    /// capped at half of free disk and cleared when a title finishes, so it can never fill the device.
+    private var diskCacheFooter: String {
+        let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free space and the cache clears when a title finishes, so it never fills your device.")
+        guard diskCacheBytes != 0 else { return base }
+        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
+        return base + "\n" + String(localized: "Current cache: \(usage).")
+    }
 
     /// Direct Links Only writes the flat key; turning it OFF cold-starts the embedded server so
     /// torrents work again without a relaunch (guarded out of the Lite build that ships no server).
@@ -528,8 +588,8 @@ struct iOSSettingsView: View {
                 #endif
             Toggle("Match words as regex", isOn: $sourcePrefs.keywordsAreRegex).tint(Theme.Palette.accent)
             Text(sourcePrefs.keywordsAreRegex
-                 ? "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored."
-                 : "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns.")
+                 ? String(localized: "Hide / Require are case-insensitive regex patterns (e.g. require 2160p.*(remux|bluray), hide \\b(cam|ts)\\b). An invalid pattern is ignored.")
+                 : String(localized: "Hide / Require match comma-separated words in the source name. Turn on regex for full patterns."))
                 .font(.footnote).foregroundStyle(.secondary)
             Toggle("Instant sources only", isOn: $sourcePrefs.instantOnly).tint(Theme.Palette.accent)
             Toggle("Hide dead torrents", isOn: $sourcePrefs.hideDeadTorrents).tint(Theme.Palette.accent)
@@ -643,8 +703,8 @@ struct iOSSettingsView: View {
         } footer: {
             if effectiveDirectLinksOnly {
                 Text(PlaybackSettings.directLinksOnlyForced
-                     ? "This build does not bundle the streaming server."
-                     : "Direct Links Only is enabled, so torrent streaming and server configuration are inactive.")
+                     ? String(localized: "This build does not bundle the streaming server.")
+                     : String(localized: "Direct Links Only is enabled, so torrent streaming and server configuration are inactive."))
             }
         }
     }
@@ -712,24 +772,36 @@ struct iOSSettingsView: View {
         }
     }
     private var serverText: String {
-        if effectiveDirectLinksOnly { return "Disabled by Direct Links Only" }
+        if effectiveDirectLinksOnly { return String(localized: "Disabled by Direct Links Only") }
         switch serverOnline {
-        case .some(true): return "Online"
-        case .some(false): return "Offline"
-        default: return "Checking…"
+        case .some(true): return String(localized: "Online")
+        case .some(false): return String(localized: "Offline")
+        default: return String(localized: "Checking…")
         }
     }
     private var serverBadgeText: String {
         if effectiveDirectLinksOnly {
-            return PlaybackSettings.directLinksOnlyForced ? "NOT BUNDLED" : "DISABLED"
+            return PlaybackSettings.directLinksOnlyForced ? String(localized: "NOT BUNDLED") : String(localized: "DISABLED")
         }
-        return StremioServer.isCustom ? "CUSTOM" : "EMBEDDED"
+        return StremioServer.isCustom ? String(localized: "CUSTOM") : String(localized: "EMBEDDED")
     }
 
     // MARK: Appearance
 
     @ViewBuilder private var appearanceSection: some View {
         Section {
+            // Placed first so the Live TV tab toggle is easy to find at the top of Appearance
+            // (it was previously buried below all the pickers and steppers).
+            Toggle("Show Live TV tab", isOn: Binding(get: { !hideLiveTab }, set: { hideLiveTab = !$0 }))
+            // The built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.) are Cinemeta-
+            // backed and show even with no add-ons installed; this hides them (the "extra catalogs I
+            // cannot remove from Home" report).
+            Toggle("Show editorial Home rows", isOn: $showCuratedRails)
+            // Browse-by-streaming-service rails (Netflix, Disney+, ...), from TMDB watch providers; needs a TMDB key.
+            Toggle("Show streaming-service rows", isOn: $showStreamingRails)
+            // Cinematic 16:9 landscape catalog cards (clean TMDB backdrops) vs the legacy portrait posters.
+            Toggle("Cinematic landscape cards", isOn: $catalogPrefs.landscapeCards)
+
             // ThemeAccentPicker / ThemeBackgroundPicker are tvOS-only (declared in SourcesTV); on
             // iOS we bind native Pickers to the SAME ThemeManager state (accentID, oled).
             Picker("Accent", selection: $theme.accentID) {
@@ -869,7 +941,7 @@ struct iOSSettingsView: View {
                     backupDocument = BackupDocument(data: try SettingsBackup.makeBackup())
                     showBackupExporter = true
                 } catch {
-                    backupAlert = BackupAlert(title: "Backup Failed", message: error.localizedDescription)
+                    backupAlert = BackupAlert(title: String(localized: "Backup Failed"), message: error.localizedDescription)
                 }
             } label: {
                 Label("Create Backup", systemImage: "arrow.up.doc")
@@ -902,8 +974,8 @@ struct iOSSettingsView: View {
     private func exportActiveLibrary() {
         let items = profiles.exportActiveLibraryItems()
         guard !items.isEmpty else {
-            backupAlert = BackupAlert(title: "Nothing to Export",
-                message: "This profile has no saved titles or watch history yet.")
+            backupAlert = BackupAlert(title: String(localized: "Nothing to Export"),
+                message: String(localized: "This profile has no saved titles or watch history yet."))
             return
         }
         do {
@@ -911,7 +983,7 @@ struct iOSSettingsView: View {
             libraryDocument = BackupDocument(data: data)
             showLibraryExporter = true
         } catch {
-            backupAlert = BackupAlert(title: "Export Failed", message: error.localizedDescription)
+            backupAlert = BackupAlert(title: String(localized: "Export Failed"), message: error.localizedDescription)
         }
     }
 
@@ -928,7 +1000,7 @@ struct iOSSettingsView: View {
                 }
             }
             LabeledContent("Version", value: appVersion)
-            LabeledContent("Player", value: "libmpv · MPVKit")
+            LabeledContent("Player", value: String(localized: "libmpv · MPVKit"))
         }
     }
 
@@ -1010,7 +1082,7 @@ private struct ServerLogView: View {
                     UIPasteboard.general.string = status + "\n\n" + lines.joined(separator: "\n")
                     copied = true
                 } label: {
-                    Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+                    Label(copied ? String(localized: "Copied") : String(localized: "Copy"), systemImage: copied ? "checkmark" : "doc.on.doc")
                 }
             }
         }
@@ -1117,17 +1189,10 @@ enum NewEpisodeNotifications {
 
     /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
     /// answers. Never touches the engine. nil if none decode.
+    /// The implementation moved to the OS-agnostic `SeriesMetaFetcher` (SourcesShared) so the shared
+    /// `ReleaseCalendarModel` reuses the EXACT same fetch and the tvOS targets — which don't compile this
+    /// SourcesiOS file — can reach it. This thin shim keeps the existing callers unchanged; behavior is identical.
     static func fetchSeriesMeta(id: String, bases: [String]) async -> CoreMetaItem? {
-        struct Wrap: Decodable { let meta: CoreMetaItem? }
-        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
-        for base in bases {
-            guard let url = URL(string: "\(base)/meta/series/\(escaped).json") else { continue }
-            var req = URLRequest(url: url); req.timeoutInterval = 12
-            if let (data, _) = try? await URLSession.shared.data(for: req),
-               let wrap = try? JSONDecoder().decode(Wrap.self, from: data), let meta = wrap.meta {
-                return meta
-            }
-        }
-        return nil
+        await SeriesMetaFetcher.fetch(id: id, bases: bases)
     }
 }

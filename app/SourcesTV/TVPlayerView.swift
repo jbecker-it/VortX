@@ -15,6 +15,8 @@ struct TVPlayerView: View {
     var torrent: Bool = false                  // stream rides the embedded torrent engine (gets warm-up patience)
     var bingeGroup: String? = nil              // the launching stream's release-group tag, for sticky auto-next
     var headers: [String: String]? = nil       // HTTP headers the stream's add-on requires (proxyHeaders)
+    var forceMPV: Bool = false                 // last-resort escape hatch: skip AVPlayer routing, mount libmpv directly
+    var isTrailer: Bool = false                // FIX I: a trailer clip, not a content stream → never fail over to engine streams
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -35,7 +37,8 @@ struct TVPlayerView: View {
     @State private var isPaused = false
     @State private var currentTime = 0.0
     @State private var duration = 0.0
-    @State private var videoHeight = 0          // metadata line: encoded height (2160 -> "4K")
+    @State private var videoWidth = 0           // metadata line: encoded width (resolution is by WIDTH, so 2.40:1 4K is not mislabeled 1440p)
+    @State private var videoHeight = 0          // metadata line: encoded height
     @State private var audioCodec = ""          // metadata line: active audio codec (e.g. "eac3")
     @State private var isHDR = false            // metadata line: HDR/DV detected (sig-peak > 1)
     @State private var resumeSeconds: Double? = nil   // nil until fetched; applied once duration known
@@ -81,7 +84,22 @@ struct TVPlayerView: View {
     @State private var panelRows: [OptionRow] = []
     @State private var loadFailed = false              // playback couldn't start
     @State private var loadErrorMsg = ""
+    /// CW-resume only: set once we've waited for a freshly-loaded source after the stored link failed, so the
+    /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
+    @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
+    // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
+    // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
+    @State private var avEngineFailed = false
+    // AVPlayer-only START watchdog: AVPlayer can mount, show the chrome, and silently never produce a
+    // playable frame (no item error, no timePos tick). The real fix is in AVPlayerEngineController
+    // (automaticallyWaitsToMinimizeStalling = false + explicit play() + the [.initial,.new] status race fix),
+    // so a working stream now starts within a second or two; this watchdog is only the SAFETY NET for a
+    // genuinely stuck stream, set generously so a slow 4K / Dolby Vision start is never killed mid-buffer. It
+    // routes to the SAME libmpv fallback the .failed case uses. AVPlayer-only: libmpv torrents warm up longer.
+    @State private var avStartWatchdog: Task<Void, Never>?
+    private let avStartWatchdogSeconds: Double = 12
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -165,75 +183,7 @@ struct TVPlayerView: View {
         ZStack(alignment: .bottom) {
             Color.black.ignoresSafeArea()
 
-            MPVMetalPlayerView(coordinator: coordinator)
-                .play(initialPlayback.url, headers: initialPlayback.headers)
-                .live(initialLiveMode)
-                .onPropertyChange { _, name, data in
-                    switch name {
-                    case MPVProperty.pausedForCache: if let b = data as? Bool { buffering = b }
-                    case MPVProperty.pause:
-                        if let b = data as? Bool {
-                            isPaused = b
-                            UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
-                            if b { saveProgress(at: currentTime) }   // persist on pause
-                        }
-                    case MPVProperty.timePos:
-                        if let d = data as? Double {
-                            if d > 0, !hasStartedPlaying {            // playback actually began
-                                hasStartedPlaying = true; loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
-                                autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
-                                // Live has no resumable position, so don't seed Continue-Watching direct-resume
-                                // for it (mirrors PlayerScreen.recordLastStream's live guard).
-                                if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
-                                    LastStreamStore.record(libraryId: m.libraryId, entry: .init(
-                                        videoId: m.videoId, url: u.absoluteString, title: curTitle,
-                                        season: m.season, episode: m.episode, name: m.name,
-                                        poster: m.poster, type: m.type, qualityText: curHint,
-                                        torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
-                                        profileID: ProfileStore.shared.activeID)
-                                }
-                            }
-                            currentTime = d
-                            updateCurrentSkip(at: d)
-                            maybeCaptureLocalTrickplay(at: d)
-                            // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
-                            // to the engine — a live stream has no meaningful watch position.
-                            if !isCurrentLiveStream, lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
-                                lastSaved = d
-                                saveProgress(at: d)
-                                core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
-                            }
-                            if !markedWatched, duration > 0, d / duration >= 0.9, let m = curMeta {
-                                markedWatched = true            // ~90% in → flip the watched marker live
-                                core.markPlaybackWatched(m)
-                            }
-                            if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
-                            if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
-                        }
-                    case MPVProperty.videoParamsSigPeak:
-                        if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
-                    case MPVProperty.duration:
-                        if let d = data as? Double { duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles() }
-                    case MPVProperty.trackList:
-                        refreshTracks()
-                        let s = coordinator.player?.mediaSummary()
-                        videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
-                        metadataLine = computeMetadataLine()
-                        if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
-                            appliedAutoTracks = true
-                            autoSelectTracks()
-                        }
-                    case MPVProperty.endFileError:
-                        loadTimeout?.cancel()
-                        if !hasStartedPlaying { handleLoadFailure((data as? String) ?? "") }
-                    case MPVProperty.endFileEof:
-                        if handleLiveStreamEOF() { break }
-                        if !markedWatched, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
-                        autoAdvance()                                // episode finished → play next, else exit
-                    default: break
-                    }
-                }
-                .ignoresSafeArea()
+            playerSurface
 
             // UIKit owns ALL remote input. Presented in a dedicated key window so the focus engine has no
             // competitor and every press falls through to here. Swipes come via the pan recognizer.
@@ -308,7 +258,11 @@ struct TVPlayerView: View {
             }
         }
         .onDisappear {
-            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel()
+            hideTask?.cancel(); loadTimeout?.cancel(); recoveryDeadline?.cancel(); autoRetryTask?.cancel(); skipFetchTask?.cancel(); stallWatchdog?.cancel(); avStartWatchdog?.cancel()
+            // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
+            // (first-writer-wins, background, gated; no-op if the community already had a set, or on AVPlayer
+            // which captures nothing). Independent of the engine-teardown rules below.
+            scrubThumbnails.finishAndUploadIfNeeded(srcHeight: videoHeight)
             saveProgress(at: currentTime)   // no-op for live
             if !isCurrentLiveStream {
                 core.reportProgress(timeSeconds: currentTime, durationSeconds: duration)   // flush final position (never for live)
@@ -324,6 +278,127 @@ struct TVPlayerView: View {
             // preventing any leak (an app the system kills while suspended takes the server, and every
             // engine with it, down too). In-session leaks are covered by the switch / advance / exit paths.
             UIApplication.shared.isIdleTimerDisabled = false   // let the screensaver resume once the player closes
+        }
+    }
+
+    // MARK: - Video surface (engine-routed under the same chrome)
+
+    /// Whether to mount the AVFoundation engine instead of libmpv for this stream (#76). Routes on the RAW
+    /// (un-proxied) launch URL: torrents and loopback URLs always stay on libmpv (the router enforces this),
+    /// and Dolby Vision in an AVPlayer-playable container / remote HLS auto-routes to AVPlayer for true DV
+    /// passthrough, AirPlay, and Picture in Picture. On an AVPlayer load failure we fall back to libmpv for
+    /// this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text (`sourceHint`).
+    private var useAVPlayerEngine: Bool {
+        if forceMPV || avEngineFailed { return false }   // escape hatch / an AVPlayer load failure fell back to libmpv
+        let loopback = url.host == "127.0.0.1" || url.host == "localhost"
+        let isDV = StreamRanking.isDolbyVision(sourceHint ?? "")
+        return PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV) == .avfoundation
+    }
+
+    /// The video surface: the AVFoundation engine when routed there, otherwise libmpv. Both bind to the same
+    /// Coordinator and feed the same `handleProperty`, so the surrounding chrome drives either unchanged. This
+    /// mirrors `PlayerScreen.playerSurface` on iOS / macOS.
+    @ViewBuilder private var playerSurface: some View {
+        if useAVPlayerEngine {
+            AVPlayerEngineView(coordinator: coordinator)
+                .play(initialPlayback.url, headers: initialPlayback.headers)
+                .live(initialLiveMode)
+                .onPropertyChange { _, name, data in handleProperty(name, data) }
+                .ignoresSafeArea()
+        } else {
+            MPVMetalPlayerView(coordinator: coordinator)
+                .play(initialPlayback.url, headers: initialPlayback.headers)
+                .live(initialLiveMode)
+                .onPropertyChange { _, name, data in handleProperty(name, data) }
+                .ignoresSafeArea()
+        }
+    }
+
+    /// Whether the active player engine is AVFoundation (so the chrome can hide the rows AVPlayer has no
+    /// equivalent for: external add-on subtitles, trickplay frame capture).
+    private var isAVPlayerActive: Bool { coordinator.player is AVPlayerEngineController }
+
+    // MARK: - Property handling (shared by both engines via the MPVProperty event bus)
+
+    private func handleProperty(_ name: String, _ data: Any?) {
+        switch name {
+        case MPVProperty.pausedForCache: if let b = data as? Bool { buffering = b }
+        case MPVProperty.pause:
+            if let b = data as? Bool {
+                isPaused = b
+                UIApplication.shared.isIdleTimerDisabled = !b   // hold the TV awake while playing; let it sleep when paused
+                if b { saveProgress(at: currentTime) }   // persist on pause
+            }
+        case MPVProperty.timePos:
+            if let d = data as? Double {
+                if d > 0, !hasStartedPlaying {            // playback actually began
+                    hasStartedPlaying = true; loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
+                    avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
+                    autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
+                    // Live has no resumable position, so don't seed Continue-Watching direct-resume
+                    // for it (mirrors PlayerScreen.recordLastStream's live guard).
+                    if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
+                        LastStreamStore.record(libraryId: m.libraryId, entry: .init(
+                            videoId: m.videoId, url: u.absoluteString, title: curTitle,
+                            season: m.season, episode: m.episode, name: m.name,
+                            poster: m.poster, type: m.type, qualityText: curHint,
+                            torrent: curIsTorrent, savedAt: Date(), headers: curHeaders),
+                            profileID: ProfileStore.shared.activeID)
+                    }
+                }
+                currentTime = d
+                updateCurrentSkip(at: d)
+                maybeCaptureLocalTrickplay(at: d)
+                // Live: no progress is persisted (saveProgress no-ops) and nothing is reported
+                // to the engine — a live stream has no meaningful watch position.
+                if !isCurrentLiveStream, lastSaved < 0 || abs(d - lastSaved) >= 20 {   // persist ~every 20s
+                    lastSaved = d
+                    saveProgress(at: d)
+                    core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
+                }
+                if !markedWatched, duration > 0, d / duration >= 0.9, let m = curMeta {
+                    markedWatched = true            // ~90% in → flip the watched marker live
+                    core.markPlaybackWatched(m)
+                }
+                if duration > 0, d / duration >= 0.5 { preloadNextIfNeeded() }   // halfway → ready the next episode
+                if duration > 0, duration - d <= 100 { warmNextIfReady() }       // near the end → wake the provider
+            }
+        case MPVProperty.videoParamsSigPeak:
+            if let p = data as? Double { isHDR = p > 1.0; metadataLine = computeMetadataLine() }
+        case MPVProperty.duration:
+            if let d = data as? Double {
+                duration = d; maybeResume(); refreshSkipSegments(); fetchSkipTimestamps(); fetchAddonSubtitles()
+                // Community trickplay: fetch any shared sprite-sheet for this exact cut once the duration is
+                // known (fail-soft -> the existing local capture). Acts once per title.
+                if d > 0, let m = curMeta {
+                    scrubThumbnails.configureCommunity(imdbId: m.libraryId, season: m.season, episode: m.episode, duration: d)
+                }
+            }
+        case MPVProperty.trackList:
+            refreshTracks()
+            let s = coordinator.player?.mediaSummary()
+            videoWidth = s?.width ?? 0; videoHeight = s?.height ?? 0; audioCodec = s?.audioCodec ?? ""
+            metadataLine = computeMetadataLine()
+            if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
+                appliedAutoTracks = true
+                autoSelectTracks()
+            }
+        case MPVProperty.endFileError:
+            loadTimeout?.cancel()
+            if !hasStartedPlaying {
+                // #76: an AVPlayer item failure before playback started (e.g. a Profile 7 DV remux or a
+                // Matroska AVFoundation cannot demux) demotes to libmpv IN PLACE: flipping `avEngineFailed`
+                // re-renders `playerSurface` to the mpv surface on the SAME view, which re-loads the stream.
+                // This is the true last resort the owner asked for, replacing the heavyweight forceMPV window
+                // rebuild for the common case. Genuine mpv failures fall through to the existing recovery.
+                if demoteAVPlayerToMPV() { return }
+                handleLoadFailure((data as? String) ?? "")
+            }
+        case MPVProperty.endFileEof:
+            if handleLiveStreamEOF() { break }
+            if !markedWatched, let m = curMeta { markedWatched = true; core.markPlaybackWatched(m) }
+            autoAdvance()                                // episode finished → play next, else exit
+        default: break
         }
     }
 
@@ -538,12 +613,16 @@ struct TVPlayerView: View {
     /// Resolution / HDR / audio summary under the title, read live from mpv.
     private func computeMetadataLine() -> String {
         var parts: [String] = []
-        switch videoHeight {
-        case 2000...:     parts.append("4K")
-        case 1300..<2000: parts.append("1440p")
-        case 900..<1300:  parts.append("1080p")
-        case 600..<900:   parts.append("720p")
-        case 1..<600:     parts.append("\(videoHeight)p")
+        // Resolution is defined by WIDTH (4K is ~3840 wide at ANY aspect), so a 2.40:1 4K film (3840x1600)
+        // is NOT mislabeled "1440p" off its 1600 height. Width when known, else a 16:9 height estimate while
+        // the first frame is still loading.
+        let res = videoWidth > 0 ? videoWidth : Int(Double(videoHeight) * 16.0 / 9.0)
+        switch res {
+        case 3000...:     parts.append("4K")
+        case 2200..<3000: parts.append("1440p")
+        case 1500..<2200: parts.append("1080p")
+        case 1000..<1500: parts.append("720p")
+        case 1..<1000:    if videoHeight > 0 { parts.append("\(videoHeight)p") }
         default:          break
         }
         if isHDR { parts.append("HDR") }
@@ -572,7 +651,7 @@ struct TVPlayerView: View {
                 Spacer(minLength: Theme.Space.lg)
                 VStack(alignment: .trailing, spacing: 6) {
                     if !curTitle.isEmpty {
-                        Text(curTitle).font(Theme.Typography.sectionTitle)
+                        Text(displayTitle).font(Theme.Typography.sectionTitle)
                             .foregroundStyle(Theme.Palette.textPrimary).lineLimit(1)
                     }
                     if !metadataLine.isEmpty {
@@ -745,8 +824,9 @@ struct TVPlayerView: View {
             }]
             rows += groupedTrackRows(subtitleTracks) { coordinator.player?.setSubtitleTrack($0); refreshTracksSoon() }
             // External subtitles from the account's subtitle add-ons. Picking one sub-adds it
-            // into mpv and it joins the embedded list above; its add-on row disappears.
-            let available = addonSubs.filter { !addedSubURLs.contains($0.url) }
+            // into mpv and it joins the embedded list above; its add-on row disappears. Hidden on the
+            // AVPlayer engine, which cannot splice a remote WebVTT in (the row would do nothing).
+            let available = isAVPlayerActive ? [] : addonSubs.filter { !addedSubURLs.contains($0.url) }
             if !available.isEmpty {
                 rows.append(OptionRow(label: "From add-ons", isHeader: true))
                 for sub in available.prefix(30) {
@@ -1058,6 +1138,17 @@ struct TVPlayerView: View {
     /// hop budget is spent or nothing untried remains; the caller then shows the error overlay.
     @discardableResult
     private func hopToNextSource(reason: String) -> Bool {
+        // FIX I: a TRAILER never fails over to the engine's content streams. The trailer request carries no
+        // content stream of its own; nextUntriedStream() would return whatever the engine last loaded for
+        // this (or a still-resident) title, so a dead /yt route would silently play the actual/random movie.
+        // Instead show the load-error overlay ("Trailer unavailable") and stop. Return true so the caller
+        // treats the failure as handled and does not also paint its own (content-stream) error message.
+        if isTrailer {
+            DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
+            loadErrorMsg = "Trailer unavailable."
+            withAnimation { loadFailed = true }
+            return true
+        }
         guard sourceHops < maxSourceHops, let stream = nextUntriedStream() else { return false }
         // switchStream clears the budget (it doubles as the manual-pick path) and resumes at
         // currentTime; snapshot both around the call so the hop keeps its own bookkeeping and a
@@ -1309,6 +1400,7 @@ struct TVPlayerView: View {
     private func startLoadTimeout() {
         loadTimeout?.cancel()
         startRecoveryDeadline()   // first call arms the overall cap; later calls (hops) leave it running
+        startAVStartWatchdog()    // AVPlayer-only fast fallback to libmpv when it mounts but never plays
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
             guard !hasStartedPlaying else { return }
@@ -1319,6 +1411,40 @@ struct TVPlayerView: View {
             if hopToNextSource(reason: "load timeout") { return }
             if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
             withAnimation { loadFailed = true }
+        }
+    }
+
+    /// Demote the active AVFoundation engine to libmpv IN PLACE (the #76 fallback). Tears the AVPlayer
+    /// engine down NOW (cancels its periodic time observer + KVO) before flipping `avEngineFailed`, so no
+    /// stray timePos tick can land in the surface-swap window and set hasStartedPlaying (which would
+    /// suppress a later genuine libmpv failure). SwiftUI's dismantleUIView also calls stop(); it is
+    /// idempotent, so the double-stop is safe. Returns true when it actually demoted (caller should bail),
+    /// false when AVPlayer is not the active engine and the caller should run its normal failure path.
+    @discardableResult
+    private func demoteAVPlayerToMPV() -> Bool {
+        guard useAVPlayerEngine, isAVPlayerActive else { return false }
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        coordinator.player?.stop()
+        avEngineFailed = true
+        return true
+    }
+
+    /// AVPlayer-only START watchdog. AVPlayer can mount and present its chrome yet never produce a playable
+    /// frame (no item .failed, no timePos tick), so the only existing guard was the shared 30s loadTimeout,
+    /// which the owner saw as ~30s of dead chrome before libmpv finally took over. If AVFoundation is the
+    /// active engine and playback still has not begun after avStartWatchdogSeconds, route to the SAME libmpv
+    /// fallback the .failed case uses. NOT armed for libmpv (torrents legitimately warm up far longer, which
+    /// is what the 30s loadTimeout / torrent warm-up budget cover). Cancelled the moment playback starts
+    /// (the timePos handler cancels loadTimeout/recoveryDeadline and clears this) or the view goes away.
+    private func startAVStartWatchdog() {
+        avStartWatchdog?.cancel()
+        guard useAVPlayerEngine, !forceMPV, !avEngineFailed else { return }
+        avStartWatchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+            guard !Task.isCancelled, !hasStartedPlaying else { return }
+            guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, falling back to libmpv")
+            demoteAVPlayerToMPV()
         }
     }
 
@@ -1447,6 +1573,25 @@ struct TVPlayerView: View {
         guard autoRetryCount < maxAutoRetries else {
             reconnecting = false
             if hopToNextSource(reason: "load failed: \(msg)") { return }
+            // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
+            // HomeView.directResume kicks off a background reload of the title's streams, but they may not
+            // have arrived yet. Wait briefly for them and retry the hop to a FRESH source, rather than
+            // dead-ending on the "sources didn't load" overlay. One wait-cycle per playback, non-torrent only.
+            if curMeta != nil, !isTorrentPlayback, !awaitedFreshSources {
+                awaitedFreshSources = true
+                withAnimation { reconnecting = true }
+                autoRetryTask?.cancel()
+                autoRetryTask = Task { @MainActor in
+                    for _ in 0 ..< 16 {   // up to ~4s for the background stream load to land
+                        try? await Task.sleep(for: .milliseconds(250))
+                        if Task.isCancelled { return }
+                        if hopToNextSource(reason: "fresh sources after wait") { reconnecting = false; return }
+                    }
+                    reconnecting = false
+                    withAnimation { loadFailed = true }
+                }
+                return
+            }
             withAnimation { loadFailed = true }
             return
         }
@@ -1701,6 +1846,28 @@ struct TVPlayerView: View {
     private var episodeIndex: Int? { allEpisodes.firstIndex { $0.id == curMeta?.videoId } }
     private var hasNextEpisode: Bool { episodeIndex.map { $0 + 1 < allEpisodes.count } ?? false }
     private var hasPrevEpisode: Bool { (episodeIndex ?? 0) > 0 }
+
+    /// The `CoreVideo` for the episode currently playing, resolved from the loaded episode list.
+    /// Matches on the engine video id first (canonical), falling back to season+episode for direct
+    /// resumes whose `curMeta.videoId` predates the freshly loaded list. Nil for movies / live.
+    private var currentEpisodeVideo: CoreVideo? {
+        guard let m = curMeta, m.type == "series" else { return nil }
+        if let v = allEpisodes.first(where: { $0.id == m.videoId }) { return v }
+        guard let s = m.season, let e = m.episode else { return nil }
+        return allEpisodes.first { $0.season == s && $0.episode == e }
+    }
+
+    /// Top-right label text. Appends the episode title to the launch title when a *distinct* one
+    /// is known (the model's `episodeTitle` falls back to a generic "Episode N", which we suppress
+    /// to avoid noise). `play(episode:)` already bakes the title into `curTitle`, so guard against
+    /// duplicating it there. Movies / live / title-less episodes show `curTitle` unchanged.
+    private var displayTitle: String {
+        guard let v = currentEpisodeVideo,
+              let t = v.title, !t.isEmpty,           // a real episode title, not the "Episode N" fallback
+              !curTitle.contains(t)                  // don't double-append (play(episode:) already added it)
+        else { return curTitle }
+        return "\(curTitle) · \(t)"
+    }
 
     private func playNext() { if let i = episodeIndex, i + 1 < allEpisodes.count { play(episode: allEpisodes[i + 1]) } }
     private func playPrevious() { if let i = episodeIndex, i > 0 { play(episode: allEpisodes[i - 1]) } }
@@ -1970,10 +2137,20 @@ struct TVPlayerView: View {
         let body: [String: Any] = ["torrent": ["infoHash": hash],
                                    "peerSearch": ["sources": sources, "min": 40, "max": 150]]
         guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
-        var request = URLRequest(url: url); request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = data
-        URLSession.shared.dataTask(with: request).resume()
+        // Guarantee the TV-safe cache + connection cap is applied BEFORE this engine is created: the server
+        // reads cacheSize + btMaxConnections at engine-creation time (enginefs.getDefaults), and the boot-time
+        // apply can silently miss on a slow cold start -- leaving this engine at the 2 GB default cache + 55
+        // connections, which jetsams the whole 2 GB Apple TV under torrent load (the owner's "server crash /
+        // hang after finishing one title and opening another" report). A quick (<=3 try) VERIFIED apply here
+        // makes every torrent engine start capped, not just when the one-shot boot POST happened to land.
+        // No-op on a custom remote server (applyServerConfig returns immediately when isCustom).
+        Task {
+            await StremioServer.applyServerConfig(maxAttempts: 3)
+            var request = URLRequest(url: url); request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = data
+            URLSession.shared.dataTask(with: request).resume()
+        }
     }
 
     /// Tell the embedded server to destroy a torrent engine (GET /{hash}/remove). Each engine
@@ -1995,12 +2172,34 @@ struct TVPlayerView: View {
     /// engine is leaked.
     private func leavePlayback() {
         if let hash = currentTorrentHash { closeTorrent(hash: hash) }
+        // Force the OLD engine to halt decode + network and BEGIN teardown synchronously, right now, instead
+        // of leaving it to whenever SwiftUI gets around to dismantle*. This is THE debrid crash fix: a debrid
+        // title holds the FULL remote demuxer read-ahead + a 4K decoder, and without this stop() that engine
+        // was still alive when the next title's player allocated its own buffers -- two decoding players
+        // straddling on a 2 GB Apple TV jetsam-killed the whole device (the owner's "finish/stop, browse, open
+        // another -> hang"). stop() is idempotent (guards on a live handle/item) so SwiftUI's later dismantle
+        // is a harmless no-op, and this runs ONLY on a genuine exit (Back, close, terminal auto-advance), never
+        // on an in-place source/episode switch or an onDisappear rebuild, so normal playback is untouched.
+        coordinator.player?.stop()
+        // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
+        // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
+        // guardrail). No-op when the disk cache is off or empty. This runs ONLY on a genuine exit
+        // (Back / close / terminal auto-advance), never on an in-place source/episode switch, and is
+        // additive: it does not touch the stop() teardown above.
+        DiskCacheSetting.clearCache()
         onClose()
     }
 
     /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream.
+    /// Matches the ACTIVE streaming server's host:port (the embedded :11470 OR a custom remote server),
+    /// not a hardcoded :11470 -- otherwise closeTorrent silently skipped teardown for custom-server
+    /// torrents and leaked their swarms (peers/sockets/cache) across plays, the same RSS-balloon that
+    /// the embedded path's remove() exists to prevent. curURL is built from StremioServer.base, so the
+    /// host+port compare against base is exact.
     private var currentTorrentHash: String? {
-        guard let u = curURL, u.port == 11470, u.pathComponents.count >= 2 else { return nil }
+        guard let u = curURL, let serverBase = URL(string: StremioServer.base),
+              u.host == serverBase.host, u.port == serverBase.port,
+              u.pathComponents.count >= 2 else { return nil }
         let hash = u.pathComponents[1]
         return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
     }
@@ -2105,6 +2304,7 @@ struct TVPlayerView: View {
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
+        guard !isAVPlayerActive else { return }   // AVPlayer has no frame-capture; the scrub bubble stays hidden
         guard !scrubbing, !buffering, !isPaused else { return }
         guard !localTrickplayCaptureInFlight else { return }
         guard time - lastLocalTrickplayCapture >= 10 else { return }

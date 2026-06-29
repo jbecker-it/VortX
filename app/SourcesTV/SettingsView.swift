@@ -7,12 +7,18 @@ struct SettingsView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
     @EnvironmentObject private var profiles: ProfileStore
     @State private var serverOnline: Bool?
     @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     @State private var showRestartConfirm = false
     @State private var editingProfile: UserProfile?
+    /// In-app UI language (tvOS had no picker before). "system" follows the Apple TV language.
+    @State private var langSelection: String = AppLanguage.current ?? "system"
+    @State private var showLangRestart = false
+    @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
     @AppStorage(SubtitleStyle.Key.sizeScale) private var subSizeScale = 1.0
@@ -26,11 +32,25 @@ struct SettingsView: View {
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
+    // Streaming/seek cache budget, raw byte count (0 = Off, -1 = Unlimited). Int-typed @AppStorage; Int
+    // is 64-bit on Apple TV, so the byte budgets are exact.
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
     @AppStorage("stremiox.seekStep") private var seekStep = "10"   // skip step in seconds, shared with the player
+    @AppStorage(PlayerEngineRouter.overrideKey) private var playerEngine = PlayerEngineRouter.Override.auto.rawValue
     @AppStorage("stremiox.autoSkip") private var autoSkip = false  // auto-skip intro/credits, shared with iOS/Mac
+    @AppStorage(CommunityTrickplay.settingKey) private var communityTrickplay = true  // share/fetch scrub previews
     @AppStorage(SkipTimestampService.providerKey) private var skipProvider = "both"
     @AppStorage(ExternalPlayers.defaultKey) private var defaultExternalPlayer = ""   // "" == built-in libmpv
+    // Stremio mirror (account-owns-everything): default OFF = VortX keeps its own copy of each category;
+    // ON = VortX tracks Stremio (adds and removes) for that category.
+    @AppStorage(MirrorSettings.addonsKey) private var mirrorAddons = false
+    @AppStorage(MirrorSettings.libraryKey) private var mirrorLibrary = false
+    @AppStorage(MirrorSettings.continueWatchingKey) private var mirrorCW = false
     @ObservedObject private var sourcePrefs = SourcePreferences.shared
+    /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
+    /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
+    private enum AccountFocus: Hashable { case vortx, logOut, importStremio }
+    @FocusState private var accountFocus: AccountFocus?
 
     var body: some View {
         NavigationStack {
@@ -39,6 +59,7 @@ struct SettingsView: View {
                     Text("Settings").screenTitleStyle()
                     profilesSection
                     accountSection
+                    stremioMirrorSection
                     playbackSection
                     streamsSection
                     serverSection
@@ -134,19 +155,25 @@ struct SettingsView: View {
     // MARK: Account
 
     @ViewBuilder private var accountSection: some View {
-        section("Account") {
-            // The whole account block is one focus section so Down keeps stepping DOWN through
-            // its stacked rows instead of leaving after the first hit. "Log Out" sits far right
-            // (after a Spacer) while the rows below it are left-aligned; without this grouping
-            // the downward beam from Log Out misses the left-aligned links and the engine exits
-            // the section, skipping "VortX account & sync" and the metadata-keys row.
+        section(String(localized: "Account")) {
+            // The whole account block is one focus section so Down keeps stepping DOWN through its
+            // stacked rows instead of leaving after the first hit. Every focusable row (including the
+            // Log Out button below) is left-aligned and full-width, so the spatial focus engine's
+            // downward beam stays in-column and never skips a row.
             VStack(alignment: .leading, spacing: Theme.Space.md) {
                 // Lead with the VortX account (the app's own E2E account + sync); the Stremio account sits beneath.
                 NavigationLink { SyncSettingsView() } label: {
                     Label("VortX account & sync", systemImage: "arrow.triangle.2.circlepath")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                .focused($accountFocus, equals: .vortx)
                 if account.isSignedIn {
+                    // Identity is a non-focusable info row; Log Out is its OWN full-width row directly
+                    // BELOW it, in the same left-aligned column as every other account row. The old layout
+                    // stranded Log Out far-right after a Spacer(), so the spatial focus engine's downward
+                    // beam from the left-aligned rows missed it and the owner could not reach it on tvOS.
+                    // Stacking it in-column makes it a deterministic D-pad target (down lands on it, then
+                    // continues to the rows below). The .focusSection() on the enclosing VStack stays.
                     HStack(spacing: Theme.Space.md) {
                         Image(systemName: "person.crop.circle.fill")
                             .font(.system(size: 52)).foregroundStyle(Theme.Palette.accent)
@@ -155,12 +182,14 @@ struct SettingsView: View {
                             Text("Stremio · \(account.addons.count) add-ons · \(account.streamAddonBases.count) stream sources")
                                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
                         }
-                        Spacer()
-                        Button { account.signOut(); core.logOut() } label: {
-                            Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
-                        }
-                        .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                        Spacer(minLength: 0)
                     }
+                    Button { account.signOut(); core.logOut() } label: {
+                        Label("Log Out", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
+                    .buttonStyle(ChipButtonStyle(selected: true, accent: Theme.Palette.danger, accentText: Theme.Palette.danger))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .focused($accountFocus, equals: .logOut)
                 } else {
                     NavigationLink { LoginView(account: account) } label: {
                         Label("Sign in to your Stremio account", systemImage: "person.crop.circle")
@@ -171,6 +200,7 @@ struct SettingsView: View {
                     Label("Import from Stremio", systemImage: "square.and.arrow.down.on.square")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+                .focused($accountFocus, equals: .importStremio)
                 NavigationLink { MetadataKeysView() } label: {
                     Label("Metadata (TMDB, MDBList)", systemImage: "sparkles")
                 }
@@ -180,9 +210,32 @@ struct SettingsView: View {
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
                 NavigationLink { XRDBSettingsView() } label: {
-                    Label("Ratings on posters (XRDB)", systemImage: "star.circle")
+                    Label("Poster artwork (ERDB, ratings)", systemImage: "star.circle")
                 }
                 .buttonStyle(ChipButtonStyle(selected: false))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
+        }
+    }
+
+    // MARK: Stremio mirror
+
+    /// Per-category control of whether VortX mirrors a connected Stremio account. Off (the default) keeps
+    /// a VortX copy of each category so a Stremio removal never removes it from VortX; On makes VortX
+    /// track Stremio (adds and removes) for that category. Hydration always keeps the VortX-owned set
+    /// alive even when signed out of Stremio, independent of these.
+    @ViewBuilder private var stremioMirrorSection: some View {
+        section(String(localized: "Stremio mirror")) {
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                choiceRow(String(localized: "Mirror add-ons from Stremio"), [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorAddons ? "1" : "0" }, set: { mirrorAddons = ($0 == "1") }))
+                choiceRow(String(localized: "Mirror library from Stremio"), [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorLibrary ? "1" : "0" }, set: { mirrorLibrary = ($0 == "1") }))
+                choiceRow(String(localized: "Mirror Continue Watching from Stremio"), [("0", "Off"), ("1", "On")],
+                          selection: Binding(get: { mirrorCW ? "1" : "0" }, set: { mirrorCW = ($0 == "1") }))
+                Text("Off keeps a VortX copy of each one, so it stays even if you remove it in Stremio. On makes VortX track your Stremio account for that item. Your add-ons, library, and Continue Watching always stay even when you are signed out of Stremio.")
+                    .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .focusSection()
@@ -203,30 +256,53 @@ struct SettingsView: View {
                 }
                 .buttonStyle(RowFocusStyle())
             }
-            choiceRow("Audio output", AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
+            choiceRow(String(localized: "Audio output"), AudioOutputMode.allCases.map { ($0.rawValue, $0.label) }, selection: $audioOutput)
             Text(AudioOutputMode(rawValue: audioOutput)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow("Video upscaling", VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
+            choiceRow(String(localized: "Video upscaling"), VideoUpscaling.allCases.map { ($0.rawValue, $0.label) }, selection: $videoUpscaling)
             Text(VideoUpscaling(rawValue: videoUpscaling)?.detail ?? "")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-            choiceRow("Skip step", [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
-            choiceRow("Auto-skip intro & credits", [("0", "Off"), ("1", "On")],
+            choiceRow(String(localized: "Streaming cache"),
+                      DiskCacheSetting.pickerOptions.map { (String($0.id), $0.label) },
+                      selection: Binding(get: { String(diskCacheBytes) },
+                                         set: { diskCacheBytes = Int($0) ?? Int(DiskCacheSetting.defaultBytes) }))
+            Text(diskCacheFooter)
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Player engine"), PlayerEngineRouter.Override.allCases.map { ($0.rawValue, $0.label) }, selection: $playerEngine)
+            Text("Auto plays HLS and Dolby Vision through AVPlayer (AirPlay and Picture in Picture), with the full player controls, and uses the built-in libmpv player for torrents, MKV, and anything AVPlayer cannot open. If a stream will not start, choose Always libmpv.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+            choiceRow(String(localized: "Skip step"), [("10", "10s"), ("15", "15s"), ("30", "30s")], selection: $seekStep)
+            choiceRow(String(localized: "Auto-skip intro & credits"), [("0", "Off"), ("1", "On")],
                       selection: Binding(get: { autoSkip ? "1" : "0" }, set: { autoSkip = ($0 == "1") }))
-            choiceRow("Skip timestamps source", [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
+            choiceRow(String(localized: "Skip timestamps source"), [("theintrodb", "TheIntroDB"), ("skipdb", "SkipDB"), ("both", "Both")],
                       selection: $skipProvider)
-            choiceRow("Play in", externalPlayerChoices, selection: $defaultExternalPlayer)
+            choiceRow(String(localized: "Play in"), externalPlayerChoices, selection: $defaultExternalPlayer)
             Text("Direct and debrid streams open in your chosen player automatically. Torrents and the built-in player are unaffected.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             NavigationLink { SeekBarStylePicker() } label: {
                 Label("Seek bar style", systemImage: "slider.horizontal.below.rectangle")
             }
             .buttonStyle(ChipButtonStyle(selected: false))
+            choiceRow(String(localized: "Community scrub previews"), [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { communityTrickplay ? "1" : "0" }, set: { communityTrickplay = ($0 == "1") }))
+            Text("Share and reuse scrub-preview thumbnails across the community, so previews appear instantly without each device regenerating them. Only the generated thumbnails are shared, never any account data.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 
     /// Built-in plus every curated external player; picking one auto-hands eligible streams to it.
     private var externalPlayerChoices: [(String, String)] {
         [("", "Built-in player")] + ExternalPlayers.menu().map { ($0.id, $0.name) }
+    }
+
+    /// Explains the streaming cache and shows live on-disk usage when on. On the Apple TV HD the cache
+    /// is additionally capped tight; Unlimited is always bounded to half of free storage and cleared
+    /// when a title finishes, so it never fills the device.
+    private var diskCacheFooter: String {
+        let base = String(localized: "A bigger streaming cache buffers more video on disk so you can seek minutes ahead without re-buffering. Unlimited is still capped to half your free storage and the cache clears when a title finishes, so it never fills your Apple TV.")
+        guard diskCacheBytes != 0 else { return base }
+        let usage = DiskCacheSetting.humanReadable(DiskCacheSetting.currentUsageBytes)
+        return base + " " + String(localized: "Current cache: \(usage).")
     }
 
     private var effectiveDirectLinksOnly: Bool {
@@ -350,6 +426,11 @@ struct SettingsView: View {
 
     // MARK: Appearance (accent + chrome)
 
+    /// "System Default" + every shipped language, for the App Language picker on tvOS.
+    private var appLanguageOptions: [(id: String, label: String)] {
+        [(id: "system", label: "System Default")] + AppLanguage.supported.map { (id: $0.code, label: $0.name) }
+    }
+
     private var appearanceSection: some View {
         section("Appearance") {
             ThemeAccentPicker(selection: $theme.accentID).focusSection()
@@ -357,20 +438,54 @@ struct SettingsView: View {
             Text("Accent recolors focus, selection, and progress across the app. OLED Black uses true black, best on AMOLED panels.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("Dolby Vision / HDR", [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
+            choiceRow(String(localized: "App Language"), appLanguageOptions, selection: Binding(
+                get: { langSelection },
+                set: { newValue in
+                    langSelection = newValue
+                    AppLanguage.set(newValue == "system" ? nil : newValue)
+                    showLangRestart = true
+                }))
+            Text("Switches the whole app to this language. VortX must quit and reopen to apply it.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Show Live TV tab"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { hideLiveTab ? "0" : "1" }, set: { hideLiveTab = ($0 == "0") }))
+            Text("Hide the Live TV tab if you do not use it.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],
+                      selection: Binding(get: { catalogPrefs.landscapeCards ? "1" : "0" }, set: { catalogPrefs.landscapeCards = ($0 == "1") }))
+            Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Streaming-service rows"), [("1", "Show"), ("0", "Hide")],
+                      selection: Binding(get: { showStreamingRails ? "1" : "0" }, set: { showStreamingRails = ($0 == "1") }))
+            Text("Show 'what's on Netflix / Disney+ / ...' rows on Home, from TMDB watch providers. Needs a TMDB key.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+
+            choiceRow(String(localized: "Dolby Vision / HDR"), [("auto", "Auto"), ("on", "Tone-map to SDR"), ("off", "Always HDR")], selection: $hdrToneMapMode)
             Text("Auto tone-maps HDR and Dolby Vision to SDR only on a TV that can't show HDR. Choose Tone-map to SDR if 4K Dolby Vision remuxes look washed out, green or purple on your TV; Always HDR forces pass-through.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            stepperRow("App text size", value: theme.textScale,
+            stepperRow(String(localized: "App text size"), value: theme.textScale,
                        range: ThemeManager.textScaleRange,
                        onMinus: { theme.adjustTextScale(-1) },
                        onPlus: { theme.adjustTextScale(1) })
             Text("Makes every screen's text larger or smaller. Changes apply instantly.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            choiceRow("Performance", [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
+            choiceRow(String(localized: "Performance"), [("auto", "Auto"), ("full", "Full"), ("reduced", "Reduced")], selection: $perfMode)
             Text("Auto keeps the full experience on capable Apple TVs and switches to a lighter one on older models like the Apple TV HD. Reduced trims animations and shrinks playback buffers so the remote stays responsive on weak hardware. Restart the app after changing this.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
+        }
+        .confirmationDialog("Apply language?", isPresented: $showLangRestart, titleVisibility: .visible) {
+            Button("Quit Now", role: .destructive) {
+                DiagnosticsLog.logSync("app", "user requested app restart to apply language")
+                exit(0)
+            }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("VortX needs to quit and reopen to display the app in the new language. Open it again from the Home Screen.")
         }
     }
 
@@ -439,7 +554,7 @@ struct SettingsView: View {
                 Text("Sources matching the top type are ranked first within each quality tier. Debrid and Usenet are always instant; Torrent streams require peer availability.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             }
-            choiceRow("Safety filter", [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
+            choiceRow(String(localized: "Safety filter"), [("off", "Off"), ("balanced", "Balanced"), ("strict", "Strict")], selection: $sourcePrefs.safetyMode)
             Text(sourcePrefs.keywordsAreRegex
                  ? "Hides CAM and fake-quality sources. Hide / Require words are case-insensitive regex patterns (an invalid pattern is ignored)."
                  : "Hides CAM and fake-quality sources. Hide / Require words filter the list by name (comma-separated).")
@@ -458,7 +573,7 @@ struct SettingsView: View {
             }
             .toggleStyle(.switch)
             .tint(Theme.Palette.accent)
-            choiceRow("Max file size",
+            choiceRow(String(localized: "Max file size"),
                       [(0.0, "Off"), (2.0, "2 GB"), (5.0, "5 GB"), (10.0, "10 GB"),
                        (15.0, "15 GB"), (20.0, "20 GB"), (30.0, "30 GB"), (50.0, "50 GB")],
                       selection: $sourcePrefs.maxFileSizeGB)
@@ -471,9 +586,9 @@ struct SettingsView: View {
 
     private var audioSubtitleSection: some View {
         section("Audio & Subtitles") {
-            choiceRow("Audio language", TrackPreferences.commonLanguages, selection: $prefAudioLang)
-            choiceRow("Subtitle language", TrackPreferences.commonLanguages, selection: $prefSubLang)
-            choiceRow("Subtitles", TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
+            choiceRow(String(localized: "Audio language"), TrackPreferences.commonLanguages, selection: $prefAudioLang)
+            choiceRow(String(localized: "Subtitle language"), TrackPreferences.commonLanguages, selection: $prefSubLang)
+            choiceRow(String(localized: "Subtitles"), TrackPreferences.ForcedPolicy.allCases.map { ($0.rawValue, $0.label) }, selection: $prefForced)
             Text("The player auto-picks these when a title starts. Forced shows only foreign-dialogue captions; Always shows full subtitles in your language. Foreign-language titles always get full subtitles so you can follow.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
@@ -483,13 +598,13 @@ struct SettingsView: View {
 
     private var subtitleSection: some View {
         section("Subtitle Style") {
-            choiceRow("Font", SubtitleStyle.fonts.map { ($0.id, $0.label) }, selection: $subFont)
-            choiceRow("Size", SubtitleStyle.sizes.map { ($0.id, $0.label) }, selection: $subSize)
-            stepperRow("Fine size", value: subSizeScale,
+            choiceRow(String(localized: "Font"), SubtitleStyle.fonts.map { ($0.id, $0.label) }, selection: $subFont)
+            choiceRow(String(localized: "Size"), SubtitleStyle.sizes.map { ($0.id, $0.label) }, selection: $subSize)
+            stepperRow(String(localized: "Fine size"), value: subSizeScale,
                        range: SubtitleStyle.sizeScaleRange,
                        onMinus: { adjustSubScale(-1) },
                        onPlus: { adjustSubScale(1) })
-            choiceRow("Color", SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
+            choiceRow(String(localized: "Color"), SubtitleStyle.colors.map { ($0.id, $0.label) }, selection: $subColor)
             choiceRow("Background", SubtitleStyle.backgrounds.map { ($0.id, $0.label) }, selection: $subBackground)
             Text("Styles the built-in player's subtitles. Pick which subtitle track to show from the player while watching.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
@@ -593,7 +708,7 @@ struct SettingsView: View {
     }
 
     private var aboutSection: some View {
-        section("About") {
+        section(String(localized: "About")) {
             if let update = updates.available {
                 VStack(alignment: .leading, spacing: 4) {
                     Label("Update available: \(update.name)", systemImage: "arrow.down.circle.fill")
@@ -605,9 +720,9 @@ struct SettingsView: View {
                 }
                 .padding(.vertical, Theme.Space.xs)
             }
-            infoRow("Version", appVersion)
-            infoRow("Player", "libmpv · MPVKit")
-            infoRow("Server", "Stremio streaming server (nodejs-mobile)")
+            infoRow(String(localized: "Version"), appVersion)
+            infoRow(String(localized: "Player"), String(localized: "libmpv · MPVKit"))
+            infoRow(String(localized: "Server"), String(localized: "Stremio streaming server (nodejs-mobile)"))
         }
         .task { updates.checkIfStale(maxAge: 30 * 60) }   // a Settings visit deserves a fresh answer
     }

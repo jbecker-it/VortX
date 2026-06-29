@@ -9,6 +9,14 @@ struct HomeView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
+    @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
+    @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails (needs a TMDB key)
+    @StateObject private var groups = HomeGroupsModel()   // nested collections: grouped Streaming / Genres / Top New / New rails
+    @AppStorage("vortx.home.showCollectionGroups") private var showCollectionGroups = true   // toggle the whole nested-collection section (mostly TMDB-backed)
+    @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The owner profile rides the account's Continue Watching; overlay profiles ride their own
     /// private synced history.
@@ -30,6 +38,18 @@ struct HomeView: View {
                 // detailsBottom = strip height (470) + a breathing gap, so the synopsis can never
                 // run into the rail header regardless of tab-bar safe-area shifts.
                 BrowseHeroBackdrop(model: focusModel, detailsBottom: 520)
+                    // #44: once focus SETTLES on a catalog item for ~3s, its muted FULL trailer fades in
+                    // behind the hero art (over the still backdrop, under the rails + details). Gated on
+                    // the same autoplay-trailers setting + reduce-motion as the detail hero, and keyed on
+                    // the resolved URL so a focus change (which clears it) tears the libmpv layer down.
+                    // Non-focusable + no hit-testing inside the view, so the focus engine is untouched.
+                    .overlay {
+                        if autoplayTrailers, !reduceMotion, let url = heroTrailer.url {
+                            TVInHeroTrailerView(url: url)
+                                .ignoresSafeArea()
+                                .allowsHitTesting(false)
+                        }
+                    }
                 // The rails live in a bottom strip. The focus engine centers focused rows inside
                 // THIS viewport, so they are geometrically incapable of riding up over the hero.
                 ScrollView {
@@ -45,8 +65,33 @@ struct HomeView: View {
                         if !topPicks.items.isEmpty {
                             TopPicksRow(items: topPicks.items, focusModel: focusModel)
                         }
+                        // "Upcoming Episodes": the next-airing episode of each series in the library within
+                        // the next 45 days, soonest first (see ReleaseCalendarModel). Hidden when there is
+                        // nothing upcoming, so the default (no dated episodes) renders nothing.
+                        if !releaseCalendar.upcoming.isEmpty {
+                            UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
+                        }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
+                        }
+                        // Browse-by-streaming-service rails (Netflix, Disney+, ...): what's on each service
+                        // in-region, from TMDB watch providers. Discovery only; cards play through the engine
+                        // like any catalog card. Hidden with no TMDB key; each rail drops when empty in-region.
+                        // Suppressed when the nested-collection section is on, since its "Streaming" GROUP
+                        // (group 1) reproduces these exact rails — showing both would duplicate the rows.
+                        if showStreamingRails && !showCollectionGroups {
+                            ForEach(streaming.collections) { collection in
+                                StreamingRow(title: collection.title, items: collection.items, focusModel: focusModel)
+                            }
+                        }
+                        // Nested collections (grouped rails): big group headers (Streaming / Genres / Top New /
+                        // New) each over their child rails, BELOW every flat rail above. Additive + empty-state
+                        // safe — a group with no rails is never built, and the whole section needs (mostly) a
+                        // TMDB key, so with no key + no network this renders nothing and the Home is unchanged.
+                        if showCollectionGroups {
+                            ForEach(groups.groups) { group in
+                                CollectionGroupSection(group: group, focusModel: focusModel)
+                            }
                         }
                         if continueWatching.isEmpty && core.boardRows.isEmpty {
                             if account.isSignedIn { LoadingRail() } else { CoreEmptyState.signedOut }
@@ -65,11 +110,21 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks() }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showStreamingRails { streaming.load() }; if showCollectionGroups { groups.load() } }
+        .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
+        .onChange(of: showCollectionGroups) { show in if show { groups.load() } else { groups.clear() } }
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
-        .onChange(of: core.addons.count) { configureMetaSources() }
+        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
+        // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
+        // async after sign-in, so key on its count too (matching the notification sweep's input set).
+        .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
+        .onChange(of: account.addons.count) { refreshReleaseCalendar() }
+        .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
+        // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
+        // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
+        .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
     }
 
     /// Recompute the "Top Picks for you" rail from the profile-aware Continue Watching + library.
@@ -78,10 +133,22 @@ struct HomeView: View {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
     }
 
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
+    /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
+    private func refreshReleaseCalendar() {
+        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
+        guard !series.isEmpty else { releaseCalendar.clear(); return }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
+    }
+
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
     private func configureMetaSources() {
-        FocusedItemModel.configureMetaSources(
-            transportUrls: core.addons.filter(\.providesMeta).map(\.transportUrl))
+        let metaUrls = core.addons.filter(\.providesMeta).map(\.transportUrl)
+        FocusedItemModel.configureMetaSources(transportUrls: metaUrls)
+        heroTrailer.configureMetaSources(transportUrls: metaUrls)
     }
 
     /// First render shows the page's actual first item, and Continue Watching pre-fetches its
@@ -102,6 +169,108 @@ struct HomeView: View {
     }
 }
 
+/// The HOME featured-hero trailer driver (#44): plays the focused catalog item's MUTED FULL trailer behind
+/// the hero art, but only once focus has SETTLED on that item for ~3s. The 3s debounce is the whole point:
+/// scrolling catalog-to-catalog must never fire a ytdl request, so the timer is re-armed on every focus
+/// change and only the item the user actually lands on resolves a trailer. The trailer is torn down the
+/// instant focus moves (the URL clears, which unmounts `TVInHeroTrailerView`), so the embedded server is
+/// hit at most once per settled item, never on every rotation.
+///
+/// On the Lite build (no embedded server) a YouTube-only trailer has no `playableURL`, so this resolves nil
+/// and the still hero art stays — the no-op the owner asked for.
+@MainActor final class HomeHeroTrailerModel: ObservableObject {
+    /// The settled item's resolved trailer URL, or nil while debouncing / when no trailer exists. Mounting
+    /// `TVInHeroTrailerView` on this means clearing it tears the libmpv layer down at once.
+    @Published private(set) var url: URL?
+
+    /// Seconds focus must rest on one item before its trailer loads, so flicking past catalogs never loads.
+    private static let settleDelay: Duration = .seconds(3)
+
+    private var pending: Task<Void, Never>?
+    private var currentItemID: String?
+    /// Base URLs of the user's meta-serving add-ons (set by HomeView via `configureMetaSources`), walked to
+    /// resolve the focused item's meta the same way `FocusedItemModel` enriches the backdrop.
+    private var metaSourceBases: [String] = []
+
+    func configureMetaSources(transportUrls: [String]) {
+        metaSourceBases = transportUrls.map { url in
+            url.hasSuffix("manifest.json") ? String(url.dropLast("manifest.json".count)) : url
+        }
+    }
+
+    /// Focus settled on (or moved to) an item. Tear down any current trailer immediately, then arm the 3s
+    /// settle timer; if focus moves again before it fires the timer is cancelled, so no request is made.
+    /// `hero == nil` (focus left the rails) just tears down.
+    func focusChanged(to hero: FocusedHero?) {
+        guard hero?.id != currentItemID else { return }
+        currentItemID = hero?.id
+        pending?.cancel()
+        // Tear the previous trailer down the moment focus leaves it.
+        if url != nil { url = nil }
+        guard let hero else { return }
+        pending = Task { [weak self] in
+            try? await Task.sleep(for: Self.settleDelay)
+            guard !Task.isCancelled else { return }
+            await self?.resolveTrailer(for: hero)
+        }
+    }
+
+    /// Settled for the full delay: resolve the focused item's trailer to a playable URL (preferring a direct
+    /// stream, else the embedded server's `/yt` redirect) and publish it. Only applies if focus is still on
+    /// this item, so a late network reply for a since-abandoned item never paints.
+    private func resolveTrailer(for hero: FocusedHero) async {
+        guard let request = await fetchTrailer(for: hero), let playable = request.playableURL else { return }
+        guard currentItemID == hero.id, !Task.isCancelled else { return }
+        url = playable
+    }
+
+    /// Walk Cinemeta (for tt ids) + every installed meta add-on for this item's meta, building a
+    /// `TrailerRequest` from the first response that carries a trailer. Mirrors `FocusedItemModel`'s
+    /// enrichment fetch (short timeout, cache-first), so it is cheap and never blocks.
+    private func fetchTrailer(for hero: FocusedHero) async -> TrailerRequest? {
+        var bases = metaSourceBases
+        if hero.id.hasPrefix("tt") { bases.insert("https://v3-cinemeta.strem.io/", at: 0) }
+        let candidates = bases.compactMap { URL(string: "\($0)meta/\(hero.type)/\(hero.id).json") }
+        for url in candidates {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 6
+            request.cachePolicy = .returnCacheDataElseLoad
+            guard let (data, response) = try? await URLSession.shared.data(for: request),
+                  (response as? HTTPURLResponse)?.statusCode == 200,
+                  let decoded = try? JSONDecoder().decode(TrailerMetaResponse.self, from: data),
+                  let meta = decoded.meta else { continue }
+            if let trailer = meta.trailerRequest(title: hero.title) { return trailer }
+        }
+        return nil
+    }
+}
+
+/// The add-on meta response, narrowed to the trailer fields (parity with `TrailerRequest.from(meta:)` over
+/// the same shape the engine decodes into `CoreMetaItem`).
+private struct TrailerMetaResponse: Decodable {
+    struct Stream: Decodable { let ytId: String?; let url: String? }
+    struct Link: Decodable { let name: String; let category: String; let url: String? }
+    struct Meta: Decodable {
+        let trailerStreams: [Stream]?
+        let links: [Link]?
+
+        /// Build a `TrailerRequest`: prefer a direct (non-YouTube) trailer stream, else a YouTube id from
+        /// `trailerStreams` or a "Trailer" link. Nil when neither exists (so the still art stays).
+        func trailerRequest(title: String) -> TrailerRequest? {
+            let direct = (trailerStreams ?? [])
+                .compactMap { $0.ytId == nil ? $0.url : nil }
+                .compactMap { URL(string: $0) }
+                .first
+            let yt = (trailerStreams ?? []).compactMap(\.ytId).first { !$0.isEmpty }
+                ?? (links ?? []).first { $0.category.caseInsensitiveCompare("Trailer") == .orderedSame }?
+                    .url.flatMap(CoreMetaItem.youTubeID(from:))
+            guard direct != nil || yt != nil else { return nil }
+            return TrailerRequest(title: title, youTubeID: yt, directURL: direct)
+        }
+    }
+    let meta: Meta?
+}
+
 /// Eyebrow kicker + section title, the shared header for every rail.
 struct RailHeader: View {
     var eyebrow: String? = nil
@@ -113,6 +282,46 @@ struct RailHeader: View {
             Text(title).sectionTitleStyle()
         }
         .padding(.horizontal, Theme.Space.screenEdge)
+    }
+}
+
+/// The BIG header for a nested collection GROUP (Streaming / Genres / Top New / New): reuses `RailHeader`'s
+/// eyebrow + title styling but a visual tier UP — the screen-title font with an accent rule beneath — so a
+/// group reads as a section ABOVE its child rails, distinct from an individual rail's `RailHeader`.
+struct GroupHeader: View {
+    var eyebrow: String? = nil
+    let title: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let eyebrow { Text(eyebrow).eyebrowStyle(Theme.Palette.accent) }
+            Text(title).screenTitleStyle()
+            Rectangle()
+                .fill(Theme.Palette.accent)
+                .frame(width: 64, height: 4)
+                .clipShape(Capsule())
+        }
+        .padding(.horizontal, Theme.Space.screenEdge)
+        .padding(.top, Theme.Space.md)
+    }
+}
+
+/// One nested collection group on tvOS: a `GroupHeader` over its child rails. Each child rail reuses the
+/// existing `StreamingRow` (MetaPreview -> PosterCard -> DetailView routing + the focused-card backdrop),
+/// so a grouped rail behaves identically to the flat streaming/editorial rails. A group with no rails is
+/// never built (see `HomeGroupsModel`), so this always has content.
+struct CollectionGroupSection: View {
+    let group: CollectionGroup
+    var focusModel: FocusedItemModel? = nil
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            GroupHeader(eyebrow: group.eyebrow, title: group.title)
+            ForEach(group.rails) { rail in
+                StreamingRow(title: rail.title, items: rail.items, focusModel: focusModel)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -174,6 +383,15 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
+            // For a MOVIE, kick off a background load of the title's streams so a stale stored link (debrid
+            // URLs are time-limited and expire between sessions) auto-hops to a FRESH source instead of
+            // dead-ending on the "sources didn't load" overlay. The stored link still plays immediately; the
+            // player's failover picks up the fresh streams on a failure.
+            let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
+            if entry.type == "movie",
+               bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
+                bridge.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+            }
             presenter.request = PlaybackRequest(
                 url: url, title: entry.title,
                 meta: PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
@@ -190,6 +408,7 @@ struct CoreCatalogRowView: View {
     let row: CoreBoardRow
     var focusModel: FocusedItemModel? = nil
     @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var core: CoreBridge   // for per-row horizontal pagination (#95)
 
     var body: some View {
         VStack(alignment: .leading, spacing: Theme.Space.md) {
@@ -202,6 +421,9 @@ struct CoreCatalogRowView: View {
                                    onFocus: focusModel.map { model in
                                        { model.focus(item.focusedHero) }
                                    })
+                            // #95: horizontal infinite scroll. The last card asks the engine for this
+                            // catalog's next page, so a Home row keeps loading instead of capping at ~20.
+                            .onAppear { if item.id == row.items.last?.id { core.loadBoardRowNextPage(engineIndex: row.engineIndex) } }
                     }
                 }
                 .padding(.horizontal, Theme.Space.screenEdge)
@@ -245,6 +467,98 @@ struct TopPicksRow: View {
     private func hero(for item: MetaPreview) -> FocusedHero {
         FocusedHero(id: item.id, type: item.type, title: item.name,
                     backdrop: item.poster, metaLine: item.type.capitalized,
+                    overview: nil, genreLine: nil)
+    }
+}
+
+/// A "browse by streaming service" Home rail (Netflix, Disney+, ...): titles available on the service
+/// in-region, from TMDB watch providers. Mirrors `TopPicksRow`; cards carry resolved Cinemeta (tt) ids so
+/// they play through the engine like any catalog card. The service name is the rail title.
+struct StreamingRow: View {
+    let title: String
+    let items: [MetaPreview]
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: "Streaming now", title: title)
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
+                                   menu: .catalog,
+                                   onFocus: focusModel.map { model in
+                                       { model.focus(hero(for: item)) }
+                                   })
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A bare hero for the backdrop; the FocusedItemModel enriches it (rating/synopsis/real backdrop) from
+    /// the session cache or Cinemeta a beat after focus, exactly like a Top Picks card.
+    private func hero(for item: MetaPreview) -> FocusedHero {
+        FocusedHero(id: item.id, type: item.type, title: item.name,
+                    backdrop: item.poster, metaLine: item.type.capitalized,
+                    overview: nil, genreLine: nil)
+    }
+}
+
+/// "Upcoming Episodes": the next-airing episode of each series in the library within the next 45 days,
+/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow` — each card is the
+/// series' `PosterCard` (so it routes to the series `DetailView` like any catalog card and resolves its
+/// poster through `PosterArtwork`), with a small "S2E5 · Jun 30" caption under it. Series-only.
+struct UpcomingEpisodesRow: View {
+    let items: [ReleaseCalendarModel.UpcomingEpisode]
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+
+    /// Match `PosterCard`'s landscape-vs-portrait width so the per-card caption lines up under the card.
+    private var captionWidth: CGFloat {
+        (catalogPrefs.landscapeCards && apiKeys.hasTMDB) ? kLandscapeCardWidth : kPosterWidth
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: "Coming soon", title: "Upcoming Episodes")
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            PosterCard(title: item.seriesName, poster: item.video.thumbnail,
+                                       type: "series", id: item.seriesId,
+                                       menu: .catalog,
+                                       onFocus: focusModel.map { model in
+                                           { model.focus(hero(for: item)) }
+                                       })
+                            // The episode + air date for THIS card (the series name is the poster title).
+                            Text("\(item.episodeLabel) · \(item.airDateLabel)")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(1)
+                                .frame(width: captionWidth, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A bare hero for the backdrop; the FocusedItemModel enriches it from the session cache or Cinemeta a
+    /// beat after focus, exactly like a Top Picks card.
+    private func hero(for item: ReleaseCalendarModel.UpcomingEpisode) -> FocusedHero {
+        FocusedHero(id: item.seriesId, type: "series", title: item.seriesName,
+                    backdrop: item.video.thumbnail, metaLine: "Series",
                     overview: nil, genreLine: nil)
     }
 }

@@ -20,6 +20,10 @@ struct StremioTVApp: App {
             Task.detached(priority: .utility) { await StremioServer.applyServerConfig() }
         }
         #endif
+        // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
+        // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
+        // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
+        DiskCacheSetting.clearCache()
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()
@@ -50,6 +54,12 @@ struct StremioTVApp: App {
                     UpdateChecker.shared.checkIfStale()
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
+                        // Account-owns-everything: if the engine is degraded (no stream add-on), hydrate the
+                        // VortX account's owned add-ons + library so the lists never read zero on foreground.
+                        // Idempotent + never-zero guarded inside the sync manager.
+                        if CoreBridge.shared.hasNoUserStreamAddon {
+                            await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                        }
                         VortXSyncManager.shared.requestSyncSoon()     // then push THIS device's state (incl. the library + add-ons mirror) so the web dashboard repopulates on open
                     }
                     VortXSyncManager.shared.startRealtime()   // SyncRoom WebSocket + while-active poll (real-time pull)
@@ -71,6 +81,20 @@ struct StremioTVApp: App {
                 // cold start for the first seconds on device.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
                     ProfileStore.shared.bootstrapSync()
+                }
+                // Account-owns-everything launch wiring (additive, fail-soft): hydrate the engine from the
+                // VortX account's owned add-ons when it boots degraded (no stream add-on) so a logged-out /
+                // post-update Apple TV never shows zero, and snapshot-on-import ONCE on an already-synced
+                // device that has add-ons but never anchored ownership (addonsOwnedAt unset). Both no-op
+                // when signed out / unreachable (never-zero guarded inside the manager).
+                Task { @MainActor in
+                    if CoreBridge.shared.hasNoUserStreamAddon {
+                        await VortXSyncManager.shared.hydrateEngineFromOwnedAddons()
+                    }
+                    if !CoreBridge.shared.addons.isEmpty,
+                       await VortXSyncManager.shared.ownedAddonsNeverSnapshotted() {
+                        await VortXSyncManager.shared.snapshotOwnedFromEngine()
+                    }
                 }
                 // DIAGNOSTIC (-tv-playertest): exercise the real root-replacement path without an account.
                 guard ProcessInfo.processInfo.arguments.contains("-tv-playertest") else { return }

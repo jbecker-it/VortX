@@ -94,6 +94,14 @@ struct UserProfile: Codable, Identifiable, Equatable {
         if stored.hasPrefix("sha256:") { return stored == Self.pinHash(input, profileID: id) }
         return stored == input
     }
+
+    /// The one and only owner-profile id. The account owner is a singleton, so it carries a FIXED id on
+    /// every device and install. Minting it with a fresh random `UUID()` per install was the root of the
+    /// duplicate-"Main" bug: the owner ids never matched across installs, so the cross-device UNION merge
+    /// kept all of them (one real owner plus a leftover "Main" clone per install). A fixed id makes the
+    /// owner dedupe by id, so no duplicate can form. (A roster only ever belongs to one account, so a
+    /// fixed shared id is safe here; per-account uniqueness is not required.)
+    static let ownerID = UUID(uuidString: "00000000-0000-0000-0000-00000000A11C")!
     /// Whether this profile's history is the account library itself (the owner, and any profile on
     /// its own account) or a private synced overlay (every other shared profile).
     var usesEngineHistory: Bool { isOwner || usesOwnAccount }
@@ -149,6 +157,11 @@ final class ProfileStore: ObservableObject {
     private static let listKey = "stremiox.profiles"
     private static let activeKey = "stremiox.profiles.active"
     private static let modifiedKey = "stremiox.profiles.modified"
+    /// Durable cross-device delete tombstones: profile ids the user has DELETED. The app owns this set
+    /// (it lives in doc.vortx.deletedProfiles, the app's namespace) so a deleted profile can never be
+    /// resurrected by a peer device's union-merge or a stale pre-delete cloud blob. The owner id is
+    /// never tombstoned. See [[vortx-2026-06-25-rootcause-investigation]] section 2.
+    private static let deletedKey = "stremiox.profiles.deleted"
     private static func watchCacheKey(_ id: UUID) -> String { "stremiox.profiles.watch." + id.uuidString }
     /// The pre-profiles single-account Keychain slot; shared profiles keep using it.
     static let primaryTokenAccount = "stremiox.authKey"
@@ -174,7 +187,13 @@ final class ProfileStore: ObservableObject {
     private var pushRosterTask: Task<Void, Never>?
     private var pushWatchTask: Task<Void, Never>?
 
+    /// Durable delete tombstones (profile id strings). Persisted in UserDefaults, emitted into
+    /// doc.vortx.deletedProfiles by VortXSyncManager, and subtracted from every roster union so a
+    /// deleted profile cannot reappear. The owner id is never added (the owner always exists).
+    private(set) var deletedProfileIDs: Set<String> = []
+
     private init() {
+        loadDeletedTombstones()
         load()
         if profiles.isEmpty { migrateFromSingleAccount() }
         hashLegacyPins()
@@ -184,10 +203,16 @@ final class ProfileStore: ObservableObject {
             profiles[0].isOwner = true
             persist(touch: false)
         }
+        let rosterBeforeNormalize = profiles
         normalizeOwner()
         if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
             activeID = profiles.first?.id
         }
+        // Persist the owner-singleton heal (the duplicate-"Main" drop + stable-id re-key) so it survives
+        // relaunch and the next account sync carries a clean roster to the cloud and the dashboard. touch:
+        // false so launch never schedules a push (no sync ping-pong); it fires at most once, since after
+        // the heal the roster matches on every later launch.
+        if profiles != rosterBeforeNormalize { persist(touch: false) }
         // The active profile owns the theme; resync in case the stored values drifted. Seed the
         // add-on-visibility flat key too, so the first board build at launch honors the active
         // profile's set (no CoreBridge call here: the board is built later from the engine event).
@@ -292,6 +317,7 @@ final class ProfileStore: ObservableObject {
         profiles.removeAll { $0.id == profile.id }
         if profile.usesOwnAccount { Keychain.set(nil, for: keychainAccount(for: profile)) }
         UserDefaults.standard.removeObject(forKey: Self.watchCacheKey(profile.id))
+        tombstone(profile.id)   // durable cross-device delete; the union-merge can no longer resurrect it
         persist()
         if activeID == profile.id, let first = profiles.first { return select(first) }
         return nil
@@ -309,8 +335,16 @@ final class ProfileStore: ObservableObject {
                 let existing = profiles.first(where: { $0.id == uuid })
                 if e["deleted"] as? Bool == true {
                     // DELETE, hard-gated: only a non-owner profile; remove() refuses the last one and
-                    // clears that profile's watch cache + per-profile keychain slot.
-                    if let target = existing, !target.isOwner { remove(target) }
+                    // clears that profile's watch cache + per-profile keychain slot, and now records a
+                    // durable tombstone so a peer device can never resurrect it via the union-merge.
+                    if let target = existing, !target.isOwner {
+                        remove(target)
+                    } else if existing == nil, uuid != UserProfile.ownerID {
+                        // The profile is already gone locally but a peer may still hold it: tombstone the
+                        // id anyway so the next roster union from that peer drops it instead of bringing
+                        // it back. Never tombstone the owner.
+                        tombstone(uuid)
+                    }
                     continue
                 }
                 if var p = existing {
@@ -537,7 +571,7 @@ final class ProfileStore: ObservableObject {
     private func migrateFromSingleAccount() {
         let email = UserDefaults.standard.string(forKey: "stremiox.email")
         let name = email.flatMap { $0.split(separator: "@").first.map(String.init) }?.capitalized ?? "Main"
-        let first = UserProfile(name: name, avatar: "🍿",
+        let first = UserProfile(id: UserProfile.ownerID, name: name, avatar: "🍿",
                                 accentID: ThemeManager.shared.accentID,
                                 oled: ThemeManager.shared.oled,
                                 textScale: ThemeManager.shared.textScale,
@@ -573,15 +607,86 @@ final class ProfileStore: ObservableObject {
     }
 
     private func persist(touch: Bool = true) {
-        if let data = try? JSONEncoder().encode(profiles) {
-            UserDefaults.standard.set(data, forKey: Self.listKey)
+        let writeRosterAndActive = {
+            if let data = try? JSONEncoder().encode(self.profiles) {
+                UserDefaults.standard.set(data, forKey: Self.listKey)
+            }
+            UserDefaults.standard.set(self.activeID?.uuidString, forKey: Self.activeKey)
         }
-        UserDefaults.standard.set(activeID?.uuidString, forKey: Self.activeKey)
         if touch {
+            // A genuine local edit: write normally so the global UserDefaults observer arms an auto-push and
+            // this change syncs to the account + other devices.
+            writeRosterAndActive()
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.modifiedKey)
             schedulePushRoster()
+        } else {
+            // Routine housekeeping (normalizeOwner re-key, legacy migrations, per-device selection, tombstone
+            // prune, roster merge): explicitly "no push". The writes still hit UserDefaults and would fire the
+            // global didChangeNotification observer in VortXSyncManager, arming hasPendingPush even though this
+            // is not a user edit. Beta 8 added a normalizeOwner re-key on every launch (persist(touch:false)),
+            // which kept hasPendingPush ~always true and starved the receiving device's syncDown guard so peer
+            // settings never applied. Route these writes through the suppression window so they do NOT arm a
+            // push. Genuine edits (touch:true) above are never suppressed, so real toggles still sync.
+            VortXSyncManager.suppressHousekeeping(writeRosterAndActive)
         }
     }
+
+    // MARK: Delete tombstones (durable cross-device delete propagation)
+
+    private func loadDeletedTombstones() {
+        deletedProfileIDs = Set(UserDefaults.standard.stringArray(forKey: Self.deletedKey) ?? [])
+    }
+
+    private func saveDeletedTombstones() {
+        UserDefaults.standard.set(Array(deletedProfileIDs), forKey: Self.deletedKey)
+    }
+
+    /// Record a profile deletion so it sticks across devices. NEVER tombstones the owner (it always
+    /// exists, so a stray tombstone there would erase the account owner). Idempotent.
+    private func tombstone(_ id: UUID) {
+        guard id != UserProfile.ownerID else { return }
+        let key = id.uuidString
+        guard !deletedProfileIDs.contains(key) else { return }
+        deletedProfileIDs.insert(key)
+        saveDeletedTombstones()
+    }
+
+    /// Fold incoming tombstones (from another device's doc.vortx.deletedProfiles) into the local set,
+    /// dropping the owner id defensively. Returns true when the set changed (so callers can prune the
+    /// live roster of any now-tombstoned profile). The union means a tombstone propagates everywhere.
+    @discardableResult
+    func mergeDeletedTombstones(_ incoming: [String]) -> Bool {
+        let add = incoming.filter { $0 != UserProfile.ownerID.uuidString && !deletedProfileIDs.contains($0) }
+        guard !add.isEmpty else { return false }
+        deletedProfileIDs.formUnion(add)
+        saveDeletedTombstones()
+        pruneTombstonedProfiles()
+        return true
+    }
+
+    /// Remove any live profile whose id is tombstoned (the owner is never tombstoned, so it is safe).
+    /// touch: false so a prune driven by a sync-down never schedules a redundant push.
+    private func pruneTombstonedProfiles() {
+        let before = profiles
+        profiles.removeAll { deletedProfileIDs.contains($0.id.uuidString) && !$0.isOwner }
+        guard profiles != before else { return }
+        if activeID == nil || !profiles.contains(where: { $0.id == activeID }) {
+            activeID = profiles.first?.id
+        }
+        if let active {
+            applyTheme(active)
+            applyPlayback(active)
+        }
+        persist(touch: false)
+        loadWatchCache()
+    }
+
+    /// Apply the LOCAL delete tombstones to the live roster. Called by VortXSyncManager after EVERY sync pull,
+    /// so a profile this device just deleted is removed again even when the pulled doc PREDATES the tombstone
+    /// reaching the cloud (the resurrect-after-delete window: a pull lands the account's old roster back
+    /// between the delete and its debounced push). The local tombstone set is the durable authority, so
+    /// applying it on every pull closes that window. Idempotent; never touches the owner.
+    func applyLocalTombstones() { pruneTombstonedProfiles() }
 
     // MARK: Roster sync (the profile list follows the primary account across devices)
 
@@ -680,22 +785,80 @@ final class ProfileStore: ObservableObject {
         for index in profiles.indices where profiles[index].isOwner {
             profiles[index].usesOwnAccount = false
         }
-        // The owner is a singleton: one account, one owner profile. A restore/merge can leave more than
-        // one (e.g. the account owner adopted alongside a leftover local placeholder: the duplicate-"Main"
-        // bug). Collapse to ONE, direction-independently. Keep the genuine account owner, identified by its
-        // account email (the placeholder default is created with a nil email and the name "Main"; the
-        // account owner carries the email). Demote the rest to ordinary shared profiles, NEVER delete:
-        // a demoted profile keeps its overlay and becomes deletable from the dashboard.
+        // The owner is a singleton: one account, one owner profile, with a STABLE id (UserProfile.ownerID).
+        // A restore/merge can leave more than one (the account owner adopted alongside a leftover local
+        // placeholder minted with a random id: the duplicate-"Main" bug). Collapse to ONE,
+        // direction-independently. Keep the genuine account owner, identified by its account email (the
+        // placeholder default is created with a nil email and the name "Main"; the account owner carries
+        // the email). The duplicate owners are DROPPED, not demoted: an owner reads the account/engine
+        // history and carries no private watch overlay, so a clone has nothing unique to lose, and dropping
+        // it is what finally removes the leftover "Main" the owner kept seeing. Secondaries are never owners
+        // and are never touched here, so the union's "never silently drop a profile with its own history"
+        // guarantee is preserved.
         let owners = profiles.indices.filter { profiles[$0].isOwner }
-        guard owners.count > 1 else { return }
+        guard let firstOwner = owners.first else { return }
         let signedInEmail = UserDefaults.standard.string(forKey: "stremiox.email")
         let keep = owners.first(where: { signedInEmail != nil && !signedInEmail!.isEmpty && profiles[$0].email == signedInEmail })
             ?? owners.first(where: { !(profiles[$0].email ?? "").isEmpty })
             ?? owners.first(where: { profiles[$0].id == activeID })
-            ?? owners[0]
-        for index in owners where index != keep {
-            profiles[index].isOwner = false
+            ?? firstOwner
+        let keepID = profiles[keep].id
+        if owners.count > 1 {
+            let dropIDs = Set(owners.filter { profiles[$0].id != keepID }.map { profiles[$0].id })
+            profiles.removeAll { $0.isOwner && dropIDs.contains($0.id) }
+            if let a = activeID, dropIDs.contains(a) { activeID = keepID }
         }
+        // Re-key the surviving owner onto the stable owner id so every device converges and future merges
+        // dedupe by id. Skip if the owner carries a parental PIN (its hash is salted with the current id,
+        // so re-keying would silently break the PIN) or if some other profile already holds the stable id
+        // (avoid an id collision). The drop above already removes the duplicate even without re-keying.
+        if let idx = profiles.firstIndex(where: { $0.isOwner }),
+           profiles[idx].id != UserProfile.ownerID,
+           !(profiles[idx].hasPin),
+           !profiles.contains(where: { $0.id == UserProfile.ownerID && !$0.isOwner }) {
+            let old = profiles[idx].id
+            profiles[idx].id = UserProfile.ownerID
+            if activeID == old { activeID = UserProfile.ownerID }
+        }
+        collapseEmptyDuplicateSecondaries()
+    }
+
+    /// Collapse ACCIDENTAL duplicate secondaries: when two or more non-owner profiles share the same name
+    /// (trimmed, case-insensitive), an EMPTY one (no watch overlay) is almost always a cross-device sync
+    /// artifact, the same person's profile re-created with a fresh UUID on another device, so the union keeps
+    /// both and the user sees a second "Daksh" that a delete cannot clear (its twin keeps coming back). Drop
+    /// AND tombstone the empty duplicate when a same-name profile is already kept, so it never returns. A
+    /// profile that carries its OWN watch history is NEVER auto-removed, so a genuine same-name conflict is
+    /// left for the user to resolve and no history is ever lost.
+    private func collapseEmptyDuplicateSecondaries() {
+        let secondaries = profiles.filter { !$0.isOwner }
+        guard secondaries.count > 1 else { return }
+        func nameKey(_ p: UserProfile) -> String { p.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        func hasHistory(_ id: UUID) -> Bool {
+            guard let d = UserDefaults.standard.data(forKey: Self.watchCacheKey(id)),
+                  let m = try? JSONDecoder().decode([String: WatchEntry].self, from: d) else { return false }
+            return !m.isEmpty
+        }
+        // History-bearing profiles sort first so they are always the kept one for their name; the rest sort
+        // deterministically. Then, per name, keep the first and drop only the EMPTY duplicates.
+        let ordered = secondaries.sorted {
+            hasHistory($0.id) != hasHistory($1.id) ? hasHistory($0.id) : $0.id.uuidString < $1.id.uuidString
+        }
+        var keptNames = Set<String>()
+        var dropIDs = Set<UUID>()
+        for p in ordered {
+            let k = nameKey(p)
+            if k.isEmpty { continue }
+            if keptNames.contains(k) {
+                if !hasHistory(p.id) { dropIDs.insert(p.id) }   // empty same-name dup: safe to remove
+            } else {
+                keptNames.insert(k)
+            }
+        }
+        guard !dropIDs.isEmpty else { return }
+        for id in dropIDs { tombstone(id) }                      // durable: never resurrects via the union-merge
+        profiles.removeAll { dropIDs.contains($0.id) }
+        if let a = activeID, dropIDs.contains(a) { activeID = profiles.first?.id }
     }
 
     // MARK: Roster merge (UNION by id, so cross-device sync never silently drops a profile)
@@ -756,6 +919,11 @@ final class ProfileStore: ObservableObject {
             merged.append(remote)
         }
 
+        // SUBTRACT delete tombstones from the union: a profile the user deleted must NOT come back, even
+        // if a peer device (or the pre-delete cloud blob) still carries it. The owner is never tombstoned,
+        // so this can never remove the account owner.
+        merged.removeAll { deletedProfileIDs.contains($0.id.uuidString) && !$0.isOwner }
+
         // No change once the ids and chosen fields already match: skip the write so this never loops
         // (reloadFromDefaults / syncDown call into here on the foreground/auto path).
         guard merged != profiles else { return }
@@ -793,8 +961,14 @@ final class ProfileStore: ObservableObject {
     var cwItems: [CoreCWItem] {
         var dated: [(lastWatched: String, item: CoreCWItem)] = []
         for (metaId, entry) in watch {
-            if entry.type == "movie", entry.durationMs > 0,
-               Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95 { continue }
+            // A finished MOVIE leaves Continue Watching. Two finish signals: the movie's OWN id marked
+            // watched (markWatched/setWatched append it; finishedWatching then zeroes the offset, so without
+            // this a watched movie stays pinned forever by the watchedVideoIds keep-rule below), OR a near-end
+            // offset. A series is unaffected: its keep-signal is EPISODE ids, never the series metaId, so it
+            // rolls forward to the next episode as before. (libraryItems keeps finished movies; this is cwItems.)
+            if entry.type == "movie",
+               entry.watchedVideoIds.contains(metaId)
+                || (entry.durationMs > 0 && Double(entry.timeOffsetMs) >= Double(entry.durationMs) * 0.95) { continue }
             guard entry.timeOffsetMs > 0 || !entry.watchedVideoIds.isEmpty else { continue }
             let item = CoreCWItem(id: metaId, type: entry.type, name: entry.name, poster: entry.poster,
                                   state: CoreLibState(timeOffset: Double(entry.timeOffsetMs),
@@ -932,19 +1106,21 @@ final class ProfileStore: ObservableObject {
 
     private func schedulePushWatch() {
         pushWatchTask?.cancel()
-        // An overlay profile's library/CW just changed: nudge the VortX E2E sync so doc.vortx.byProfile
-        // refreshes and the SyncRoom broadcast fires, so sibling devices pull within ~5s and
-        // applyRemoteOverlay shows it (real-time per-profile sync). Runs regardless of the legacy
-        // ProfileSync key below; requestSyncSoon no-ops when not signed into a VortX account.
-        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
-        guard let profile = active, !profile.usesEngineHistory,
-              let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty else { return }
+        // DEBOUNCED (3s): progress writes fire on every ~20s tick AND on every pause / seek / menu / close,
+        // so nudging the VortX E2E sync on EACH write (the old immediate requestSyncSoon) stormed the
+        // whole-doc encrypt + push on overlay profiles - a burst of seeks = a burst of syncs. Coalesce BOTH
+        // the E2E nudge and the legacy ProfileSync push into one trailing task, so a burst of writes = ONE
+        // sync 3s after the last write. requestSyncSoon no-ops when not signed into a VortX account.
+        let profile = active
         let snapshot = watch
-        let id = profile.id
-        pushWatchTask = Task {
+        pushWatchTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(3))
             guard !Task.isCancelled else { return }
-            await ProfileSync.pushWatch(snapshot, profileID: id, authKey: key)
+            VortXSyncManager.shared.requestSyncSoon()
+            if let profile, !profile.usesEngineHistory,
+               let key = Keychain.string(keychainAccount(for: profile)), !key.isEmpty {
+                await ProfileSync.pushWatch(snapshot, profileID: profile.id, authKey: key)
+            }
         }
     }
 

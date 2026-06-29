@@ -8,13 +8,14 @@ import SwiftUI
 /// This hero is an AMBIENT BILLBOARD, decoupled from the catalog grid: the model rotates it through a
 /// random pool of top items as a still backdrop, and rotation quiets while the user interacts. It does
 /// NOT auto-select / focus / ring any poster, and tapping a poster opens that title via normal
-/// navigation rather than "featuring" it here (issue #53). When the featured item has a trailer id and
-/// motion is allowed, a muted, looping YouTube clip plays as the hero backdrop (#44) via the keyless
-/// IFrame embed (`YouTubeEmbedView`); the still backdrop underneath is the permanent fallback, so a
-/// missing / slow / blocked clip never occludes the art (this is the correct fix for the old "Error 153"
-/// autoplay layer that was removed in issue #46/#1/#3). The Play button opens the title's detail and the
-/// Trailer chip plays the trailer in-app in a full-screen cover. The cross-fade, rotation, and the hero
-/// clip honour `accessibilityReduceMotion` (the view swaps instantly and the clip is skipped when set).
+/// navigation rather than "featuring" it here (issue #53). When the featured item has a trailer whose
+/// `playableURL` resolves and motion is allowed, a muted, looping clip plays as the hero backdrop (#44)
+/// through the native libmpv player over the embedded server's `/yt` route (`InHeroTrailerView`), the
+/// SAME path tvOS uses — no YouTube web embed (which YouTube's July-2025 Referer enforcement broke). The
+/// still backdrop underneath is the permanent fallback, so a missing / slow / blocked clip never occludes
+/// the art. The Play button opens the title's detail and the Trailer chip plays the trailer in-app in a
+/// full-screen native player cover. The cross-fade, rotation, and the hero clip honour
+/// `accessibilityReduceMotion` (the view swaps instantly and the clip is skipped when set).
 struct FeaturedHeroView: View {
     @ObservedObject var model: FeaturedHeroModel
     /// Open the featured title's detail page (hero Play button).
@@ -22,12 +23,15 @@ struct FeaturedHeroView: View {
 
     @EnvironmentObject private var theme: ThemeManager
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The "Auto-play trailers" setting, honored by the other three hero clip call sites (tvOS home + both
+    /// detail pages). The home billboard clip gates on it too so turning trailers off in Settings actually
+    /// stops this ambient clip, not just reduced-motion.
+    @AppStorage("stremiox.autoplayTrailers") private var autoplayTrailers = true
 
-    /// The yt id presented full-screen by the Trailer chip (Bug A in the hero). Drives a cover.
-    @State private var trailerEmbedID: String?
-    /// Hero ids whose trailer embed reported a failure (owner disabled embedding, removed video, etc.).
-    /// The clip is suppressed for these so the still backdrop shows instead of YouTube's error card.
-    @State private var failedTrailerIDs: Set<String> = []
+    /// The trailer presented full-screen IN-APP by the Trailer chip - a YouTube id handed to the keyless
+    /// WKWebView IFrame cover (`TrailerEmbedCover`), the reliable YouTube path now that tokenless extraction
+    /// is dead. Drives a cover.
+    @State private var trailerEmbed: TrailerEmbedLaunch?
 
 
     /// Hero band height. iOS is 380: a bit bigger than the 0.3.0 320 (the user wanted a larger billboard),
@@ -69,53 +73,30 @@ struct FeaturedHeroView: View {
         // cross-fade, but keying the container guarantees art + overlay move as one.
         .animation(reduceMotion ? nil : .easeOut(duration: FeaturedHeroModel.heroCrossfade),
                    value: model.hero?.id)
-        // Bug A in the hero: the Trailer chip presents the in-app YouTube embed full-screen (a media
-        // cover, so it fills the window on macOS too).
-        .platformFullScreenPlayerCover(item: trailerEmbedCoverItem) { item in
-            TrailerEmbedCover(youTubeID: item.id, title: model.hero?.name ?? "Trailer",
-                              onClose: { trailerEmbedID = nil })
+        // The Trailer chip presents the trailer IN-APP full-screen via the keyless WKWebView IFrame cover
+        // (the reliable YouTube path now that tokenless extraction is dead), filling the window on macOS too.
+        .platformFullScreenPlayerCover(item: $trailerEmbed) { launch in
+            TrailerEmbedCover(youTubeID: launch.youTubeID, title: launch.title, onClose: { trailerEmbed = nil })
+                .ignoresSafeArea()
         }
     }
 
-    /// The muted, looping, chromeless in-hero clip (#44). Mounted over the backdrop ONLY when motion is
-    /// allowed and the featured item has a resolved trailer id. Keyed on the hero id so it reloads per
-    /// item; the still backdrop underneath is the fallback when no clip plays. Decorative — the title /
-    /// meta read first for VoiceOver.
+    /// The muted, looping, chromeless in-hero clip (#44), now played through libmpv via `InHeroTrailerView`
+    /// (the embedded server's `/yt` route), mirroring tvOS. Mounted over the backdrop ONLY when motion is
+    /// allowed and the featured item's trailer resolves a PLAYABLE url (nil on the Lite build, so it
+    /// no-ops to the still backdrop there). Keyed on the URL so it reloads per item and tears down the
+    /// moment the hero rotates to another title; the still backdrop underneath is the fallback when no
+    /// clip plays. Decorative — the title / meta read first for VoiceOver.
     @ViewBuilder private var heroClip: some View {
-        if !reduceMotion, let hero = model.hero, let yt = hero.trailerYouTubeID, !yt.isEmpty,
-           !failedTrailerIDs.contains(hero.id) {
-            YouTubeEmbedView(youTubeID: yt, mode: .background, onFailure: { failedTrailerIDs.insert(hero.id) })
-                .frame(height: heroHeight)
-                .frame(maxWidth: .infinity)
-                .clipped()
-                .allowsHitTesting(false)       // the clip is ambient; taps fall through to the chrome
-                .id("hero-clip-\(hero.id)")    // reload the embed for each new featured item
+        if autoplayTrailers, !reduceMotion, let hero = model.hero,
+           let yt = hero.trailerYouTubeID, !yt.isEmpty {
+            // Home billboard = the muted, looping trailer through the WKWebView IFrame (tokenless /yt extraction
+            // is dead). Non-interactive so it stays ambient; the still backdrop underneath is the fallback.
+            YouTubeEmbedView(youTubeID: yt, mode: .background)
+                .frame(height: heroHeight).clipped().allowsHitTesting(false)
+                .id("hero-clip-\(hero.id)")    // reload the clip for each new featured item / rotation
                 .transition(reduceMotion ? .identity : .opacity)
-                .overlay(
-                    // Reuse the same dual scrim the backdrop uses so the title/meta stay legible over
-                    // video, and the band still dissolves into the page below.
-                    LinearGradient(stops: [
-                        .init(color: .clear, location: 0.0),
-                        .init(color: Theme.Palette.canvas.opacity(0.35), location: 0.5),
-                        .init(color: Theme.Palette.canvas.opacity(0.85), location: 0.82),
-                        .init(color: Theme.Palette.canvas, location: 1.0),
-                    ], startPoint: .top, endPoint: .bottom)
-                )
-                .overlay(
-                    LinearGradient(colors: [Theme.Palette.canvas.opacity(0.6), .clear],
-                                   startPoint: .leading, endPoint: .center)
-                )
-                .accessibilityHidden(true)
         }
-    }
-
-    /// Binding of the Identifiable yt-id box that drives the cover. Maps the `String?` state into the
-    /// `Binding<TrailerEmbedID?>` the cover modifier expects; clearing it dismisses.
-    private var trailerEmbedCoverItem: Binding<TrailerEmbedID?> {
-        Binding(
-            get: { trailerEmbedID.map(TrailerEmbedID.init) },
-            set: { trailerEmbedID = $0?.id }
-        )
     }
 
     // MARK: Backdrop (full-bleed still art + dual scrim, lifted from iOSDetailView.backdrop)
@@ -215,20 +196,10 @@ struct FeaturedHeroView: View {
     /// The add-on logo when enrichment surfaced one (the editorial signature), else the serif hero
     /// type — mirrors `iOSDetailView.titleOrLogo`.
     @ViewBuilder private func titleOrLogo(_ hero: FeaturedHeroItem) -> some View {
-        if let logo = hero.logo, let url = URL(string: logo), !logo.isEmpty {
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let img):
-                    img.resizable().aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: 320, maxHeight: 110, alignment: .leading)
-                        .shadow(color: .black.opacity(0.45), radius: 10, y: 4)
-                        // The logo is the title in image form — read the name, not the URL.
-                        .accessibilityLabel(hero.name)
-                default:
-                    heroTitle(hero)
-                }
-            }
-        } else {
+        // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
+        // The shared component is used by tvOS + the detail pages too, so the logo behaves identically everywhere.
+        ResolvedTitleLogo(id: hero.id, type: hero.type, fallbackLogo: hero.logo,
+                          maxWidth: 320, maxHeight: 110, accessibilityName: hero.name) {
             heroTitle(hero)
         }
     }
@@ -277,13 +248,13 @@ struct FeaturedHeroView: View {
 
     /// The Trailer chip — shown only when the enriched hero carries a trailer whose `playableURL`
     /// resolves (so the Lite build, with no proxy, auto-hides it the same way the detail page does).
-    /// Tapping it opens an explicit full-screen player cover; it never autoplays inline.
+    /// Tapping it opens an explicit full-screen IN-APP player cover; it never autoplays inline.
     @ViewBuilder private func trailerButton(_ hero: FeaturedHeroItem) -> some View {
         if let yt = hero.trailerYouTubeID, !yt.isEmpty {
             Button {
-                // Play the trailer in-app via the keyless YouTube IFrame embed (Bug A) — same as the
-                // detail page. No external hand-off, no Error 153.
-                trailerEmbedID = yt
+                // Play the trailer in-app via the keyless WKWebView IFrame cover (the reliable YouTube path
+                // now that tokenless /yt extraction is dead), with a silent hand-off if a video blocks embedding.
+                trailerEmbed = TrailerEmbedLaunch(youTubeID: yt, title: "\(hero.name) — Trailer")
             } label: {
                 Label("Trailer", systemImage: "play.rectangle.fill")
             }
@@ -292,5 +263,9 @@ struct FeaturedHeroView: View {
     }
 }
 
-/// Identifiable yt-id box for `platformFullScreenCover(item:)` (the hero Trailer chip, Bug A).
-private struct TrailerEmbedID: Identifiable { let id: String }
+/// Identifiable launch box for the hero Trailer chip's in-app IFrame cover (`platformFullScreenPlayerCover(item:)`).
+private struct TrailerEmbedLaunch: Identifiable {
+    let id = UUID()
+    let youTubeID: String
+    let title: String
+}

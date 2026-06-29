@@ -12,12 +12,14 @@ export type Route =
   | { name: "library" }
   | { name: "live" }
   | { name: "settings" }
-  | { name: "login" };
+  | { name: "login" }
+  | { name: "approve" }; // QR device approval; ?c=&k= ride in the hash query, read by the approve view
 
 /** Parse the current `location.hash` into a typed Route, defaulting to Home. */
 export function parseRoute(): Route {
   const hash = location.hash.replace(/^#\/?/, "");
-  const [path, ...rest] = hash.split("/");
+  const [rawPath, ...rest] = hash.split("/");
+  const path = rawPath.split("?")[0]; // strip a query string (e.g. #/approve?c=..&k=..)
   const tail = rest.join("/");
 
   switch (path) {
@@ -41,6 +43,8 @@ export function parseRoute(): Route {
       return { name: "settings" };
     case "login":
       return { name: "login" };
+    case "approve":
+      return { name: "approve" };
     default:
       return { name: "home" };
   }
@@ -67,6 +71,8 @@ export function hashFor(route: Route): string {
       return "#/settings";
     case "login":
       return "#/login";
+    case "approve":
+      return "#/approve";
   }
 }
 

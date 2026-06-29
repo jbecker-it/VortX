@@ -561,3 +561,104 @@ final class DebridCoordinator {
         return try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
     }
 }
+
+// MARK: - Play-path bridge (cached debrid → direct link)
+
+extension DebridCoordinator {
+    /// Streaming-settle ceiling for an in-line resolve, matched to the source-list settle window: a CACHED
+    /// torrent resolves in ~1 round trip, so 15s comfortably covers it while bounding a stall (an uncached
+    /// add-then-poll, a flaky provider, a hung network) so the play action never hangs the UI. On timeout the
+    /// resolve Task is cancelled and the caller falls soft to the local engine.
+    private static let resolveTimeout: Duration = .seconds(15)
+
+    /// The single bridge from a tapped/auto-picked RAW TORRENT to a debrid DIRECT link for playback.
+    ///
+    /// Returns a remote HTTPS URL the player can open as a plain direct stream (NOT a torrent — it does not
+    /// match the `{server}:11470/{40-hex}/{idx}` shape the player keys torrent behaviour off, so it gets no
+    /// `/create`, no warm-up, and no `closeTorrent` teardown), or `nil` when the caller should use today's
+    /// path unchanged. It is FAIL-SOFT by construction: every non-success (no key, not a raw torrent, any
+    /// `DebridError`, a throw, or the timeout) returns `nil`, so the user is never left unable to play.
+    ///
+    /// NO-KEY BYTE-IDENTICAL GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns
+    /// `nil` on the very first line with ZERO `await` and zero provider contact, so the caller runs exactly
+    /// the code it ran before this feature existed. The same immediate `nil` applies to any non-raw-torrent
+    /// stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
+    ///
+    /// - Parameters:
+    ///   - stream: the stream the user is about to play.
+    ///   - episode: the SxEy target for a series, so a season-pack resolves the right file. `nil` for movies.
+    func resolvedPlaybackURL(for stream: CoreStream, episode: DebridEpisode? = nil) async -> URL? {
+        // Raw torrent only: a stream WITH a `url` is already a direct/debrid link; one with neither url nor
+        // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
+        guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
+        // No-key fast path: zero await, zero behaviour change. This is the byte-identical guarantee.
+        guard hasAnyResolver else { return nil }
+
+        // Build the magnet from the infohash (+ the add-on's `sources`, which carry trackers some providers
+        // use to add the magnet); fileIdx biases the season-pack pick when present, the episode SxEy refines it.
+        let trackers = (stream.sources ?? []).filter { $0.hasPrefix("tracker:") }.map { String($0.dropFirst("tracker:".count)) }
+        let magnet = DebridResolve.magnet(forHash: hash, name: stream.behaviorHints?.filename, trackers: trackers)
+        let fileIdx = stream.fileIdx   // hoist the value so the @Sendable task captures an Int?, not CoreStream
+
+        // Bounded resolve: race the provider resolve against a timeout sleep; whichever finishes first wins and
+        // the loser is cancelled. Any throw / timeout collapses to `nil` → the caller falls soft.
+        return await withTaskGroup(of: URL?.self) { group in
+            group.addTask {
+                try? await DebridCoordinator.shared.resolve(
+                    infoHash: hash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+            }
+            group.addTask {
+                try? await Task.sleep(for: DebridCoordinator.resolveTimeout)
+                return nil   // timeout sentinel
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+}
+
+// MARK: - Detail-view cache awareness
+
+/// Publishes the set of raw-torrent infoHashes a detail page's title has CACHED in the user's debrid
+/// account, so the source list can badge + rank them up (`StreamRanking(debridCachedHashes:)`). It is a
+/// per-view `@StateObject`: a detail view holds one, calls `refresh(from:)` once the title's stream
+/// groups have loaded, and reads `cachedHashes` for the badge + ranking. With NO debrid key configured
+/// `DebridCoordinator.cacheCheck` returns `[:]`, so `cachedHashes` stays empty and nothing changes.
+///
+/// Awareness only: this never resolves a direct link or touches the play path. It de-dups by the set of
+/// hashes it last queried, so a re-render with the same torrents does not re-hit the provider.
+@MainActor
+final class DebridCacheAwareness: ObservableObject {
+    /// Lowercased infoHashes confirmed cached. Empty until a check completes (and always, with no key).
+    @Published private(set) var cachedHashes: Set<String> = []
+
+    /// The hash set most recently queried, so an identical set (same title, same torrents) is a no-op.
+    private var lastQueried: Set<String> = []
+    private var task: Task<Void, Never>?
+
+    /// Collect the RAW-torrent infoHashes in `groups` (a raw torrent is `url == nil`, `infoHash != nil`)
+    /// and, if that set changed since the last query, ask the coordinator which are cached. Cheap and
+    /// debounced: identical input returns immediately, and an empty input or no-key path clears nothing
+    /// it didn't set. Safe to call on every `groups` change / `.task`.
+    func refresh(from groups: [CoreStreamSourceGroup]) {
+        var hashes: Set<String> = []
+        for group in groups {
+            for stream in group.streams where stream.url == nil {
+                if let h = stream.infoHash?.lowercased(), !h.isEmpty { hashes.insert(h) }
+            }
+        }
+        guard !hashes.isEmpty else { return }          // nothing to check; leave any prior result intact
+        guard hashes != lastQueried else { return }    // same torrents already queried: no re-hit
+        task?.cancel()
+        task = Task { [weak self] in
+            let result = await DebridCoordinator.shared.cacheCheck(hashes: Array(hashes))
+            guard !Task.isCancelled, let self else { return }
+            // Commit the queried set ONLY after a real result, so a failed/cancelled check leaves
+            // lastQueried untouched and the next refresh re-hits the provider instead of being deduped away.
+            self.lastQueried = hashes
+            // result keys are already lowercased infoHashes (see TorBoxResolver.checkCache).
+            self.cachedHashes = Set(result.keys)
+        }
+    }
+}

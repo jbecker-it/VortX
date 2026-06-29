@@ -52,11 +52,20 @@ export async function loadInstalledAddons(): Promise<Addon[]> {
   return addons;
 }
 
+// When signed in, add/remove pushes the new installed list UP to the account (the doc.addons web sibling)
+// so add-ons added on the web reach the user's other devices. The pusher is INJECTED by account.ts (which
+// owns the session + the encrypted write) to avoid a store -> account import cycle; null when signed out.
+let addonsSyncPusher: (() => void) | null = null;
+export function registerAddonsSyncPusher(fn: (() => void) | null): void {
+  addonsSyncPusher = fn;
+}
+
 /** Add a stream/catalog add-on by transport URL. Validates the manifest before persisting; returns
  *  the resolved Addon so the caller can refresh the UI. Throws if the URL is not a valid add-on. */
 export async function addAddon(transportUrl: string): Promise<Addon> {
   const addon = await loadAddon(transportUrl.trim()); // validates scheme (https-only) + normalizes
   persist([...installedUrls(), addon.transportUrl]); // store exactly the normalized URL that loaded
+  addonsSyncPusher?.(); // fire-and-forget push to the account (no-op signed out)
   return addon;
 }
 
@@ -64,6 +73,7 @@ export async function addAddon(transportUrl: string): Promise<Addon> {
 export function removeAddon(transportUrl: string): void {
   if (transportUrl === CINEMETA_URL) return;
   persist(installedUrls().filter((u) => u !== transportUrl));
+  addonsSyncPusher?.();
 }
 
 // --- Library (saved titles) ---------------------------------------------------------------------
@@ -112,6 +122,31 @@ export function mergeInstalledAddons(urls: string[]): boolean {
     .filter((u) => !existing.has(u));
   if (!added.length) return false;
   persist([...installedUrls(), ...added]); // persist() de-dupes + pins Cinemeta first
+  return true;
+}
+
+/** Apply a synced add-on ORDER to the local list (read-down): take the synced order as canonical for the
+ *  URLs we have installed, then append any local-only URLs in their current order (never drops a local
+ *  add-on). Cinemeta stays pinned first so Home + meta always work. Persists + returns true only when the
+ *  order actually changes, so it never triggers a redundant re-render. https-only, like mergeInstalledAddons. */
+export function applyAddonOrder(orderedUrls: string[]): boolean {
+  const cleanOrder = orderedUrls
+    .filter((u): u is string => typeof u === "string" && /^https:\/\//i.test(u.trim()))
+    .map((u) => u.trim());
+  if (!cleanOrder.length) return false;
+  const current = installedUrls();
+  const currentSet = new Set(current);
+  const ordered: string[] = [];
+  const seen = new Set<string>([CINEMETA_URL]); // Cinemeta is pinned first below, never in the middle
+  for (const u of cleanOrder) {
+    if (currentSet.has(u) && !seen.has(u)) { ordered.push(u); seen.add(u); }
+  }
+  for (const u of current) {
+    if (!seen.has(u)) { ordered.push(u); seen.add(u); }
+  }
+  const next = [CINEMETA_URL, ...ordered];
+  if (next.length === current.length && next.every((u, i) => u === current[i])) return false;
+  persist(next);
   return true;
 }
 
@@ -285,6 +320,129 @@ function persistCW(entries: CWEntry[]): void {
   } catch {
     /* storage disabled or full: best-effort */
   }
+}
+
+/** Merge externally-sourced Continue Watching entries (derived from the synced account library's watch
+ *  progress) into the OWNER (base) store - account watch history belongs to the owner, never an active
+ *  overlay profile, mirroring how mergeLibrary always targets the base key. Union by resumeId; a fresher
+ *  local entry (newer updatedAt) is never clobbered. Only in-progress entries (0 < position/duration <
+ *  0.95) are kept. Returns whether anything changed (so the caller can trigger a re-render). */
+export function mergeContinueWatching(entries: CWEntry[]): boolean {
+  const incoming = entries.filter(
+    (e) =>
+      e &&
+      typeof e.id === "string" &&
+      typeof e.resumeId === "string" &&
+      e.duration > 0 &&
+      e.position > 0 &&
+      e.position / e.duration < 0.95,
+  );
+  if (!incoming.length) return false;
+  let existing: CWEntry[] = [];
+  try {
+    const raw = localStorage.getItem(CW_KEY); // base (owner) key, NOT the active scope
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
+  } catch {
+    existing = [];
+  }
+  const byResume = new Map(
+    existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]),
+  );
+  let changed = false;
+  for (const e of incoming) {
+    const cur = byResume.get(e.resumeId);
+    if (!cur || e.updatedAt > cur.updatedAt) {
+      byResume.set(e.resumeId, e);
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
+  try {
+    localStorage.setItem(CW_KEY, JSON.stringify(next));
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
+// --- Per-profile (scoped) hydration -------------------------------------------------------------
+// Account hydration of a SECONDARY (overlay) profile's synced library / continue-watching writes into
+// that profile's own scoped key (LIBRARY_KEY.<scope> / CW_KEY.<scope>), matching scopedKey()'s scheme,
+// so switching to that profile shows its own titles + resume points. scope "" targets the owner (base
+// key). Read-only union (existing local entries win); never deletes. Returns whether anything changed.
+
+function scopedBaseKey(base: string, scope: string): string {
+  return scope ? `${base}.${scope}` : base;
+}
+
+/** Merge a profile's synced library into its scoped key (union by id, existing wins). */
+export function mergeLibraryForScope(scope: string, items: MetaItem[]): boolean {
+  const valid = items.filter(
+    (m) => m && typeof m.id === "string" && typeof m.type === "string" && typeof m.name === "string",
+  );
+  if (!valid.length) return false;
+  const key = scopedBaseKey(LIBRARY_KEY, scope);
+  let existing: MetaItem[] = [];
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as MetaItem[];
+  } catch {
+    existing = [];
+  }
+  const seen = new Set(existing.map((e) => e.id));
+  const additions = valid
+    .filter((m) => !seen.has(m.id))
+    .map((m) => ({ id: m.id, type: m.type, name: m.name, poster: m.poster }));
+  if (!additions.length) return false;
+  try {
+    localStorage.setItem(key, JSON.stringify([...existing, ...additions]));
+  } catch {
+    /* best-effort */
+  }
+  return true;
+}
+
+/** Merge a profile's synced continue-watching into its scoped key (union by resumeId, fresher wins). */
+export function mergeContinueWatchingForScope(scope: string, entries: CWEntry[]): boolean {
+  const incoming = entries.filter(
+    (e) =>
+      e &&
+      typeof e.id === "string" &&
+      typeof e.resumeId === "string" &&
+      e.duration > 0 &&
+      e.position > 0 &&
+      e.position / e.duration < 0.95,
+  );
+  if (!incoming.length) return false;
+  const key = scopedBaseKey(CW_KEY, scope);
+  let existing: CWEntry[] = [];
+  try {
+    const raw = localStorage.getItem(key);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    if (Array.isArray(parsed)) existing = parsed as CWEntry[];
+  } catch {
+    existing = [];
+  }
+  const byResume = new Map(existing.filter((e) => e && typeof e.resumeId === "string").map((e) => [e.resumeId, e]));
+  let changed = false;
+  for (const e of incoming) {
+    const cur = byResume.get(e.resumeId);
+    if (!cur || e.updatedAt > cur.updatedAt) {
+      byResume.set(e.resumeId, e);
+      changed = true;
+    }
+  }
+  if (!changed) return false;
+  const next = [...byResume.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 40);
+  try {
+    localStorage.setItem(key, JSON.stringify(next));
+  } catch {
+    /* best-effort */
+  }
+  return true;
 }
 
 // --- Recent searches ----------------------------------------------------------------------------

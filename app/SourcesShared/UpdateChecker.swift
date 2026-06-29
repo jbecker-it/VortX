@@ -126,6 +126,11 @@ final class UpdateChecker: ObservableObject {
             guard let e = manifest.entry(for: self.platformKey), e.build > self.currentBuild else {
                 self.available = nil; self.prompt = nil; return
             }
+            // Only nudge for a stable ("Latest") release. A prerelease entry (every beta today) stays
+            // silent - testers sideload betas by hand; the in-app prompt is for the blessed Latest build.
+            guard (e.prerelease ?? false) == false else {
+                self.available = nil; self.prompt = nil; return
+            }
             let release = Release(version: e.version ?? "", build: e.build, name: e.name ?? (e.version ?? "Update"),
                                   notes: e.notes ?? "", ipa: e.ipa, altstore: e.altstore)
             self.available = release
@@ -145,6 +150,9 @@ final class UpdateChecker: ObservableObject {
         let notes: String?
         let ipa: String?
         let altstore: String?
+        /// When true (every current beta), the in-app update prompt stays silent; flip to false / omit on
+        /// the first non-prerelease "Latest" release so the prompt fires only for stable builds.
+        let prerelease: Bool?
     }
 
     /// Typed wrapper over the manifest. Decoding into named optional fields (instead of `[String: Entry]`)

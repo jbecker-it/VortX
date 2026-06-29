@@ -60,21 +60,80 @@ struct XRDBSettingsView: View {
     @AppStorage(XRDB.enabledKey) private var enabled = true
     @AppStorage(XRDB.baseKey) private var baseURL = ""
     @AppStorage(XRDB.aliasKey) private var alias = ""
+    @AppStorage(ERDB.enabledKey) private var erdbEnabled = false
+    @AppStorage(ERDB.tokenKey) private var erdbToken = ""
+    @AppStorage(ERDB.baseKey) private var erdbBase = ""
+    @AppStorage(ERDB.fanartPostersKey) private var erdbFanartPosters = false
+    @AppStorage(Fanart.enabledKey) private var fanartEnabled = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
-                Text("Ratings on posters").screenTitleStyle()
+                Text("Poster artwork & ratings").screenTitleStyle()
                 Text("VortX bakes the rating onto your posters using its own service, no setup and no key needed. It is on by default. Advanced: point at your own XRDB-compatible instance (and profile alias) to use richer multi-source artwork instead. Unrelated to debrid.")
                     .font(Theme.Typography.body)
                     .foregroundStyle(Theme.Palette.textSecondary)
-                Toggle("Show ratings on posters", isOn: $enabled)
-                    .tint(Theme.Palette.accent)
-                    .padding(Theme.Space.md)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                Toggle(isOn: $enabled) {
+                    Text("Show ratings on posters")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
                 field("Custom instance URL (optional)", text: $baseURL, hint: "Leave blank to use VortX's own service. Or set your own XRDB-compatible endpoint.", url: true)
                 field("Profile alias (optional)", text: $alias, hint: "Only used with a custom instance: the config profile alias from its Configurator.", url: false)
+
+                Text("ERDB (posters + logos)")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("ERDB renders posters, backdrops, and rating-baked LOGOS and overrides the VortX poster service above when on. It uses VortX's own keyless service, so no token is needed, just turn it on. Advanced: add a Tk- token (or a self-hosted base URL) to use your own ERDB configuration instead.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                Toggle(isOn: $erdbEnabled) {
+                    Text("Use ERDB (overrides the above)")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                Toggle(isOn: $erdbFanartPosters) {
+                    Text("Use fanart posters")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                Text("Pull posters from fanart.tv instead of the default source (requires ERDB on). Uses your fanart key from Metadata keys if you set one, otherwise VortX's own key.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                field("ERDB token (optional)", text: $erdbToken, hint: "Not required: ERDB works keyless. Only for your own ERDB configurator profile. Stored on this device and synced, encrypted, to your VortX account.", url: false)
+                field("ERDB base URL (optional)", text: $erdbBase, hint: "Leave blank to use easyratingsdb.com. Or set a self-hosted ERDB instance.", url: true)
+
+                Text("fanart.tv artwork")
+                    .font(Theme.Typography.sectionTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("Use community clearlogos from fanart.tv for the hero, INDEPENDENT of ERDB (no rating-baked posters). Uses your fanart.tv key from Metadata keys. More fanart art (clearart, posters, backgrounds) follows.")
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                Toggle(isOn: $fanartEnabled) {
+                    Text("Use fanart.tv logos")
+                        .font(Theme.Typography.cardTitle)
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                }
+                .toggleStyle(.switch)
+                .tint(Theme.Palette.accent)
+                .padding(Theme.Space.md)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
