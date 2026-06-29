@@ -266,7 +266,7 @@ struct DetailView: View {
     /// otherwise the serif hero title text. Mirrors iOS `iOSDetailView.titleOrLogo`.
     @ViewBuilder private func titleOrLogo(_ m: CoreMetaItem) -> some View {
         // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
-        ResolvedTitleLogo(id: m.id, type: m.type, fallbackLogo: m.logo,
+        ResolvedTitleLogo(id: m.behaviorHints?.defaultVideoId ?? m.id, type: m.type, fallbackLogo: m.logo,
                           maxWidth: 640, maxHeight: 200, shadowOpacity: 0.5, shadowRadius: 12,
                           accessibilityName: m.name) {
             heroTitleText(m)

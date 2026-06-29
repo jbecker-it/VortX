@@ -545,7 +545,7 @@ struct iOSDetailView: View {
     /// otherwise the serif hero type.
     @ViewBuilder private var titleOrLogo: some View {
         // fanart.tv clearlogo first (when enabled), else the ERDB-aware add-on/metahub logo, else serif text.
-        ResolvedTitleLogo(id: meta?.id, type: meta?.type ?? "movie", fallbackLogo: meta?.logo,
+        ResolvedTitleLogo(id: meta?.behaviorHints?.defaultVideoId ?? meta?.id, type: meta?.type ?? "movie", fallbackLogo: meta?.logo,
                           maxWidth: 320, maxHeight: 110, accessibilityName: meta?.name ?? "") {
             heroTitle
         }
