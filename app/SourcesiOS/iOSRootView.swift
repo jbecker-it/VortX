@@ -691,9 +691,14 @@ struct iOSLibraryView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
     @EnvironmentObject private var profiles: ProfileStore   // gate the Library on the active profile's own history
+    @EnvironmentObject private var account: StremioAccount  // progress-recording wiring for play-from-local (#30)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var hero = FeaturedHeroModel()
     @State private var path: [FeaturedHeroItem] = []
+    #if !os(tvOS)
+    @ObservedObject private var downloads = DownloadStore.shared   // offline downloads section (#30)
+    @State private var downloadPlayer: iOSPlayerLaunch?            // play-from-local cover
+    #endif
 
     /// The owner profile's Library is the account library (engine); an overlay profile's Library is its
     /// own private watch overlay (every watched title), never the account.
@@ -702,6 +707,16 @@ struct iOSLibraryView: View {
         return source.map {
             RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: $0.progress)
         }
+    }
+
+    /// True when there is at least one offline download — keeps the empty-Library placeholder from
+    /// showing when a user has downloads but no saved titles. Always false on tvOS (downloads deferred).
+    private var hasDownloads: Bool {
+        #if os(tvOS)
+        return false
+        #else
+        return !downloads.records.isEmpty
+        #endif
     }
 
     /// The hero pool: the first few saved titles. Library entries carry no backdrop field, so (like
@@ -714,6 +729,15 @@ struct iOSLibraryView: View {
     var body: some View {
         NavigationStack(path: $path) {
             ScrollView {
+                #if !os(tvOS)
+                // Offline downloads (#30): a section at the top of Library, hidden when empty. Plays from
+                // the local file, with pause/resume/cancel/delete + total storage used.
+                if !downloads.records.isEmpty {
+                    DownloadsView(onPlay: { launch in downloadPlayer = launch })
+                        .padding(.horizontal, Theme.Space.md)
+                        .padding(.bottom, Theme.Space.lg)
+                }
+                #endif
                 // The owner profile's Library is the account library (engine), with its type/sort filter
                 // chips; an overlay profile's Library is its own private watch overlay, with no engine
                 // `selectable` so the filter chips are omitted. Both gate on the profile-aware
@@ -741,7 +765,9 @@ struct iOSLibraryView: View {
                     // Pin the column to the viewport width (same fix as Discover): the adaptive PosterGrid
                     // can report an over-wide ideal that the LazyVStack adopts, shifting the column left.
                     .frame(maxWidth: .infinity, alignment: .leading)
-                } else {
+                } else if !hasDownloads {
+                    // Only show the "Library empty" placeholder when there are ALSO no downloads — a user
+                    // with downloads but no saved titles still sees their offline section above.
                     ContentUnavailableViewCompat(title: "Library", systemImage: "books.vertical",
                         message: "Titles you add to your library in Stremio show up here.")
                         .frame(minHeight: 420)
@@ -753,6 +779,9 @@ struct iOSLibraryView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            #if !os(tvOS)
+            .iOSPlayerCover($downloadPlayer, account: account, core: core)
+            #endif
             .onAppear { if core.library?.catalog.isEmpty != false { core.loadLibrary() } }
         }
         .onAppear {
@@ -796,6 +825,144 @@ struct iOSLibraryView: View {
         }
     }
 }
+
+#if !os(tvOS)
+/// The offline-downloads section shown at the top of the Library tab (#30). Lists every download with
+/// live progress, plays a completed one from its LOCAL file (so it works offline), and offers
+/// pause/resume/cancel/delete plus a total-storage footer. Device-local only; nothing here syncs or
+/// touches the account library.
+struct DownloadsView: View {
+    /// Hand a ready-to-play local-file launch up to the Library view, which presents the player cover.
+    let onPlay: (iOSPlayerLaunch) -> Void
+
+    @ObservedObject private var store = DownloadStore.shared
+    private let manager = DownloadManager.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack {
+                Text("Downloads")
+                    .font(Theme.Typography.cardTitle)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Spacer(minLength: 0)
+                Text(store.formattedTotalSize())
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+            }
+            ForEach(store.records) { record in
+                row(record)
+            }
+        }
+    }
+
+    @ViewBuilder private func row(_ record: DownloadRecord) -> some View {
+        HStack(alignment: .top, spacing: Theme.Space.md) {
+            leadingGlyph(record)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(record.displayTitle)
+                    .font(Theme.Typography.body)
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(2)
+                subtitle(record)
+                if record.state == .downloading || record.state == .paused {
+                    ProgressView(value: record.fractionComplete)
+                        .tint(Theme.Palette.accent)
+                        .padding(.top, 2)
+                }
+            }
+            Spacer(minLength: 0)
+            controls(record)
+        }
+        .padding(Theme.Space.sm)
+        .background(Theme.Palette.surface1.opacity(0.6),
+                    in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { if record.state == .completed { play(record) } }
+    }
+
+    @ViewBuilder private func leadingGlyph(_ record: DownloadRecord) -> some View {
+        let symbol: String = {
+            switch record.state {
+            case .completed: return "play.circle.fill"
+            case .failed:    return "exclamationmark.triangle.fill"
+            case .paused:    return "pause.circle"
+            default:         return "arrow.down.circle"
+            }
+        }()
+        Image(systemName: symbol)
+            .font(.system(size: 26))
+            .foregroundStyle(record.state == .failed ? Theme.Palette.textTertiary : Theme.Palette.accent)
+    }
+
+    @ViewBuilder private func subtitle(_ record: DownloadRecord) -> some View {
+        let parts: [String] = {
+            switch record.state {
+            case .completed:
+                let size = ByteCountFormatter.string(fromByteCount: max(record.bytesDone, record.bytesTotal), countStyle: .file)
+                return [record.qualityText, size].compactMap { $0 }
+            case .downloading:
+                let pct = Int(record.fractionComplete * 100)
+                return ["Downloading \(pct)%"]
+            case .paused:
+                return ["Paused"]
+            case .failed:
+                return [record.errorText ?? "Failed"]
+            case .queued:
+                return ["Queued"]
+            }
+        }()
+        if !parts.isEmpty {
+            Text(parts.joined(separator: "  ·  "))
+                .font(Theme.Typography.label)
+                .foregroundStyle(Theme.Palette.textTertiary)
+                .lineLimit(1)
+        }
+    }
+
+    @ViewBuilder private func controls(_ record: DownloadRecord) -> some View {
+        HStack(spacing: Theme.Space.sm) {
+            switch record.state {
+            case .downloading:
+                iconButton("pause.fill", "Pause") { manager.pause(id: record.id) }
+            case .paused, .failed:
+                iconButton("arrow.clockwise", "Resume") { manager.resume(id: record.id) }
+            case .completed:
+                iconButton("play.fill", "Play") { play(record) }
+            case .queued:
+                EmptyView()
+            }
+            iconButton("trash", "Delete") { manager.cancel(id: record.id) }
+        }
+    }
+
+    private func iconButton(_ symbol: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(Theme.Palette.textSecondary)
+                .frame(width: 34, height: 34)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    /// Play a completed download from its LOCAL file. Rebuilds the engine `PlaybackMeta` so progress /
+    /// Continue Watching record exactly as for a streamed source; `isTorrent: false` because a finished
+    /// file plays directly (never back through the loopback torrent server). Fail-soft if the file is
+    /// missing (purged out from under us) — drop the row.
+    private func play(_ record: DownloadRecord) {
+        guard record.state == .completed, store.fileExists(for: record) else {
+            if record.state == .completed { manager.cancel(id: record.id) }   // file gone → clean up the stale row
+            return
+        }
+        let url = store.fileURL(for: record)
+        let launch = iOSPlayerLaunch(url: url, title: record.displayTitle, headers: nil,
+                                     resume: 0, meta: record.playbackMeta,
+                                     qualityText: record.qualityText, isTorrent: false)
+        onPlay(launch)
+    }
+}
+#endif
 
 /// Search across every installed add-on, on the engine (debounced). Mirrors the tvOS `SearchView`:
 /// results are grouped into Movies / Series / Other rail sections (#16) rather than one flat grid, a

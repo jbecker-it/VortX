@@ -184,6 +184,9 @@ struct iOSDetailView: View {
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
     // has cached, so they badge + rank up. Empty (zero badges, ranking unchanged) with no debrid key.
     @StateObject private var debridCache = DebridCacheAwareness()
+    #if !os(tvOS)
+    @ObservedObject private var downloads = DownloadStore.shared   // offline-download state for the hero "Download" affordance (#30)
+    #endif
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
@@ -806,6 +809,21 @@ struct iOSDetailView: View {
             trailerButton
             iOSLibraryChip()
             shareChip
+            #if !os(tvOS)
+            // Offline (#30): download the best source, the offline twin of Watch Now. Shows a check once
+            // this title is already downloaded so a user can't queue it twice.
+            Button {
+                Task { await downloadBest() }
+            } label: {
+                if downloads.hasDownload(videoId: meta?.id ?? id) {
+                    Label("Downloaded", systemImage: "checkmark.circle.fill")
+                } else {
+                    Label("Download", systemImage: "arrow.down.circle")
+                }
+            }
+            .buttonStyle(ChipButtonStyle())
+            .disabled(!movieReady || downloads.hasDownload(videoId: meta?.id ?? id))
+            #endif
         }
         // #16: why the recommended source was auto-picked - the rank decision the per-row tags don't show.
         if movieReady, let s = movieBest, let reason = StreamRanking.pickReason(s) {
@@ -860,9 +878,20 @@ struct iOSDetailView: View {
             // Hero already shows Watch + Quality + the "Sources" scroll button, so suppress this list's
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
-            play: { stream, url in Task { await playStream(stream, url: url) } }
+            play: { stream, url in Task { await playStream(stream, url: url) } },
+            download: movieDownloadHandler
         )
         .padding(.horizontal, Theme.Space.md)
+    }
+
+    /// The per-row offline-download handler passed to the movie source list — present on iPhone/iPad/Mac,
+    /// nil on tvOS (downloads are deferred there), so the list renders no Download affordance on tvOS.
+    private var movieDownloadHandler: ((CoreStream, URL) -> Void)? {
+        #if os(tvOS)
+        return nil
+        #else
+        return { stream, url in Task { await downloadStream(stream, url: url) } }
+        #endif
     }
 
     /// The id to dispatch a movie/live stream request with: the meta's imdb `defaultVideoId` (tt...) when
@@ -1027,6 +1056,29 @@ struct iOSDetailView: View {
                                             qualityText: StreamRanking.signature(stream),
                                             bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: !prime && stream.isTorrent))
     }
+
+    #if !os(tvOS)
+    // MARK: Offline download (#30)
+
+    /// Queue an offline download of a chosen MOVIE source. Resolves the URL EXACTLY as `playStream` does
+    /// (cached-debrid direct link preferred, else the source's `playableURL`), builds the same
+    /// `PlaybackMeta`, and hands both to `DownloadManager`. Device-local only; writes nothing to the
+    /// account / libraryItem docs.
+    private func downloadStream(_ stream: CoreStream, url: URL) async {
+        guard let m = meta else { return }
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
+        let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
+                              name: m.name, poster: m.poster, season: nil, episode: nil)
+        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolved ?? url,
+                                        sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+    }
+
+    /// "Download best" — the offline twin of Watch Now: download the auto-picked best source.
+    private func downloadBest() async {
+        guard let stream = movieBest, let url = stream.playableURL else { return }
+        await downloadStream(stream, url: url)
+    }
+    #endif
 
     // MARK: Live — backdrop + LIVE badge + source list (no VOD chrome)
 
@@ -1490,7 +1542,8 @@ struct iOSEpisodeStreams: View {
                     continuity: rememberedQuality,
                     pinContext: pinContext,
                     cachedHashes: debridCache.cachedHashes,
-                    play: { stream, url in Task { await play(stream, url: url) } }
+                    play: { stream, url in Task { await play(stream, url: url) } },
+                    download: episodeDownloadHandler
                 )
                 .padding(.horizontal, Theme.Space.md)
                 // #9: cap the source list to a readable column, centered, on wide iPad/Mac windows.
@@ -1658,6 +1711,29 @@ struct iOSEpisodeStreams: View {
                                             qualityText: StreamRanking.signature(stream), isTorrent: isTorrent)
     }
 
+    #if !os(tvOS)
+    /// Per-row offline-download handler for the EPISODE source list (nil on tvOS). Resolves the URL the
+    /// same way `play` does and queues a download for THIS episode, with the episode's `PlaybackMeta`.
+    private var episodeDownloadHandler: ((CoreStream, URL) -> Void)? {
+        { stream, url in Task { await downloadStream(stream, url: url) } }
+    }
+
+    /// Queue an offline download of a chosen episode source. Resolves the URL exactly as `play` does
+    /// (cached-debrid direct preferred, else `stream.playableURL`) and builds the same series-typed
+    /// `PlaybackMeta`, so play-from-local records progress against the right episode. Device-local only.
+    private func downloadStream(_ stream: CoreStream, url: URL) async {
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        let (resolved, _) = await playbackURL(for: stream, episode: ep)
+        let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                              name: meta.name, poster: video.thumbnail ?? meta.poster,
+                              season: video.season, episode: video.episode)
+        DownloadManager.shared.download(stream: stream, meta: pm, resolvedURL: resolved ?? url,
+                                        sourceName: stream.name, qualityText: StreamRanking.signature(stream))
+    }
+    #else
+    private var episodeDownloadHandler: ((CoreStream, URL) -> Void)? { nil }
+    #endif
+
     /// Resolve the URL to play for `stream` on this episode view, preferring a cached-debrid DIRECT link
     /// for a raw torrent. Mirrors the movie view's helper; returns `(direct, false)` when debrid served it,
     /// else `(stream.playableURL, stream.isTorrent)`. Fail-soft and no-key byte-identical.
@@ -1816,6 +1892,10 @@ struct iOSSourceList: View {
     /// keep the default true — there the control bar is the only primary action.
     var showsPrimaryControls = true
     let play: (CoreStream, URL) -> Void
+    /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
+    /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
+    /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
+    var download: ((CoreStream, URL) -> Void)? = nil
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
@@ -2126,12 +2206,31 @@ struct iOSSourceList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if let url = stream.playableURL {
-            Button { play(stream, url) } label: {
-                iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream),
-                               debridCached: isDebridCached(stream))
+            HStack(spacing: Theme.Space.sm) {
+                Button { play(stream, url) } label: {
+                    iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream),
+                                   debridCached: isDebridCached(stream))
+                }
+                .buttonStyle(RowFocusStyle())
+                .contextMenu {
+                    pinMenu(addon, stream)
+                    if let download {
+                        Button { download(stream, url) } label: { Label("Download", systemImage: "arrow.down.circle") }
+                    }
+                }
+                // A visible per-row Download affordance (the context menu carries the same action for
+                // discoverability). `#if !os(tvOS)`-gated implicitly by the optional closure being nil there.
+                if let download {
+                    Button { download(stream, url) } label: {
+                        Image(systemName: "arrow.down.circle")
+                            .font(.system(size: 22))
+                            .foregroundStyle(Theme.Palette.accent)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Download this source")
+                    .padding(.trailing, Theme.Space.xs)
+                }
             }
-            .buttonStyle(RowFocusStyle())
-            .contextMenu { pinMenu(addon, stream) }
         } else {
             iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false,
                            debridCached: isDebridCached(stream))
