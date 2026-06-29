@@ -88,18 +88,13 @@ struct FeaturedHeroView: View {
     /// moment the hero rotates to another title; the still backdrop underneath is the fallback when no
     /// clip plays. Decorative — the title / meta read first for VoiceOver.
     @ViewBuilder private var heroClip: some View {
-        if autoplayTrailers, !reduceMotion, let hero = model.hero,
-           let yt = hero.trailerYouTubeID, !yt.isEmpty {
-            // Home billboard = the muted, looping trailer through the WKWebView IFrame (tokenless /yt extraction
-            // is dead). Non-interactive so it stays ambient; the still backdrop underneath is the fallback.
-            YouTubeEmbedView(youTubeID: yt, mode: .background, onFailure: {
-                // A failed embed (owner disabled embedding, removed/private video, or the 151/152/153
-                // embedder-verification family) just falls back to the still backdrop underneath. Log it
-                // for on-device diagnosis but do NOT retry or re-pick: re-triggering is what caused the
-                // YouTube-153 flicker / retry-storm. The clip stays gone until the hero rotates.
-                NSLog("[Hero] trailer embed failed for yt=\(yt) — falling back to still backdrop")
-            })
-                .frame(height: heroHeight).clipped().allowsHitTesting(false)
+        if autoplayTrailers, !reduceMotion, let hero = model.hero, let clip = hero.clipURL {
+            // The muted ambient trailer now plays the VortX /clip mp4 (iTunes -> KinoCheck + Container -> R2)
+            // natively in libmpv - the same path tvOS uses - instead of the flaky YouTube IFrame (the
+            // 151/152/153 embedder family). A miss never reveals, leaving the still backdrop + Ken Burns.
+            // The explicit Trailer button still plays YouTube on demand.
+            InHeroTrailerView(url: clip, height: heroHeight, window: nil)
+                .allowsHitTesting(false)
                 .id("hero-clip-\(hero.id)")    // reload the clip for each new featured item / rotation
                 .transition(reduceMotion ? .identity : .opacity)
         }

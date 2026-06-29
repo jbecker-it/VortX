@@ -20,6 +20,9 @@ struct TrailerRequest: Identifiable, Equatable {
     /// callers that lack a year/type (e.g. a home board-row hero) still build a title-only /clip request.
     var year: String? = nil
     var mediaType: String = "movie"
+    /// IMDb id (`tt...`) when known: the `/clip` worker keys on it (KinoCheck) to fetch the exact
+    /// trailer/clip, preferred over title+year matching. nil for tmdb:/kitsu: catalog ids.
+    var imdbID: String? = nil
 
     /// The libmpv-playable URL: a direct (non-YouTube) trailer stream when the meta carried one, else the
     /// public `trailer.vortx.tv/yt/{id}` resolver URL for a YouTube id. The resolver 302-redirects to a
@@ -33,6 +36,7 @@ struct TrailerRequest: Identifiable, Equatable {
         if let directURL { return directURL }
         var c = URLComponents(string: "https://trailer.vortx.tv/clip")
         c?.queryItems = [
+            URLQueryItem(name: "id", value: imdbID),
             URLQueryItem(name: "title", value: title),
             URLQueryItem(name: "year", value: year),
             URLQueryItem(name: "type", value: mediaType),
@@ -58,7 +62,8 @@ struct TrailerRequest: Identifiable, Equatable {
         // film/series; nil if not parseable. type is movie/series.
         let yr = (meta.releaseInfo?.prefix(4)).map(String.init)
         let year = (yr?.count == 4 && yr?.allSatisfy(\.isNumber) == true) ? yr : nil
+        let imdbID = meta.id.hasPrefix("tt") ? meta.id : nil
         return TrailerRequest(title: meta.name, youTubeID: yt, directURL: direct,
-                              year: year, mediaType: meta.type)
+                              year: year, mediaType: meta.type, imdbID: imdbID)
     }
 }

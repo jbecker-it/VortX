@@ -538,11 +538,10 @@ struct iOSDetailView: View {
             if let direct = detailTrailerDirectURL {
                 // Direct (non-YouTube) stream: a short SILENT WINDOW in libmpv (parity with tvOS: start 10, length 8).
                 InHeroTrailerView(url: direct, height: backdropHeight, window: (start: 10, length: 8))
-            } else if let yt = detailTrailerYouTubeID {
-                // YouTube clip: a muted, windowed WKWebView IFrame (tokenless /yt extraction is dead). Non-
-                // interactive so it reads as ambient backdrop; the still art underneath stays as the fallback.
-                YouTubeEmbedView(youTubeID: yt, mode: .clip(startSeconds: 10, windowSeconds: 8))
-                    .frame(height: backdropHeight).clipped().allowsHitTesting(false)
+            } else if let clip = detailTrailerClipURL {
+                // VortX /clip (iTunes -> KinoCheck + Container -> R2) in libmpv, replacing the flaky YouTube
+                // IFrame for the ambient clip; the explicit Trailer button still plays YouTube on demand.
+                InHeroTrailerView(url: clip, height: backdropHeight, window: (start: 10, length: 8))
             }
         }
     }
@@ -551,6 +550,13 @@ struct iOSDetailView: View {
     private var detailTrailerDirectURL: URL? {
         guard let m = meta else { return nil }
         return TrailerRequest.from(meta: m)?.directURL
+    }
+
+    /// The VortX /clip URL for the detail hero's ambient trailer (libmpv plays the muted mp4; the still art +
+    /// Ken Burns are the fallback). Used only when there's no direct stream (the branch above handles that).
+    private var detailTrailerClipURL: URL? {
+        guard let m = meta else { return nil }
+        return TrailerRequest.from(meta: m)?.playableURL
     }
 
     /// The YouTube trailer id (engine meta's, else the Cinemeta/TMDB fallback) for the WKWebView IFrame clip.

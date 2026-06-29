@@ -301,6 +301,22 @@ struct FeaturedHeroItem: Identifiable, Equatable, Hashable {
         return "https://images.metahub.space/logo/medium/\(id)/img"
     }
 
+    /// The VortX `/clip` URL for this title's ambient hero trailer (libmpv plays the muted mp4; the still
+    /// backdrop + Ken Burns are the fallback). Keys on the imdb id when enrichment surfaced one (the worker
+    /// matches via KinoCheck), else title + year + type.
+    var clipURL: URL? {
+        var c = URLComponents(string: "https://trailer.vortx.tv/clip")
+        let yr = releaseInfo.map { String($0.prefix(4)) }
+        let year = (yr?.count == 4 && yr?.allSatisfy(\.isNumber) == true) ? yr : nil
+        c?.queryItems = [
+            URLQueryItem(name: "id", value: (defaultVideoId?.hasPrefix("tt") == true) ? defaultVideoId : nil),
+            URLQueryItem(name: "title", value: name),
+            URLQueryItem(name: "year", value: year),
+            URLQueryItem(name: "type", value: type),
+        ].filter { ($0.value?.isEmpty == false) }
+        return c?.url
+    }
+
     /// Seed from a catalog meta (carries its own `background` + preview fields when the add-on filled
     /// them; falls back to metahub-by-IMDB / poster otherwise).
     static func from(meta: CoreMeta) -> FeaturedHeroItem {
