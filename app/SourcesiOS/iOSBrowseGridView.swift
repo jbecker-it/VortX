@@ -128,11 +128,20 @@ struct iOSCategoryBrowse: View {
     @State private var loadTask: Task<Void, Never>?
     @State private var pushing = false
 
+    /// The persistent cinematic hero at the top of the browse screen - the same ambient billboard Home /
+    /// Discover use, seeded from the selected pill's top items. tvOS's TVCategoryBrowse already has a hero
+    /// (BrowseHeroBackdrop); this brings the iOS/Mac twin to parity.
+    @StateObject private var hero = FeaturedHeroModel()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     private var subs: [SubCatalog] { CollectionsCatalog.subCatalogs(for: target, region: TMDBClient.deviceRegion) }
 
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                if hero.hero != nil {
+                    FeaturedHeroView(model: hero, onOpen: openHero)
+                }
                 pills
                 if items.isEmpty {
                     if done {
@@ -145,7 +154,7 @@ struct iOSCategoryBrowse: View {
                     PosterGrid(items: items, onTap: open, menu: .catalog, onReachEnd: { Task { await loadNext() } })
                 }
             }
-            .padding(.vertical, Theme.Space.md)
+            .padding(.bottom, Theme.Space.md)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .navigationTitle(target.title)
@@ -174,6 +183,13 @@ struct iOSCategoryBrowse: View {
         path.append(FeaturedHeroItem.from(rail: item))
     }
 
+    /// Hero Play button - same double-push guard as a poster tap, but the hero already hands us a FeaturedHeroItem.
+    private func openHero(_ item: FeaturedHeroItem) {
+        guard !pushing else { return }
+        pushing = true
+        path.append(item)
+    }
+
     private func select(_ id: String) {
         guard id != selectedID || items.isEmpty else { return }
         selectedID = id
@@ -191,9 +207,15 @@ struct iOSCategoryBrowse: View {
         loading = false
         if metas.isEmpty { done = true; return }
         page += 1
+        let firstPage = (page == 2)   // page was 1 before this increment -> these are the pill's top items
         let fresh = metas.filter { seen.insert($0.id).inserted }
             .map { RailItem(id: $0.id, type: $0.type, name: $0.name, poster: $0.poster, progress: 0) }
         items.append(contentsOf: fresh)
+        // Seed (and on a pill switch, re-seed) the hero from the top of the freshly loaded catalog so the
+        // billboard reflects what's on screen. The model rotates + enriches from here; later pages don't reseed.
+        if firstPage {
+            hero.seed(Array(items.prefix(6)).map(FeaturedHeroItem.from(rail:)), reduceMotion: reduceMotion)
+        }
     }
 }
 
