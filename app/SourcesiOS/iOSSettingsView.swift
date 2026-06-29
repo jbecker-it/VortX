@@ -50,7 +50,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
     // Streaming/seek cache budget, stored as a raw byte count (0 = Off, -1 = Unlimited). @AppStorage is
     // Int-typed; Int is 64-bit on every Apple device this runs on, so the byte budgets are exact.
-    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = Int(DiskCacheSetting.defaultBytes)
+    @AppStorage(DiskCacheSetting.key) private var diskCacheBytes = 0   // Off by default, matching DiskCacheSetting.storedBytes; the cache is opt-in
     @AppStorage("stremiox.hideLiveTab") private var hideLiveTab = false
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true
