@@ -9,6 +9,7 @@ struct HomeView: View {
     @EnvironmentObject private var profiles: ProfileStore
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
     @AppStorage("vortx.home.showStreamingRails") private var showStreamingRails = true   // toggle: Netflix/Disney+/... rails (needs a TMDB key)
     @StateObject private var heroTrailer = HomeHeroTrailerModel()   // #44: focus-settled muted hero trailer
@@ -62,6 +63,12 @@ struct HomeView: View {
                         if !topPicks.items.isEmpty {
                             TopPicksRow(items: topPicks.items, focusModel: focusModel)
                         }
+                        // "Upcoming Episodes": the next-airing episode of each series in the library within
+                        // the next 45 days, soonest first (see ReleaseCalendarModel). Hidden when there is
+                        // nothing upcoming, so the default (no dated episodes) renders nothing.
+                        if !releaseCalendar.upcoming.isEmpty {
+                            UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
+                        }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
                         }
@@ -90,12 +97,17 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
-        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); if showStreamingRails { streaming.load() } }
+        .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showStreamingRails { streaming.load() } }
         .onChange(of: showStreamingRails) { show in if show { streaming.load() } else { streaming.clear() } }
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
-        .onChange(of: core.addons.count) { configureMetaSources() }
+        // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
+        // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
+        // async after sign-in, so key on its count too (matching the notification sweep's input set).
+        .onChange(of: core.library?.catalog.count ?? 0) { refreshReleaseCalendar() }
+        .onChange(of: account.addons.count) { refreshReleaseCalendar() }
+        .onChange(of: core.addons.count) { configureMetaSources(); refreshReleaseCalendar() }
         // Drive the focus-settled hero trailer (#44): every hero change re-arms the 3s debounce and tears
         // down the current trailer, so scrolling catalog-to-catalog never loads a clip.
         .onChange(of: focusModel.hero?.id) { heroTrailer.focusChanged(to: focusModel.hero) }
@@ -105,6 +117,17 @@ struct HomeView: View {
     /// The model no-ops when the seed set is unchanged, so this is cheap to call on every re-emit.
     private func refreshTopPicks() {
         topPicks.refresh(profileID: profiles.activeID, cw: continueWatching, library: libraryItems)
+    }
+
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
+    /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
+    private func refreshReleaseCalendar() {
+        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
+        guard !series.isEmpty else { releaseCalendar.clear(); return }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
@@ -428,6 +451,60 @@ struct StreamingRow: View {
     private func hero(for item: MetaPreview) -> FocusedHero {
         FocusedHero(id: item.id, type: item.type, title: item.name,
                     backdrop: item.poster, metaLine: item.type.capitalized,
+                    overview: nil, genreLine: nil)
+    }
+}
+
+/// "Upcoming Episodes": the next-airing episode of each series in the library within the next 45 days,
+/// soonest first (see `ReleaseCalendarModel`). Mirrors `TopPicksRow`/`StreamingRow` — each card is the
+/// series' `PosterCard` (so it routes to the series `DetailView` like any catalog card and resolves its
+/// poster through `PosterArtwork`), with a small "S2E5 · Jun 30" caption under it. Series-only.
+struct UpcomingEpisodesRow: View {
+    let items: [ReleaseCalendarModel.UpcomingEpisode]
+    var focusModel: FocusedItemModel? = nil
+    @EnvironmentObject private var theme: ThemeManager
+    @ObservedObject private var catalogPrefs = CatalogPreferences.shared
+    @ObservedObject private var apiKeys = ApiKeys.shared
+
+    /// Match `PosterCard`'s landscape-vs-portrait width so the per-card caption lines up under the card.
+    private var captionWidth: CGFloat {
+        (catalogPrefs.landscapeCards && apiKeys.hasTMDB) ? kLandscapeCardWidth : kPosterWidth
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Theme.Space.md) {
+            RailHeader(eyebrow: "Coming soon", title: "Upcoming Episodes")
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                    ForEach(items) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            PosterCard(title: item.seriesName, poster: item.video.thumbnail,
+                                       type: "series", id: item.seriesId,
+                                       menu: .catalog,
+                                       onFocus: focusModel.map { model in
+                                           { model.focus(hero(for: item)) }
+                                       })
+                            // The episode + air date for THIS card (the series name is the poster title).
+                            Text("\(item.episodeLabel) · \(item.airDateLabel)")
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundStyle(Theme.Palette.textSecondary)
+                                .lineLimit(1)
+                                .frame(width: captionWidth, alignment: .leading)
+                        }
+                    }
+                }
+                .padding(.horizontal, Theme.Space.screenEdge)
+                .padding(.vertical, Theme.Space.lg)   // room for the focus halo
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A bare hero for the backdrop; the FocusedItemModel enriches it from the session cache or Cinemeta a
+    /// beat after focus, exactly like a Top Picks card.
+    private func hero(for item: ReleaseCalendarModel.UpcomingEpisode) -> FocusedHero {
+        FocusedHero(id: item.seriesId, type: "series", title: item.seriesName,
+                    backdrop: item.video.thumbnail, metaLine: "Series",
                     overview: nil, genreLine: nil)
     }
 }

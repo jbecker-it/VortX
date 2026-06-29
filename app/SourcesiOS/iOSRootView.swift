@@ -267,6 +267,7 @@ struct iOSHomeView: View {
     @State private var showSignIn = false
     @StateObject private var hero = FeaturedHeroModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
+    @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
     @StateObject private var curated = CuratedCollectionsModel()   // editorial Cinemeta-backed rails (B3)
     @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true   // owner-toggleable: hide the built-in editorial rails
     @StateObject private var streaming = StreamingRailsModel()   // browse-by-streaming-service rails (TMDB watch providers)
@@ -423,6 +424,19 @@ struct iOSHomeView: View {
                                             },
                                             onTap: handleTap))
                     }
+                    // "Upcoming Episodes": the next-airing episode of each series in the library within the
+                    // next 45 days, soonest first (see ReleaseCalendarModel). Each card is the SERIES (so a
+                    // tap opens its detail page like any catalog card) with an "S2E5 · Jun 30" caption.
+                    // Hidden when there is nothing upcoming, so the default path renders nothing.
+                    if !releaseCalendar.upcoming.isEmpty {
+                        homeRail(PosterRail(title: "Upcoming Episodes",
+                                            items: releaseCalendar.upcoming.map {
+                                                RailItem(id: $0.seriesId, type: "series", name: $0.seriesName,
+                                                         poster: $0.video.thumbnail, progress: 0,
+                                                         caption: "\($0.episodeLabel) · \($0.airDateLabel)")
+                                            },
+                                            onTap: handleTap))
+                    }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
                             homeRail(PosterRail(title: row.title,
@@ -537,13 +551,17 @@ struct iOSHomeView: View {
             FeaturedHeroModel.configureMetaSources(core.addons)
             hero.seed(heroCandidates, reduceMotion: reduceMotion)
             refreshTopPicks()
+            refreshReleaseCalendar()
             // Editorial rails are global (Cinemeta-backed), so build them once; the model no-ops while
             // already loaded or in flight, and retries on the next appearance if the first fetch failed.
             if showCuratedRails { curated.load() }
             if showStreamingRails { streaming.load() }
         }
-        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks() }
+        .onChange(of: core.revision) { _ in hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshTopPicks(); refreshReleaseCalendar() }
         .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
+        // once they arrive (same input set as the notification sweep).
+        .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
         // Editorial-rails toggle: build them when turned on, drop them when turned off (the "extra
         // catalogs I can't remove from Home" report). The render + hero pool are gated on the same flag.
         .onChange(of: showCuratedRails) { show in if show { curated.load() } else { curated.clear() } }
@@ -551,8 +569,9 @@ struct iOSHomeView: View {
         // Addons hydrate ASYNC, after onAppear — so configureMetaSources(core.addons) above often ran with
         // an empty set, leaving tmdb:/tvdb:/kitsu: hero items un-enriched (no rating/logo/backdrop on Home,
         // Discover, Library CW). Re-configure + re-seed once addons arrive so enrichment can reach the
-        // installed meta add-on. tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
-        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        // installed meta add-on, and rebuild Upcoming Episodes (its sweep also needs the meta add-ons).
+        // tvOS already does this (HomeView/LiveView .onChange(of: core.addons.count)).
+        .onChange(of: core.addons.count) { _ in FeaturedHeroModel.configureMetaSources(core.addons); hero.seed(heroCandidates, reduceMotion: reduceMotion); refreshReleaseCalendar() }
         .onDisappear { hero.stop() }
     }
 
@@ -584,6 +603,17 @@ struct iOSHomeView: View {
         let cw = profiles.activeUsesEngineHistory ? core.continueWatching : profiles.cwItems
         let library = profiles.activeUsesEngineHistory ? (core.library?.catalog ?? []) : profiles.libraryItems
         topPicks.refresh(profileID: profiles.activeID, cw: cw, library: library)
+    }
+
+    /// Recompute "Upcoming Episodes" from the series library + the installed meta add-on bases — derived
+    /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
+    /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
+    private func refreshReleaseCalendar() {
+        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
+        guard !series.isEmpty else { releaseCalendar.clear(); return }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
     }
 
     /// Continue-Watching one-tap direct resume (#11): play the exact last-played stream straight away
@@ -1070,6 +1100,9 @@ struct RailItem: Identifiable {
     /// direct resume can confirm the remembered link still matches the episode the engine
     /// is parked on (mirrors the tvOS `directResume` series guard). Nil for catalog/library cards.
     var cwVideoId: String? = nil
+    /// A small secondary caption shown UNDER the card title (e.g. "S2E5 · Jun 30" on the Upcoming
+    /// Episodes rail). Nil on every other rail, so their cards are byte-for-byte unchanged.
+    var caption: String? = nil
 }
 
 // MARK: - Poster context menu (#14, ported from tvOS PosterCard.menuItems)
@@ -1749,7 +1782,7 @@ private struct PosterRail: View {
     /// into view, all additive modifiers so touch / VoiceOver / the existing tap + long-press are unchanged.
     @ViewBuilder private func railCard(_ item: RailItem, proxy: ScrollViewProxy) -> some View {
         let base = Button { onTap(item) } label: {
-            PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, imdbRating: item.imdbRating,
+            PosterCardiOS(id: item.id, type: item.type, name: item.name, poster: item.poster, fallbackArt: item.background, caption: item.caption, imdbRating: item.imdbRating,
                           progress: item.progress, menu: menu,
                           onDetails: onDetails.map { od in { od(item) } })
         }
@@ -1974,6 +2007,9 @@ private struct PosterCardiOS: View {
     /// Backdrop to fall back to when an add-on item carries no `poster` (AIOMetadata sometimes omits it),
     /// so the tile shows the title's art cropped to the card instead of a blank surface. Nil = no fallback.
     var fallbackArt: String? = nil
+    /// A small secondary caption under the title (e.g. "S2E5 · Jun 30" on Upcoming Episodes). Nil hides it,
+    /// so every other rail's card is unchanged.
+    var caption: String? = nil
     /// IMDb rating to show as a small star badge on the poster, when the catalog item carries one. Nil hides it.
     var imdbRating: String? = nil
     let progress: Double
@@ -2040,6 +2076,13 @@ private struct PosterCardiOS: View {
                 .font(Theme.Typography.label)
                 .foregroundStyle(Theme.Palette.textSecondary)
                 .lineLimit(1).frame(width: cardW, alignment: .leading)
+            // Optional secondary caption (Upcoming Episodes: "S2E5 · Jun 30"); absent on every other rail.
+            if let caption {
+                Text(caption)
+                    .font(Theme.Typography.eyebrow)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                    .lineLimit(1).frame(width: cardW, alignment: .leading)
+            }
         }
         // One contiguous tap + long-press target over the whole card (poster, the 6pt gap, and title).
         // Without it the .buttonStyle(.plain) label hit-tests as the UNION of its subview shapes, so the

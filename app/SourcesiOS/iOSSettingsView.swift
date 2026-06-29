@@ -1168,17 +1168,10 @@ enum NewEpisodeNotifications {
 
     /// One series' full meta, fetched directly over the add-on protocol from the first meta add-on that
     /// answers. Never touches the engine. nil if none decode.
+    /// The implementation moved to the OS-agnostic `SeriesMetaFetcher` (SourcesShared) so the shared
+    /// `ReleaseCalendarModel` reuses the EXACT same fetch and the tvOS targets — which don't compile this
+    /// SourcesiOS file — can reach it. This thin shim keeps the existing callers unchanged; behavior is identical.
     static func fetchSeriesMeta(id: String, bases: [String]) async -> CoreMetaItem? {
-        struct Wrap: Decodable { let meta: CoreMetaItem? }
-        let escaped = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
-        for base in bases {
-            guard let url = URL(string: "\(base)/meta/series/\(escaped).json") else { continue }
-            var req = URLRequest(url: url); req.timeoutInterval = 12
-            if let (data, _) = try? await URLSession.shared.data(for: req),
-               let wrap = try? JSONDecoder().decode(Wrap.self, from: data), let meta = wrap.meta {
-                return meta
-            }
-        }
-        return nil
+        await SeriesMetaFetcher.fetch(id: id, bases: bases)
     }
 }
