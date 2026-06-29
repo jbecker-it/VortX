@@ -93,8 +93,19 @@ final class CoreBridge: ObservableObject {
 
     /// Remove an installed addon. UninstallAddon takes a full Descriptor, so we send back the raw one
     /// the engine gave us (matched by transportUrl).
-    func uninstallAddon(_ descriptor: CoreDescriptor) {
+    ///
+    /// `tombstone` (default true) records a DURABLE cross-device removal in `AddonTombstones` so the
+    /// removal SYNCS: `vortxSummary` pushes the set into `doc.vortx.deletedAddons` and subtracts it from
+    /// the `doc.vortx.addons` UNION, and `syncDown` re-applies it on peers (mirrors `deletedProfiles`).
+    /// Official/protected stubs are NEVER tombstoned (a logout resets the engine to exactly those, so a
+    /// tombstone there would wrongly suppress a default forever). The Change-URL replace path passes
+    /// `tombstone: false`: swapping a manifest URL removes the OLD url but is not a real removal, so the
+    /// URL must stay re-addable on every device. The genuine in-app Remove button keeps the default.
+    func uninstallAddon(_ descriptor: CoreDescriptor, tombstone: Bool = true) {
         guard let raw = rawAddonsByUrl[descriptor.transportUrl] else { return }
+        if tombstone, !descriptor.isOfficial, !descriptor.isProtected {
+            AddonTombstones.tombstone(descriptor.transportUrl)
+        }
         dispatchCtx(["action": "UninstallAddon", "args": raw])
     }
 

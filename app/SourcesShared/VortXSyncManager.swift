@@ -393,15 +393,25 @@ final class VortXSyncManager: ObservableObject {
         let engineIsDefaultOnly = engineAddons.allSatisfy { (($0["flags"] as? [String: Any])?["official"] as? Bool) == true }
         let mirrorReplaceAddons = MirrorSettings.mirrorAddons && !engineAddons.isEmpty
             && CoreBridge.shared.isLoggedIn() && !engineIsDefaultOnly
+        // SUBTRACT the durable removal tombstones from the union (the add-on analogue of subtracting
+        // deletedProfiles from the roster union): an add-on the user removed must NOT come back, even if
+        // the engine still briefly holds it OR a peer device's prior doc.vortx.addons still carries it.
+        // Official/protected stubs are never tombstoned, so this never drops a default. Compared on the
+        // same normalized (trim+lowercase) transportUrl the tombstone is stored under.
+        let removedAddons = AddonTombstones.all()
         var addonList: [[String: Any]] = []
         var seenAddonURLs = Set<String>()
         for entry in engineAddons {
-            guard let url = entry["transportUrl"] as? String, seenAddonURLs.insert(url).inserted else { continue }
+            guard let url = entry["transportUrl"] as? String,
+                  !removedAddons.contains(AddonTombstones.normalize(url)),
+                  seenAddonURLs.insert(url).inserted else { continue }
             addonList.append(entry)
         }
         if !mirrorReplaceAddons, let prior = (existingVortx?["addons"] as? [[String: Any]]) {
             for entry in prior {
-                guard let url = entry["transportUrl"] as? String, !url.isEmpty, seenAddonURLs.insert(url).inserted else { continue }
+                guard let url = entry["transportUrl"] as? String, !url.isEmpty,
+                      !removedAddons.contains(AddonTombstones.normalize(url)),
+                      seenAddonURLs.insert(url).inserted else { continue }
                 addonList.append(entry)
             }
         }
@@ -428,6 +438,10 @@ final class VortXSyncManager: ObservableObject {
         // resurrecting them. Empty set is omitted so a fresh account never writes the key.
         let deleted = store.deletedProfileIDs
         if !deleted.isEmpty { v["deletedProfiles"] = Array(deleted) }
+        // Durable cross-device add-on REMOVAL tombstones (app-authoritative, exactly like deletedProfiles;
+        // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
+        // device uninstalls them on its next pull instead of re-hydrating them. Empty set is omitted.
+        if !removedAddons.isEmpty { v["deletedAddons"] = Array(removedAddons) }
         return v
     }
 
@@ -588,6 +602,34 @@ final class VortXSyncManager: ObservableObject {
         if let vortx = doc["vortx"] as? [String: Any], let deleted = vortx["deletedProfiles"] as? [String] {
             if ProfileStore.shared.mergeDeletedTombstones(deleted) { restored = true }
         }
+        // Cross-device add-on REMOVAL tombstones (the add-on analogue of the deletedProfiles fold above).
+        // Reached ONLY inside this withRemoteApplySuppressed region, which runs after a STRICTLY-NEWER,
+        // SUCCESSFUL pullDocVersioned() — a .failed/.empty pull returns earlier, so a stale/partial sync
+        // can NEVER drive an uninstall. Fold the app-authored doc.vortx.deletedAddons AND a (future)
+        // web-authored doc.webAddonRemovals array into the durable local set, then uninstall any
+        // tombstoned add-on still installed in the engine. The uninstall is HARD-GATED to non-official,
+        // non-protected descriptors so a default stub is never removed; it passes tombstone: false because
+        // the URL is already tombstoned (re-recording would be a redundant no-op). The local set is also
+        // subtracted from hydrateEngineFromOwnedAddons' ownedAddons(from:), so a removed add-on is never
+        // reinstalled on the next hydrate even before this uninstall runs.
+        var incomingAddonRemovals: [String] = []
+        if let vortx = doc["vortx"] as? [String: Any], let removed = vortx["deletedAddons"] as? [String] {
+            incomingAddonRemovals += removed
+        }
+        if let webRemoved = doc["webAddonRemovals"] as? [String] {   // web agent owns this write; we only READ it
+            incomingAddonRemovals += webRemoved
+        }
+        if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
+        let removedAddonSet = AddonTombstones.all()
+        if !removedAddonSet.isEmpty {
+            Task { @MainActor in
+                for addon in CoreBridge.shared.addons
+                where removedAddonSet.contains(AddonTombstones.normalize(addon.transportUrl))
+                    && !addon.isOfficial && !addon.isProtected {
+                    CoreBridge.shared.uninstallAddon(addon, tombstone: false)
+                }
+            }
+        }
         if let vortx = doc["vortx"] as? [String: Any], let byProfile = vortx["byProfile"] as? [String: Any] {
             for (idStr, raw) in byProfile {
                 guard let uuid = UUID(uuidString: idStr),
@@ -661,7 +703,13 @@ final class VortXSyncManager: ObservableObject {
     static func ownedAddons(from doc: [String: Any]) -> [VortXOwnedAddon] {
         var byUrl: [String: VortXOwnedAddon] = [:]
         var order: [String] = []   // preserve install order (AIOManager-compat: collection order = priority)
+        // EXCLUDE durable removal tombstones so hydrateEngineFromOwnedAddons never REINSTALLS an add-on the
+        // user removed (the install-only hydrate was the gap that let a removal come back). The doc's
+        // deletedAddons subset was already folded into this local set on syncDown; we read the local set so
+        // even a doc that predates the removal is honored. Same normalized transportUrl the set is keyed by.
+        let removedAddons = AddonTombstones.all()
         func add(_ a: VortXOwnedAddon) {
+            guard !removedAddons.contains(AddonTombstones.normalize(a.transportUrl)) else { return }
             // First sight wins both the order slot AND the descriptor, so the app/engine-owned set (added
             // first below) defines the order spine and its richer descriptor is kept for a shared URL.
             if byUrl[a.transportUrl] == nil { order.append(a.transportUrl); byUrl[a.transportUrl] = a }

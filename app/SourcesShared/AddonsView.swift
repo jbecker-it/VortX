@@ -452,7 +452,9 @@ private struct EditAddonURLView: View {
             if let error = await CoreBridge.shared.installAddon(urlString: newURL) {
                 message = error; working = false; return
             }
-            CoreBridge.shared.uninstallAddon(addon)
+            // Change-URL is a REPLACE, not a removal: drop the old URL but do NOT tombstone it, so the
+            // same URL stays re-addable on every device (a removal tombstone would wrongly suppress it).
+            CoreBridge.shared.uninstallAddon(addon, tombstone: false)
             working = false
             dismiss()
         }
