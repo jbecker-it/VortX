@@ -562,6 +562,62 @@ final class DebridCoordinator {
     }
 }
 
+// MARK: - Play-path bridge (cached debrid → direct link)
+
+extension DebridCoordinator {
+    /// Streaming-settle ceiling for an in-line resolve, matched to the source-list settle window: a CACHED
+    /// torrent resolves in ~1 round trip, so 15s comfortably covers it while bounding a stall (an uncached
+    /// add-then-poll, a flaky provider, a hung network) so the play action never hangs the UI. On timeout the
+    /// resolve Task is cancelled and the caller falls soft to the local engine.
+    private static let resolveTimeout: Duration = .seconds(15)
+
+    /// The single bridge from a tapped/auto-picked RAW TORRENT to a debrid DIRECT link for playback.
+    ///
+    /// Returns a remote HTTPS URL the player can open as a plain direct stream (NOT a torrent — it does not
+    /// match the `{server}:11470/{40-hex}/{idx}` shape the player keys torrent behaviour off, so it gets no
+    /// `/create`, no warm-up, and no `closeTorrent` teardown), or `nil` when the caller should use today's
+    /// path unchanged. It is FAIL-SOFT by construction: every non-success (no key, not a raw torrent, any
+    /// `DebridError`, a throw, or the timeout) returns `nil`, so the user is never left unable to play.
+    ///
+    /// NO-KEY BYTE-IDENTICAL GUARANTEE: with no resolver configured (`hasAnyResolver == false`) this returns
+    /// `nil` on the very first line with ZERO `await` and zero provider contact, so the caller runs exactly
+    /// the code it ran before this feature existed. The same immediate `nil` applies to any non-raw-torrent
+    /// stream (direct URL, YouTube, externalUrl), so direct/trailer playback is also untouched.
+    ///
+    /// - Parameters:
+    ///   - stream: the stream the user is about to play.
+    ///   - episode: the SxEy target for a series, so a season-pack resolves the right file. `nil` for movies.
+    func resolvedPlaybackURL(for stream: CoreStream, episode: DebridEpisode? = nil) async -> URL? {
+        // Raw torrent only: a stream WITH a `url` is already a direct/debrid link; one with neither url nor
+        // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
+        guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
+        // No-key fast path: zero await, zero behaviour change. This is the byte-identical guarantee.
+        guard hasAnyResolver else { return nil }
+
+        // Build the magnet from the infohash (+ the add-on's `sources`, which carry trackers some providers
+        // use to add the magnet); fileIdx biases the season-pack pick when present, the episode SxEy refines it.
+        let trackers = (stream.sources ?? []).filter { $0.hasPrefix("tracker:") }.map { String($0.dropFirst("tracker:".count)) }
+        let magnet = DebridResolve.magnet(forHash: hash, name: stream.behaviorHints?.filename, trackers: trackers)
+        let fileIdx = stream.fileIdx   // hoist the value so the @Sendable task captures an Int?, not CoreStream
+
+        // Bounded resolve: race the provider resolve against a timeout sleep; whichever finishes first wins and
+        // the loser is cancelled. Any throw / timeout collapses to `nil` → the caller falls soft.
+        return await withTaskGroup(of: URL?.self) { group in
+            group.addTask {
+                try? await DebridCoordinator.shared.resolve(
+                    infoHash: hash, magnet: magnet, fileIdx: fileIdx, episode: episode)
+            }
+            group.addTask {
+                try? await Task.sleep(for: DebridCoordinator.resolveTimeout)
+                return nil   // timeout sentinel
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+    }
+}
+
 // MARK: - Detail-view cache awareness
 
 /// Publishes the set of raw-torrent infoHashes a detail page's title has CACHED in the user's debrid

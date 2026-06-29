@@ -1107,7 +1107,27 @@ struct CoreStreamList: View {
 
     /// Play a stream by handing a request to the root, which swaps the whole shell out for the player
     /// (the only reliable tvOS focus isolation — see RootView). Wires the engine + prepares torrents first.
+    ///
+    /// CACHED DEBRID: for a RAW TORRENT the user's debrid account can serve, play the debrid DIRECT link
+    /// instead of starting the local torrent engine. The resolve is bounded and FAIL-SOFT — any
+    /// failure/timeout (and the entire no-key path, with zero await) falls through to today's embedded path,
+    /// byte-identical. A debrid URL is a remote direct link, so it is presented with `torrent: false` and
+    /// skips `prepareTorrent` (no `/create`); the player keys torrent behaviour off the URL shape, so it
+    /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(_ stream: CoreStream) {
+        Task { await playResolving(stream) }
+    }
+
+    @MainActor private func playResolving(_ stream: CoreStream) async {
+        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream) {
+            core.loadEnginePlayer(for: stream)
+            presenter.request = PlaybackRequest(url: direct, title: title, meta: meta, episodes: episodes,
+                                                sourceHint: StreamRanking.signature(stream), torrent: false,
+                                                bingeGroup: stream.behaviorHints?.bingeGroup,
+                                                headers: stream.requestHeaders)
+            return
+        }
+        // Today's path, unchanged.
         guard let url = stream.playableURL else { return }
         core.loadEnginePlayer(for: stream)
         prepareTorrent(stream)

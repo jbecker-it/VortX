@@ -993,29 +993,39 @@ struct iOSDetailView: View {
     }
 
     private func playMovie() async {
-        guard !preparing, let m = meta, let stream = movieBest,
-              let url = stream.playableURL else { return }
+        guard !preparing, let m = meta, let stream = movieBest else { return }
         preparing = true; defer { preparing = false }
-        primePlayback(stream)
+        // CACHED DEBRID: a raw torrent the user's debrid serves plays as a direct link (fail-soft; no-key is
+        // a zero-await nil → today's path). On a debrid hit we play a remote direct URL with isTorrent:false
+        // and DON'T run primePlayback (no `/create`); otherwise `prime` stays true and the path is exactly
+        // today's (primePlayback → engine + torrent prime), so the no-key path is byte-identical.
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
+        guard let url = resolved ?? stream.playableURL else { return }
+        let prime = resolved == nil
+        if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
         let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
                               name: m.name, poster: m.poster, season: nil, episode: nil)
         presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: stream.isTorrent))
+                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: !prime && stream.isTorrent))
     }
 
-    /// Play an arbitrary chosen movie source (a tapped source-list row).
+    /// Play an arbitrary chosen movie source (a tapped source-list row). `url` is the source's
+    /// `playableURL`; a cached-debrid raw torrent overrides it with the direct link (fail-soft, no-key
+    /// byte-identical — see `DebridCoordinator.resolvedPlaybackURL`).
     private func playStream(_ stream: CoreStream, url: URL) async {
         guard !preparing, let m = meta else { return }
         preparing = true; defer { preparing = false }
-        primePlayback(stream)
+        let resolved = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream)
+        let prime = resolved == nil
+        if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
         let pm = PlaybackMeta(libraryId: m.id, videoId: m.id, type: "movie",
                               name: m.name, poster: m.poster, season: nil, episode: nil)
-        presentation = .player(PlayerLaunch(url: url, title: m.name, headers: stream.requestHeaders,
+        presentation = .player(PlayerLaunch(url: resolved ?? url, title: m.name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: stream.isTorrent))
+                                            bingeGroup: stream.behaviorHints?.bingeGroup, isTorrent: !prime && stream.isTorrent))
     }
 
     // MARK: Live — backdrop + LIVE badge + source list (no VOD chrome)
@@ -1622,22 +1632,40 @@ struct iOSEpisodeStreams: View {
 
     /// Play the tapped source: prime the engine + torrent (same path as the movie list), then present
     /// the native player carrying the stream's proxy headers.
+    ///
+    /// CACHED DEBRID: a raw torrent the user's debrid can serve plays as a direct link, resolving the
+    /// SxEy file in a season pack via the episode hint. Fail-soft (no-key is a zero-await nil → the
+    /// passed-in `url`/torrent path, unchanged). A debrid URL is a remote direct stream: skip the torrent
+    /// prime and mark isTorrent:false.
     private func play(_ stream: CoreStream, url: URL) async {
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
+        let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
+        let (resolved, isTorrent) = await playbackURL(for: stream, episode: ep)
+        let playURL = resolved ?? url
         core.loadEnginePlayer(for: stream)
         lastBinge = stream.behaviorHints?.bingeGroup   // seed the sticky release-group from the user's pick (#3)
         // Cancel any prior torrent prime before storing the new one, so a re-pick can't leave a stale
-        // backoff loop running; the stored Task is also cancelled on view disappear.
+        // backoff loop running; the stored Task is also cancelled on view disappear. Debrid direct → no prime.
         torrentPrime?.cancel()
-        torrentPrime = prepareTorrentStream(stream)
+        torrentPrime = isTorrent ? prepareTorrentStream(stream) : nil
         let name = "\(meta.name)  ·  S\(video.season ?? season)E\(video.episodeNumber)"
         let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                               name: meta.name, poster: video.thumbnail ?? meta.poster,
                               season: video.season, episode: video.episode)
-        player = iOSDetailView.PlayerLaunch(url: url, title: name, headers: stream.requestHeaders,
+        player = iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
-                                            qualityText: StreamRanking.signature(stream), isTorrent: stream.isTorrent)
+                                            qualityText: StreamRanking.signature(stream), isTorrent: isTorrent)
+    }
+
+    /// Resolve the URL to play for `stream` on this episode view, preferring a cached-debrid DIRECT link
+    /// for a raw torrent. Mirrors the movie view's helper; returns `(direct, false)` when debrid served it,
+    /// else `(stream.playableURL, stream.isTorrent)`. Fail-soft and no-key byte-identical.
+    private func playbackURL(for stream: CoreStream, episode: DebridEpisode?) async -> (url: URL?, isTorrent: Bool) {
+        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream, episode: episode) {
+            return (direct, false)
+        }
+        return (stream.playableURL, stream.isTorrent)
     }
 
     private func resume(_ pm: PlaybackMeta) async -> Double {
