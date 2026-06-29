@@ -561,3 +561,48 @@ final class DebridCoordinator {
         return try await resolver.resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: episode)
     }
 }
+
+// MARK: - Detail-view cache awareness
+
+/// Publishes the set of raw-torrent infoHashes a detail page's title has CACHED in the user's debrid
+/// account, so the source list can badge + rank them up (`StreamRanking(debridCachedHashes:)`). It is a
+/// per-view `@StateObject`: a detail view holds one, calls `refresh(from:)` once the title's stream
+/// groups have loaded, and reads `cachedHashes` for the badge + ranking. With NO debrid key configured
+/// `DebridCoordinator.cacheCheck` returns `[:]`, so `cachedHashes` stays empty and nothing changes.
+///
+/// Awareness only: this never resolves a direct link or touches the play path. It de-dups by the set of
+/// hashes it last queried, so a re-render with the same torrents does not re-hit the provider.
+@MainActor
+final class DebridCacheAwareness: ObservableObject {
+    /// Lowercased infoHashes confirmed cached. Empty until a check completes (and always, with no key).
+    @Published private(set) var cachedHashes: Set<String> = []
+
+    /// The hash set most recently queried, so an identical set (same title, same torrents) is a no-op.
+    private var lastQueried: Set<String> = []
+    private var task: Task<Void, Never>?
+
+    /// Collect the RAW-torrent infoHashes in `groups` (a raw torrent is `url == nil`, `infoHash != nil`)
+    /// and, if that set changed since the last query, ask the coordinator which are cached. Cheap and
+    /// debounced: identical input returns immediately, and an empty input or no-key path clears nothing
+    /// it didn't set. Safe to call on every `groups` change / `.task`.
+    func refresh(from groups: [CoreStreamSourceGroup]) {
+        var hashes: Set<String> = []
+        for group in groups {
+            for stream in group.streams where stream.url == nil {
+                if let h = stream.infoHash?.lowercased(), !h.isEmpty { hashes.insert(h) }
+            }
+        }
+        guard !hashes.isEmpty else { return }          // nothing to check; leave any prior result intact
+        guard hashes != lastQueried else { return }    // same torrents already queried: no re-hit
+        task?.cancel()
+        task = Task { [weak self] in
+            let result = await DebridCoordinator.shared.cacheCheck(hashes: Array(hashes))
+            guard !Task.isCancelled, let self else { return }
+            // Commit the queried set ONLY after a real result, so a failed/cancelled check leaves
+            // lastQueried untouched and the next refresh re-hits the provider instead of being deduped away.
+            self.lastQueried = hashes
+            // result keys are already lowercased infoHashes (see TorBoxResolver.checkCache).
+            self.cachedHashes = Set(result.keys)
+        }
+    }
+}

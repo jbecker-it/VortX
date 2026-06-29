@@ -72,7 +72,8 @@ func iOSDisplayGroups(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGro
 @MainActor
 func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: String,
                              seriesName: String, defaultSeason: Int, fallbackPoster: String?,
-                             continuity: String?, binge: String? = nil, core: CoreBridge,
+                             continuity: String?, binge: String? = nil, cachedHashes: Set<String> = [],
+                             core: CoreBridge,
                              account: StremioAccount) async -> PlayerEpisodeStream? {
     guard let v = videos.first(where: { $0.id == videoId }) else { return nil }
     core.loadMeta(type: "series", id: seriesId, streamType: "series", streamId: v.id)
@@ -92,7 +93,8 @@ func iOSResolveEpisodeStream(videoId: String, in videos: [CoreVideo], seriesId: 
         try? await Task.sleep(for: .milliseconds(250))
     }
     let pin = SourcePinStore.shared.effectivePin(SourcePinContext(metaId: seriesId, isSeries: true))
-    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin),
+    guard let best = StreamRanking.best(groups, continuity: continuity, binge: binge, pin: pin,
+                                        debridCachedHashes: cachedHashes),
           let url = best.playableURL else { return nil }
     core.loadEnginePlayer(for: best)
     _ = prepareTorrentStream(best)   // fire-and-forget prime; self-terminating backoff
@@ -179,6 +181,9 @@ struct iOSDetailView: View {
     @State private var preparing = false                 // movie Watch Now is resolving
     @State private var season = 1
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
+    // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
+    // has cached, so they badge + rank up. Empty (zero badges, ranking unchanged) with no debrid key.
+    @StateObject private var debridCache = DebridCacheAwareness()
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @State private var similarItems: [MetaPreview] = []
     @State private var mdbRatings: MDBListRatings?
@@ -325,6 +330,13 @@ struct iOSDetailView: View {
         .task {
             try? await Task.sleep(for: .seconds(20))
             settleTimedOut = true
+        }
+        // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
+        // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
+        // when the torrents actually change; with no debrid key it returns an empty set and nothing renders.
+        // Series load streams per-episode (iOSEpisodeStreams owns its own awareness); movie + live read here.
+        .onChange(of: core.streamLoadProgress().loaded) { _ in
+            if type != "series" { debridCache.refresh(from: displayGroups(core.streamGroups())) }
         }
         .platformFullScreenPlayerCover(item: $presentation) { item in
             switch item {
@@ -761,7 +773,8 @@ struct iOSDetailView: View {
     /// **Sources** button (scrolls to the grouped per-add-on list below), and **Add to Library**,
     /// plus the trailer chip when one exists. Wraps onto a second line on a narrow phone.
     @ViewBuilder private func watchNow(scrollToSources: @escaping () -> Void) -> some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin)
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                                debridCachedHashes: debridCache.cachedHashes)
         let sourceTotal = groups.reduce(0) { $0 + $1.streams.count }
         // FlowLayout so the action chips wrap to a new line on a narrow phone instead of compressing into
         // vertical slivers ("Sou / rce") under the hero's hard width cap.
@@ -836,12 +849,14 @@ struct iOSDetailView: View {
     /// component owns the filter / collapse state; it plays a chosen source through `playStream`.
     @ViewBuilder private var sourceSection: some View {
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin),
+            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                               debridCachedHashes: debridCache.cachedHashes),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
             continuity: rememberedQuality,
             pinContext: pinContext,
+            cachedHashes: debridCache.cachedHashes,
             // Hero already shows Watch + Quality + the "Sources" scroll button, so suppress this list's
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
@@ -949,7 +964,8 @@ struct iOSDetailView: View {
 
     /// The best source for the movie, honoring Direct-links-only and the remembered-quality continuity.
     private var movieBest: CoreStream? {
-        StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality, pin: sourcePin)
+        StreamRanking.best(displayGroups(core.streamGroups()), continuity: rememberedQuality, pin: sourcePin,
+                           debridCachedHashes: debridCache.cachedHashes)
     }
 
     /// Whether stream add-ons are still answering for this movie. Mirrors the tvOS Watch-Now gate:
@@ -1107,11 +1123,13 @@ struct iOSDetailView: View {
     /// remembered-quality continuity hint (live streams don't carry meaningful quality memory).
     @ViewBuilder private var liveSourceSection: some View {
         iOSSourceList(
-            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin),
+            groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                               debridCachedHashes: debridCache.cachedHashes),
             progress: core.streamLoadProgress(),
             states: core.streamAddonStates(),
             settleTimedOut: settleTimedOut,
             pinContext: pinContext,
+            cachedHashes: debridCache.cachedHashes,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } }
         )
         .padding(.horizontal, Theme.Space.md)
@@ -1431,6 +1449,8 @@ struct iOSEpisodeStreams: View {
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source for this show (#15)
+    // Debrid cache awareness for THIS episode's source list. Empty (no badges, ranking unchanged) with no key.
+    @StateObject private var debridCache = DebridCacheAwareness()
 
     /// A series pin is keyed by the show id, so every episode shares the pinned provider/quality.
     private var pinContext: SourcePinContext { SourcePinContext(metaId: meta.id, isSeries: true) }
@@ -1452,12 +1472,14 @@ struct iOSEpisodeStreams: View {
             VStack(alignment: .leading, spacing: Theme.Space.lg) {
                 hero(width: geo.size.width)
                 iOSSourceList(
-                    groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin),
+                    groups: StreamRanking.rankedGroups(displayGroups(core.streamGroups(forStreamId: video.id)), pin: sourcePin,
+                                                       debridCachedHashes: debridCache.cachedHashes),
                     progress: core.streamLoadProgress(forStreamId: video.id),
                     states: core.streamAddonStates(forStreamId: video.id),
                     settleTimedOut: settleTimedOut,
                     continuity: rememberedQuality,
                     pinContext: pinContext,
+                    cachedHashes: debridCache.cachedHashes,
                     play: { stream, url in Task { await play(stream, url: url) } }
                 )
                 .padding(.horizontal, Theme.Space.md)
@@ -1489,6 +1511,11 @@ struct iOSEpisodeStreams: View {
         .task {
             try? await Task.sleep(for: .seconds(20))
             settleTimedOut = true
+        }
+        // Debrid cache awareness for this episode's torrents: re-check as add-ons answer (de-duped by hash
+        // set in refresh). Empty / no-op with no debrid key.
+        .onChange(of: core.streamLoadProgress(forStreamId: video.id).loaded) { _ in
+            debridCache.refresh(from: displayGroups(core.streamGroups(forStreamId: video.id)))
         }
         .platformFullScreenPlayerCover(item: $player) { launch in
             PlayerScreen(
@@ -1654,7 +1681,8 @@ struct iOSEpisodeStreams: View {
                                             secondsSinceFirstPlayable: elapsed, rememberedQuality: rememberedQuality) { break }
             try? await Task.sleep(for: .milliseconds(250))
         }
-        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin),
+        guard let best = StreamRanking.best(groups, continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
+                                            debridCachedHashes: debridCache.cachedHashes),
               let url = best.playableURL else { return nil }
         lastBinge = best.behaviorHints?.bingeGroup   // keep the next episode on this release group (#3)
         core.loadEnginePlayer(for: best)
@@ -1681,7 +1709,8 @@ struct iOSEpisodeStreams: View {
             }
             for await g in tasks { if let g { groups.append(g) } }
         }
-        guard let best = StreamRanking.best(displayGroups(groups), continuity: rememberedQuality, binge: lastBinge, pin: sourcePin) else { return }
+        guard let best = StreamRanking.best(displayGroups(groups), continuity: rememberedQuality, binge: lastBinge, pin: sourcePin,
+                                            debridCachedHashes: debridCache.cachedHashes) else { return }
         prepareTorrentStream(best)                       // start peer discovery now (no-op for direct / debrid)
         guard best.url != nil, let url = best.playableURL else { return }   // direct / debrid → pull first bytes to warm the CDN
         var request = URLRequest(url: url)
@@ -1750,6 +1779,9 @@ struct iOSSourceList: View {
     var settleTimedOut = false                          // resolution gave up → show "No sources" not a spinner
     var continuity: String? = nil                       // remembered quality signature → same-quality Watch-in pick
     var pinContext: SourcePinContext? = nil             // title context for the per-row pin source menu/badge (#15)
+    /// Raw-torrent infoHashes the user's debrid account has cached, lowercased, for the per-row "Cached"
+    /// chip. Empty by default (no key / not yet checked) → no badges, identical to today.
+    var cachedHashes: Set<String> = []
     /// When false, the primary Watch / Quality / All-sources control bar is hidden and the grouped list is
     /// shown directly. The MOVIE detail page passes false because its hero already shows Watch + Quality +
     /// a "Sources" scroll button (rendering both looked like duplicate controls). The episode + live pages
@@ -1913,7 +1945,7 @@ struct iOSSourceList: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
             // on the same quality it last played (same-release-group biased) — matching tvOS.
-            if let best = StreamRanking.best(groups, continuity: continuity), let url = best.playableURL {
+            if let best = StreamRanking.best(groups, continuity: continuity, debridCachedHashes: cachedHashes), let url = best.playableURL {
                 HStack(spacing: Theme.Space.sm) {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
@@ -2067,15 +2099,24 @@ struct iOSSourceList: View {
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if let url = stream.playableURL {
             Button { play(stream, url) } label: {
-                iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream))
+                iOSStreamLabel(addon: addon, stream: stream, enabled: true, pinned: isPinned(addon, stream),
+                               debridCached: isDebridCached(stream))
             }
             .buttonStyle(RowFocusStyle())
             .contextMenu { pinMenu(addon, stream) }
         } else {
-            iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false)
+            iOSStreamLabel(addon: addon, stream: stream, enabled: false, pinned: false,
+                           debridCached: isDebridCached(stream))
                 .background(Theme.Palette.surface1.opacity(0.5),
                             in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
         }
+    }
+
+    /// True when this raw torrent's infoHash is in the debrid-confirmed cached set (drives the row chip).
+    /// False for every stream when the set is empty (no key / not yet checked), so no chips render.
+    private func isDebridCached(_ stream: CoreStream) -> Bool {
+        guard !cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
+        return cachedHashes.contains(h)
     }
 
     /// True when this stream is the one the effective pin floats to the top - drives the row's pin badge.
@@ -2125,6 +2166,9 @@ private struct iOSStreamLabel: View {
     let stream: CoreStream
     let enabled: Bool
     var pinned: Bool = false
+    /// This raw torrent is cached in the user's debrid account (coordinator-confirmed). Adds a small
+    /// "Cached" chip; false by default so the row is unchanged when no key is configured.
+    var debridCached: Bool = false
 
     var body: some View {
         let quality = StreamRanking.qualityLabel(stream)        // "4K" / "1080p" / "Best"
@@ -2148,6 +2192,9 @@ private struct iOSStreamLabel: View {
                     // one above (the reported double tag). Real add-on names still show.
                     if addon.uppercased() != quality.uppercased() { badge(addon.uppercased()) }
                     if stream.isTorrent { badge("TORRENT") }
+                    // Debrid cache chip: this raw torrent is instant from the user's debrid account. Reuses
+                    // the prominent (accent) badge style with a bolt glyph; only shows when confirmed cached.
+                    if debridCached { badge("⚡ CACHED", prominent: true) }
                 }
                 // Parsed flavour tags + size — the clean line tvOS shows, minus the resolution (it is
                 // the prominent badge above), so the row never reads as a doubled "4K · 4K · HDR".

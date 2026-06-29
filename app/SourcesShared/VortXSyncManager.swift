@@ -561,6 +561,10 @@ final class VortXSyncManager: ObservableObject {
             if let v = keys["allDebrid"],  v != debrid.key(for: .allDebrid)  { debrid.setKey(v, for: .allDebrid) }
             if let v = keys["premiumize"], v != debrid.key(for: .premiumize) { debrid.setKey(v, for: .premiumize) }
             if let v = keys["torBox"],     v != debrid.key(for: .torBox)     { debrid.setKey(v, for: .torBox) }
+            // A key that ARRIVED from another device must take effect here too: rebuild the resolvers so
+            // the changed/new key is live (setKey already nudges this on a local edit; this covers the pull
+            // path explicitly). @MainActor hop because the coordinator is main-actor isolated.
+            Task { @MainActor in DebridCoordinator.shared.reload() }
             restored = true
         }
         if let searches = doc["searches"] as? [String: [String]] {

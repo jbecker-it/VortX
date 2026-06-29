@@ -105,7 +105,7 @@ enum StreamRanking {
     /// score. bingeGroup (exact, from the add-on) outweighs the quality-signature
     /// heuristic; both fall back to the plain best when absent.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
-                     pin: ResolvedPin? = nil) -> CoreStream? {
+                     pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
@@ -115,11 +115,11 @@ enum StreamRanking {
         }
         let hasHint = hint?.isEmpty == false
         let hasBinge = binge?.isEmpty == false
-        guard hasHint || hasBinge || pin != nil else { return best(groups, pin: pin) }
+        guard hasHint || hasBinge || pin != nil else { return best(groups, pin: pin, debridCachedHashes: debridCachedHashes) }
         let candidates = playablePairs(groups)
         return candidates.max { lhs, rhs in
-            (score(lhs.stream) + continuityBonus(lhs.stream, hint: hint) + bingeBonus(lhs.stream, group: binge) + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)) <
-            (score(rhs.stream) + continuityBonus(rhs.stream, hint: hint) + bingeBonus(rhs.stream, group: binge) + pinBonus(rhs.stream, addon: rhs.addon, pin: pin))
+            (score(lhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(lhs.stream, hint: hint) + bingeBonus(lhs.stream, group: binge) + pinBonus(lhs.stream, addon: lhs.addon, pin: pin)) <
+            (score(rhs.stream, debridCachedHashes: debridCachedHashes) + continuityBonus(rhs.stream, hint: hint) + bingeBonus(rhs.stream, group: binge) + pinBonus(rhs.stream, addon: rhs.addon, pin: pin))
         }?.stream
     }
 
@@ -164,7 +164,15 @@ enum StreamRanking {
         return qualityReady || seconds > 16                            // ceiling so a vanished quality cannot hang it
     }
 
-    static func score(_ s: CoreStream) -> Int {
+    static func score(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
+        // Coordinator-confirmed cache hits bypass the memo: the score cache is keyed only by the
+        // stream's own text fields (streamKey), NOT by the cached set, so caching a hit-adjusted score
+        // under that key would leak into an empty-set call (and an empty-set score would leak into a
+        // hit call). When the set is empty — every existing call site — this is the unchanged memoized
+        // path, so output is byte-identical to today.
+        if !debridCachedHashes.isEmpty, let hash = s.infoHash?.lowercased(), debridCachedHashes.contains(hash) {
+            return computeScore(s, debridCachedHashes: debridCachedHashes)
+        }
         let key = streamKey(s)
         cacheLock.lock()
         if let hit = scoreCache[key] { cacheLock.unlock(); return hit }
@@ -181,7 +189,7 @@ enum StreamRanking {
         return value
     }
 
-    private static func computeScore(_ s: CoreStream) -> Int {
+    private static func computeScore(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
         let text = qualityText(s)
         var score = resolution(text)
         // Source ladder: STRICT and the dominant WITHIN-resolution key (issue #68 — a remux must beat
@@ -239,9 +247,12 @@ enum StreamRanking {
         // "uncached debrid kept winning" fix. It stays SMALLER than the 15k tier gap on purpose:
         // the user's source-type order is the top-level key, so someone who ranks Torrent or
         // Usenet above Debrid genuinely gets that order, cached or not.
-        if isCached(s, text) { score += 8000 }
+        if isCached(s, text, debridCachedHashes: debridCachedHashes) { score += 8000 }
         // Source type is the dominant sort key: user-ranked tier (debrid > usenet > torrent >
         // direct by default) contributes a 15k-spaced weight that overrules quality and cache.
+        // A coordinator-confirmed cached raw torrent KEEPS its .torrent type here: this is an
+        // awareness-only slice, so it still plays via the torrent server, not debrid. The +8000 cached
+        // bonus above lifts it WITHIN the torrent tier; the .debrid retag waits for the cached-PLAY path.
         let type = sourceType(s, text)
         score += SourcePreferences.shared.tierWeight(for: type)
         // Provider offset: a small INTRA-tier nudge that orders equal-quality streams between
@@ -614,13 +625,14 @@ enum StreamRanking {
         }
     }
 
-    static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil) -> [CoreStreamSourceGroup] {
+    static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
+                             debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
         let groups = applyUserFilters(groups)
         guard !SourcePreferences.shared.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
             for (i, stream) in group.streams.enumerated() {
-                scored.append((stream: stream, score: score(stream) + pinBonus(stream, addon: group.addon, pin: pin), index: i))
+                scored.append((stream: stream, score: score(stream, debridCachedHashes: debridCachedHashes) + pinBonus(stream, addon: group.addon, pin: pin), index: i))
             }
             scored.sort { $0.score != $1.score ? $0.score > $1.score : $0.index < $1.index }
             return CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: scored.map { $0.stream })
@@ -628,13 +640,14 @@ enum StreamRanking {
     }
 
     /// The single best playable stream across all groups, for the one-press "Watch Now".
-    static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil) -> CoreStream? {
+    static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
+                     debridCachedHashes: Set<String> = []) -> CoreStream? {
         let groups = applyUserFilters(groups)
         if SourcePreferences.shared.useAddonOrder {
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
         }
-        return playablePairs(groups).max { (score($0.stream) + pinBonus($0.stream, addon: $0.addon, pin: pin)) < (score($1.stream) + pinBonus($1.stream, addon: $1.addon, pin: pin)) }?.stream
+        return playablePairs(groups).max { (score($0.stream, debridCachedHashes: debridCachedHashes) + pinBonus($0.stream, addon: $0.addon, pin: pin)) < (score($1.stream, debridCachedHashes: debridCachedHashes) + pinBonus($1.stream, addon: $1.addon, pin: pin)) }?.stream
     }
 
     /// The best playable stream for each distinct resolution (4K, 1080p, …), best-first — feeds the
@@ -900,7 +913,19 @@ enum StreamRanking {
     /// had to download into the debrid first (the "first pick always fails" reports).
     /// Marker sets verified against the four major add-ons' formatter source.
     /// Order matters: "uncached" contains "cached", so the negative markers test first.
-    static func isCached(_ s: CoreStream, _ text: String) -> Bool {
+    ///
+    /// `debridCachedHashes` is an OPTIONAL set of infoHashes the user's own debrid account confirmed
+    /// cached (via `DebridCoordinator.cacheCheck`), lowercased. A raw torrent whose infoHash is in it
+    /// gets the SAME instant treatment as a text-marked cached stream. The set defaults to empty, in
+    /// which case this is byte-identical to the marker/URL heuristic alone.
+    static func isCached(_ s: CoreStream, _ text: String, debridCachedHashes: Set<String> = []) -> Bool {
+        // Coordinator-confirmed cache: the user's debrid account holds this exact torrent, so it plays
+        // instantly even if the add-on text carries no cache marker. Checked first (a positive override),
+        // and a no-op when the set is empty.
+        if !debridCachedHashes.isEmpty, let hash = s.infoHash?.lowercased(),
+           debridCachedHashes.contains(hash) {
+            return true
+        }
         // "[RD download]" forms, "⏳" hourglass, "⬇" download arrow, "❌ not ready", "🎟" ticket.
         if text.contains("⏳") || text.contains("⬇") || text.contains("uncached")
             || text.contains("not ready") || text.contains("🎟")

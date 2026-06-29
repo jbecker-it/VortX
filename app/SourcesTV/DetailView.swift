@@ -928,6 +928,9 @@ struct CoreStreamList: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
+    // Debrid cache AWARENESS: which raw torrents the user's debrid account has cached, so they badge +
+    // rank up. Empty (no badges, ranking unchanged) with no debrid key configured.
+    @StateObject private var debridCache = DebridCacheAwareness()
 
     /// Pin context derived from the title being shown - a movie pin or a show pin, both keyed by the
     /// library (meta) id. A series episode list passes a `type: "series"` PlaybackMeta, so every episode
@@ -936,7 +939,8 @@ struct CoreStreamList: View {
     private var sourcePin: ResolvedPin? { pinContext.flatMap { pinStore.effectivePin($0) } }
 
     var body: some View {
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin)   // best source first within each add-on
+        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
+                                                debridCachedHashes: debridCache.cachedHashes)   // best source first within each add-on
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
@@ -945,7 +949,8 @@ struct CoreStreamList: View {
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin)
+        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin,
+                                      debridCachedHashes: debridCache.cachedHashes)
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
@@ -1076,6 +1081,12 @@ struct CoreStreamList: View {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true
         }
+        // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
+        // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
+        // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
+        .onChange(of: core.streamLoadProgress().loaded) { _ in
+            debridCache.refresh(from: displayGroups(core.streamGroups()))
+        }
     }
 
     /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.
@@ -1122,7 +1133,7 @@ struct CoreStreamList: View {
 
     @ViewBuilder private func streamRow(_ addon: String, _ stream: CoreStream) -> some View {
         if stream.playableURL != nil {
-            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream)) }
+            Button { play(stream) } label: { streamLabel(addon, stream, enabled: true, pinned: isPinned(addon, stream), debridCached: isDebridCached(stream)) }
                 .buttonStyle(RowFocusStyle())
                 .contextMenu { pinMenu(addon, stream) }
         } else {
@@ -1133,6 +1144,13 @@ struct CoreStreamList: View {
             Button {} label: { streamLabel(addon, stream, enabled: false) }
                 .buttonStyle(RowFocusStyle())
         }
+    }
+
+    /// True when this raw torrent's infoHash is in the debrid-confirmed cached set (drives the row chip).
+    /// False for every stream when the set is empty (no key / not yet checked), so no chips render.
+    private func isDebridCached(_ stream: CoreStream) -> Bool {
+        guard !debridCache.cachedHashes.isEmpty, let h = stream.infoHash?.lowercased() else { return false }
+        return debridCache.cachedHashes.contains(h)
     }
 
     /// True when this stream matches the effective pin - drives the row's pin badge.
@@ -1164,7 +1182,8 @@ struct CoreStreamList: View {
         }
     }
 
-    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false) -> some View {
+    private func streamLabel(_ addon: String, _ stream: CoreStream, enabled: Bool, pinned: Bool = false,
+                             debridCached: Bool = false) -> some View {
         HStack(alignment: .top, spacing: Theme.Space.md) {
             Image(systemName: enabled ? (stream.isTorrent ? "arrow.down.circle.fill" : "play.circle.fill") : "lock.circle")
                 .font(.system(size: 30))
@@ -1177,6 +1196,9 @@ struct CoreStreamList: View {
                     }
                     badge(addon.uppercased())
                     if stream.isTorrent { badge("TORRENT") }
+                    // Debrid cache chip: this raw torrent is instant from the user's debrid account. Accent
+                    // tint sets it apart from the neutral add-on/torrent badges; only shown when confirmed.
+                    if debridCached { badge("⚡ CACHED", accent: true) }
                 }
                 if let name = stream.name, !name.isEmpty {
                     Text(name).font(Theme.Typography.cardTitle)
@@ -1194,11 +1216,11 @@ struct CoreStreamList: View {
         .opacity(enabled ? 1 : 0.55)
     }
 
-    private func badge(_ text: String) -> some View {
+    private func badge(_ text: String, accent: Bool = false) -> some View {
         Text(text).font(Theme.Typography.eyebrow).tracking(1)
             .padding(.horizontal, 10).padding(.vertical, 4)
-            .background(Theme.Palette.surface3, in: Capsule())
-            .foregroundStyle(Theme.Palette.textSecondary)
+            .background(accent ? Theme.Palette.accent.opacity(0.22) : Theme.Palette.surface3, in: Capsule())
+            .foregroundStyle(accent ? Theme.Palette.accent : Theme.Palette.textSecondary)
     }
 
     /// Torrents: ask the embedded server to start fetching peers before playback. No-op for url/debrid.

@@ -62,7 +62,14 @@ final class DebridKeys: ObservableObject {
             keys[service.rawValue] = trimmed
             Keychain.set(trimmed, for: service.keychainAccount)
         }
-        Task { @MainActor in VortXSyncManager.shared.requestSyncSoon() }
+        // Rebuild the debrid resolvers so a CHANGED key takes effect: the coordinator's lazy
+        // `if resolvers.isEmpty { reload() }` only warms on first use, so it would otherwise keep
+        // using the OLD key (resolvers is non-empty). DebridCoordinator is @MainActor; setKey may run
+        // off the main actor (e.g. the sync apply path), so hop on.
+        Task { @MainActor in
+            DebridCoordinator.shared.reload()
+            VortXSyncManager.shared.requestSyncSoon()
+        }
     }
 
     /// A SecureField binding that persists on edit (same UX as the metadata-key fields).
