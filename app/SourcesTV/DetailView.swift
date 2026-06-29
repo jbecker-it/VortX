@@ -914,10 +914,16 @@ struct CoreStreamList: View {
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
-    // FIX H: seat the detail page's initial focus on Watch Now, not the Trailer chip. The movie page
-    // lays the trailer chip out ABOVE this list, so without an explicit default the focus engine parked
-    // on Trailer. Watch Now stays focusable even while gated (the button is never .disabled), so it is a
-    // valid default on appear; this only sets WHERE focus lands, it does not touch the RemoteCatcher model.
+    @State private var hasSeatedFocus = false      // one-shot: seat focus on Watch Now once, then leave the user alone
+    // FIX H (take 3): seat the detail page's initial focus on Watch Now, not the Trailer chip. The movie
+    // page lays the trailer chip out ABOVE this list, so without an explicit default the focus engine parks
+    // on Trailer. The earlier takes set `.defaultFocus($watchFocused, true)` but ONLY bound $watchFocused to
+    // the READY button (`if let best`), which does not exist on first appear while sources are still loading
+    // - so defaultFocus had no target and tvOS fell back to the first focusable (the trailer chip). This
+    // take binds $watchFocused to the loading AND no-sources buttons too, so the target always exists and
+    // focus follows the one primary-action slot as it transitions loading -> ready, plus a one-shot
+    // programmatic seat (.task below) as belt-and-suspenders over defaultFocus (only a hint tvOS can drop).
+    // It only sets WHERE focus lands; it does not touch the RemoteCatcher model.
     @FocusState private var watchFocused: Bool
     @EnvironmentObject private var presenter: PlayerPresenter   // root-replacement player presentation
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source floats to top + row menu/badge (#15)
@@ -1039,11 +1045,13 @@ struct CoreStreamList: View {
                     }
                 }
                 .buttonStyle(PrimaryActionStyle())
+                .focused($watchFocused)   // FIX H take 3: the default-focus target must exist in THIS (loading) state too
             } else {
                 // Done, nothing playable: a greyed (disabled-looking) button + an explanation. Focusable so Back works.
                 Button {} label: { Label("No sources found", systemImage: "exclamationmark.triangle") }
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(0.55)
+                    .focused($watchFocused)   // FIX H take 3: keep the seat valid in the no-sources state as well
                 Text("None of your \(addons.total) add-on\(addons.total == 1 ? "" : "s") returned a playable source for this title.")
                     .font(Theme.Typography.body).foregroundStyle(Theme.Palette.textSecondary)
             }
@@ -1055,6 +1063,15 @@ struct CoreStreamList: View {
         // FIX H: on appear, seat focus on Watch Now (above) rather than letting the focus engine pick the
         // first focusable view, which on the movie page is the Trailer chip laid out higher up.
         .defaultFocus($watchFocused, true)
+        .task {
+            // Belt-and-suspenders over .defaultFocus (a hint tvOS drops when a sibling like the trailer chip
+            // is laid out first): force the seat onto the Watch Now slot once, just after appear. One-shot
+            // via hasSeatedFocus so it never yanks focus back after the user has moved it.
+            guard !hasSeatedFocus else { return }
+            try? await Task.sleep(for: .milliseconds(60))
+            hasSeatedFocus = true
+            watchFocused = true
+        }
         .task {
             try? await Task.sleep(for: .seconds(12))
             settleTimedOut = true
