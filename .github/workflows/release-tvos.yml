@@ -44,8 +44,16 @@ jobs:
 
       - name: Select the newest Xcode on the runner
         run: |
-          XCODE="$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)"
-          echo "Selecting $XCODE"
+          # Pick the newest Xcode whose toolchain ACTUALLY EXISTS. A rotated runner image can ship a
+          # newest-by-version stub (e.g. Xcode_26.3.0.app) with no Contents/Developer, which made the
+          # Beta-14 build die with "missing DEVELOPER_DIR path". Walk newest-first and take the first
+          # install that has a real xcodebuild; fall back to the active xcode-select path if none match.
+          XCODE=""
+          for c in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -Vr); do
+            if [ -x "$c/Contents/Developer/usr/bin/xcodebuild" ]; then XCODE="$c"; break; fi
+          done
+          if [ -z "$XCODE" ]; then XCODE="$(dirname "$(dirname "$(xcode-select -p)")")"; fi
+          echo "Selected Xcode: $XCODE ($("$XCODE/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1))"
           sudo xcode-select -s "$XCODE"
           # Pin it for EVERY later step via DEVELOPER_DIR (xcodebuild honors it over the global
           # xcode-select state), so a runner-image default flip or the disk-free cleanup can never
