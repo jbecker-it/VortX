@@ -281,6 +281,9 @@ struct iOSHomeView: View {
     /// macOS keyboard browse: which Home poster card is focused. Passed to each rail so its cards become
     /// `.focusable()` and join native arrow traversal; nil on iOS (this whole member is macOS-only).
     @FocusState private var macFocus: MacBrowseFocus?
+    /// Debounces the focus -> hero feature: focus churns rapidly as the rails enrich, so we wait for ~300ms
+    /// of focus stability before cross-fading the billboard (otherwise the hero flickers every 0.3-0.5s).
+    @State private var macFocusDebounceTask: Task<Void, Never>?
     #endif
 
     /// All Home rail items in display order (Continue Watching first, then catalog rows), as
@@ -489,7 +492,7 @@ struct iOSHomeView: View {
                     // like any other. Each rail fails soft / drops when empty; the whole section needs a TMDB key.
                     // Suppressed when the nested-collection section is on, since its "Streaming" GROUP reproduces
                     // these exact rails (group 1) — showing both would duplicate the rows and their focus keys.
-                    if showStreamingRails && !showCollectionGroups {
+                    if showStreamingRails && (!showCollectionGroups || ApiKeys.tmdbKey() == nil) {
                         ForEach(streaming.collections) { collection in
                             homeRail(PosterRail(title: collection.title,
                                                 items: collection.items.map {
@@ -528,21 +531,28 @@ struct iOSHomeView: View {
             // billboard never yanks the page while the user is browsing (#53).
             .scrollDismissesHeroRotation(model: hero)
             #if os(macOS)
-            // Arrow keys MOVE the keyboard-browse selection. On plain SwiftUI/macOS, .focusable() +
-            // .focusSection() join the Tab loop but do NOT bind arrows to focus movement (unlike tvOS), so
-            // without this the accent ring shows on a clicked card but arrows do nothing (the "Mac arrow-key
-            // nav dead" report). advanceMacFocus walks the rails and sets macFocus.
+            // Arrow keys MOVE the keyboard-browse selection. These live on the ScrollView (not the
+            // NavigationStack) because on macOS the inner ScrollView is first responder and swallows arrow
+            // keys, so onMoveCommand attached to the stack never fired (the "Mac arrow-key nav dead" report).
+            // On plain SwiftUI/macOS, .focusable() + .focusSection() join the Tab loop but do NOT bind arrows
+            // to focus movement (unlike tvOS). advanceMacFocus walks the rails and sets macFocus.
             .onMoveCommand { advanceMacFocus($0) }
             // Escape steps focus up a level: drop the focused card so the keyboard browse returns to a
             // neutral state (the bottom tab strip is its own focus space, reachable via Tab / arrows).
             .onExitCommand { macFocus = nil }
             // Keyboard browse drives the hero: the focused poster features in the billboard (the tvOS
             // focused-card-hero behaviour, adapted for the Mac). Focus leaving the cards lets it resume.
+            // Debounced ~300ms: focus churns as the rails enrich, so feature only once focus settles.
             .onChange(of: macFocus) { newValue in
-                if case let .card(_, itemID) = newValue, let item = allRailItems.first(where: { $0.id == itemID }) {
-                    hero.feature(FeaturedHeroItem.from(rail: item))
-                } else {
-                    hero.noteInteraction()
+                macFocusDebounceTask?.cancel()
+                macFocusDebounceTask = Task {
+                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    guard !Task.isCancelled else { return }
+                    if case let .card(_, itemID) = newValue, let item = allRailItems.first(where: { $0.id == itemID }) {
+                        hero.feature(FeaturedHeroItem.from(rail: item))
+                    } else {
+                        hero.noteInteraction()
+                    }
                 }
             }
             // Seed focus onto the first card so a responder exists and arrows start moving: once on appear,

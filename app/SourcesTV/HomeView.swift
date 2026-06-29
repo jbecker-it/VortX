@@ -79,7 +79,7 @@ struct HomeView: View {
                         // like any catalog card. Hidden with no TMDB key; each rail drops when empty in-region.
                         // Suppressed when the nested-collection section is on, since its "Streaming" GROUP
                         // (group 1) reproduces these exact rails — showing both would duplicate the rows.
-                        if showStreamingRails && !showCollectionGroups {
+                        if showStreamingRails && (!showCollectionGroups || ApiKeys.tmdbKey() == nil) {
                             ForEach(streaming.collections) { collection in
                                 StreamingRow(title: collection.title, items: collection.items, focusModel: focusModel)
                             }
