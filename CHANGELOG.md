@@ -6,7 +6,9 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## Unreleased
 
-A stability pass aimed straight at the Apple TV crash where the whole device hangs, usually after you finish or stop a title and then open another. Please test this hard once it is in a build.
+## 0.3.8 Beta 14 - 2026-06-29 (pre-release)
+
+The big one: the Apple TV crash/hang fix you asked for, offline downloads, our own skip database with an in-player editor, community scrub-preview thumbnails, grouped Home collections, a configurable streaming cache, and a wave of sync and add-on improvements. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV stability on real hardware.
 
 ### Fixed
 
@@ -15,11 +17,26 @@ A stability pass aimed straight at the Apple TV crash where the whole device han
 - **A finished movie leaves Continue Watching on every profile.** A movie watched to the end could stay pinned in Continue Watching, most often on a second profile. It clears now.
 - **Smoother second profile.** Watch progress was nudging the cross-device sync on every tick while you watched; it now waits until you pause or stop, which keeps a second profile from feeling laggy.
 - **Apple TV: a movie's page opens on Watch Now again, not the Trailer button.** When you opened a movie while its sources were still loading, the focus landed on the Trailer chip instead of Watch Now. The page now seats focus on Watch Now from the moment it appears and keeps it there as the sources settle.
+- **The player's top-right now shows the episode title, not just the season and episode number.**
+- **Mac: arrow keys move focus on Home again.**
 
 ### Added
 
 - **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It uses the same air-date data the new-episode reminders already gather, routes to the show when you open a card, and simply does not appear when nothing is upcoming.
-- **Debrid-cached sources are marked and ranked up.** If you have a debrid account (Real-Debrid, AllDebrid, Premiumize, or TorBox) set under API keys, sources your account already has cached now show a small "cached" chip and rank higher in the source list, so the quick pick lands on one your debrid holds. Without a debrid key nothing changes. (Playing straight from the cached debrid link, instead of starting the torrent, is the next step.)
+- **Offline downloads.** Download movies and episodes to your iPhone, iPad, or Mac and play them with no connection, from debrid, direct links, or torrents. Downloads live in their own section with progress, pause and resume, and storage management.
+- **Self-hosted skip database with an in-player editor.** Skip-intro, recap, and credits times are now fetched first from VortX's own database, then the open community sources. You can mark and submit segments yourself from a built-in player editor, and a submission goes to VortX and the open SkipDB at the same time. You can also add an API key for any other compatible provider to contribute there too.
+- **Community scrub-preview thumbnails.** Seek-preview thumbnails are now shared across devices: once anyone has generated a title's previews, everyone else sees them instantly with no local work. It always falls back to your device's own capture, so there is never a regression.
+- **Play straight from a cached debrid link.** If a source is already cached on your debrid account (Real-Debrid, AllDebrid, Premiumize, or TorBox), VortX now plays it directly from the cached link instead of starting the torrent, and cached sources show a "cached" chip and rank higher in the list. Without a debrid key nothing changes.
+- **Upcoming Episodes on Home.** A new rail shows the next episode of the shows in your library that air within the next 45 days, soonest first, on Apple TV, iPhone, iPad, and Mac. It routes to the show when you open a card, and simply does not appear when nothing is upcoming.
+- **Grouped Home collections.** Home rails are now grouped (streaming services, genres, top new, and just new) for a cleaner browse, with a browse-by-streaming-service view.
+- **Configurable streaming cache.** A new Settings option lets you set an on-disk streaming cache size (default off), so seeking back in a long title stays instant.
+- **Add-on improvements.** Removing an add-on on one device now removes it everywhere, like settings sync. Add-ons also gained a Configure button, a change-URL option, drag-to-reorder on iPhone, iPad, and Mac, and better compatibility with manager add-ons (logo, order, and update-on-reinstall).
+- **Logos on more art.** fanart.tv clearlogos now show across Apple TV, iPhone, and Mac.
+
+### In progress
+
+- **Trailers and hero clips** play where they resolve today; broader coverage is still rolling out.
+- **Jellyfin media-server support** is groundwork only and not usable yet.
 
 ## 0.3.8 Beta 13 - 2026-06-28 (pre-release)
 
