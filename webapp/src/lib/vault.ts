@@ -659,3 +659,196 @@ export async function qrApprove(session: Session, code: string, devicePublicKey:
   if (r.status === 410) throw new Error("That code has expired.");
   if (r.status !== 200) throw new Error("Could not approve the sign-in.");
 }
+
+// --- Household sharing (shared add-ons / library / metadata + debrid keys across SEPARATE accounts) ---
+// A household has ONE random 32-byte household key (`hhKey`, versioned by `hhKeyVersion`). Every member
+// can decrypt the household-scoped shared blob with it; the worker (/v1/household/*) never sees `hhKey`
+// in plaintext. Admission reuses the SAME ephemeral X25519 + ECDH + HKDF primitive as QR pairing above,
+// but with a DISTINCT HKDF salt AND info ("vortx-household-salt-v1" / "vortx-household-v1") so a
+// household-wrapped payload can never cross-replay with a pairing-wrapped one (domain separation). The
+// owner ECDH-wraps the RAW 32-byte `hhKey` to a joiner's published public key; the worker relays only
+// the ciphertext. Byte contract is identical to the Apple app's HouseholdCrypto.swift + the e2e test:
+//   wrappingKey = HKDF-SHA256(ECDH(ourPriv, peerPub),
+//                             salt = utf8("vortx-household-salt-v1"),
+//                             info = utf8("vortx-household-v1"), L = 32)
+//   wrappedHhKey = base64url( AES-GCM-seal(hhKey 32B, wrappingKey) )   // iv(12)||ct(32)||tag(16), base64URL
+//   public keys  = base64url( X25519 raw public key (32 bytes) )       // same framing as the pairing flow
+// The SHARED BLOB itself is sealed under `hhKey` with the account-backup framing (standard base64
+// iv||ct||tag, i.e. seal/open above), NOT base64url — two distinct b64 alphabets for two channels, kept
+// separate on purpose so each matches its Swift counterpart exactly.
+
+const HOUSEHOLD_SALT = enc("vortx-household-salt-v1");
+const HOUSEHOLD_INFO = enc("vortx-household-v1");
+
+/** ECDH(X25519) + HKDF-SHA256 -> the 32-byte household wrapping key, from our private key + the peer's
+ *  raw public key (base64url). DISTINCT salt+info from pairWrappingKey for real domain separation. */
+async function householdWrappingKey(ourPrivate: CryptoKey, peerPubB64url: string): Promise<Uint8Array> {
+  const peer = await crypto.subtle.importKey("raw", unb64url(peerPubB64url) as BufferSource, { name: "X25519" }, false, []);
+  const secret = new Uint8Array(await crypto.subtle.deriveBits({ name: "X25519", public: peer }, ourPrivate, 256));
+  const hk = await crypto.subtle.importKey("raw", secret as BufferSource, "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: HOUSEHOLD_SALT as BufferSource, info: HOUSEHOLD_INFO as BufferSource },
+    hk,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+/** Mint a brand-new household key: 32 random bytes. Called ONCE on household init and again ONLY on
+ *  rotation (a member leaves), where the version is bumped so old members are locked out of FUTURE
+ *  shared content. Never derive these bytes deterministically. */
+export function newHhKey(): Uint8Array {
+  return crypto.getRandomValues(new Uint8Array(32));
+}
+
+/** Joiner: mint a one-time ephemeral X25519 keypair for a household key-request. Hold the keypair in
+ *  memory until the owner answers, then unwrap with unwrapHhKey. */
+export async function newHouseholdEphemeral(): Promise<{ keyPair: CryptoKeyPair; publicKeyB64url: string }> {
+  const keyPair = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const publicKeyB64url = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", keyPair.publicKey)));
+  return { keyPair, publicKeyB64url };
+}
+
+/** Owner side: wrap the RAW 32-byte `hhKey` to a joiner's published public key. Mints a fresh ephemeral
+ *  keypair (so the owner public key for THIS answer is `ownerPublicKey`), does ECDH against the joiner
+ *  key, derives the household wrapping key, and seals `hhKey` under it. Returns the owner ephemeral
+ *  public key + the sealed key, both base64url. */
+export async function wrapHhKey(
+  hhKey: Uint8Array,
+  joinerPublicKeyB64url: string,
+): Promise<{ ownerPublicKey: string; wrappedHhKey: string }> {
+  if (hhKey.length !== 32) throw new Error("hhKey must be exactly 32 bytes.");
+  const ephemeral = (await crypto.subtle.generateKey({ name: "X25519" }, true, ["deriveBits"])) as CryptoKeyPair;
+  const ownerPublicKey = b64url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const wrapKey = await householdWrappingKey(ephemeral.privateKey, joinerPublicKeyB64url);
+  const wrappedHhKey = await sealPair(wrapKey, hhKey);
+  return { ownerPublicKey, wrappedHhKey };
+}
+
+/** Joiner side: unwrap the household key with our ephemeral private key + the owner's ephemeral public
+ *  key. Returns the RAW 32-byte `hhKey`, or null if anything fails to verify (wrong key / tamper / the
+ *  recovered bytes are not 32 long). The joiner is expected to re-seal these bytes under its own dataKey
+ *  for durability (doc.household.wrappedHhKey), which is a plain seal() with the dataKey. */
+export async function unwrapHhKey(
+  wrappedHhKey: string,
+  ownerPublicKeyB64url: string,
+  ourPrivate: CryptoKey,
+): Promise<Uint8Array | null> {
+  const wrapKey = await householdWrappingKey(ourPrivate, ownerPublicKeyB64url);
+  const hhKey = await openPair(wrapKey, wrappedHhKey);
+  if (!hhKey || hhKey.length !== 32) return null;
+  return hhKey;
+}
+
+/** Seal the household shared blob under `hhKey`. Uses the account-backup framing (standard base64
+ *  iv||ct||tag), pinned to seal() so the blob stored in household_docs matches every surface + the app's
+ *  HouseholdCrypto.sealSharedBlob. */
+export async function sealSharedBlob(plaintext: Uint8Array, hhKey: Uint8Array): Promise<string> {
+  return seal(hhKey, plaintext);
+}
+/** Open the household shared blob sealed under `hhKey`. Null on any failure (wrong key / tamper). */
+export async function openSharedBlob(ciphertext: string, hhKey: Uint8Array): Promise<Uint8Array | null> {
+  return open(hhKey, ciphertext);
+}
+
+// --- Household worker calls (the /v1/household/* relay; the worker stays a blind ciphertext relay) ---
+
+export interface HouseholdStatus {
+  familyId: string;
+  role: string;
+  hasBlob: boolean;
+  version: number;
+  hhKeyVersion: number;
+  pendingRequests: number;
+}
+export interface HouseholdKeyRequest {
+  accountId: string;
+  username: string;
+  joinerPublicKey: string;
+  createdAt: number;
+}
+
+/** GET /v1/household — sharing status for the caller's family, or null when not in a household. */
+export async function householdStatus(session: Session): Promise<HouseholdStatus | null> {
+  const r = await api("/v1/household", { token: session.token });
+  if (r.status !== 200) return null;
+  return (r.data?.household as HouseholdStatus | null) ?? null;
+}
+
+/** GET /v1/household/blob — the shared ciphertext blob + its versions, or null when none exists yet. */
+export async function householdBlobGet(
+  session: Session,
+): Promise<{ document: string; version: number; hhKeyVersion: number } | null> {
+  const r = await api("/v1/household/blob", { token: session.token });
+  if (r.status === 404) return null;
+  if (r.status !== 200) throw new Error("Could not read the household.");
+  const d = r.data as { document: string; version: number; hhKeyVersion: number };
+  return { document: d.document, version: d.version, hhKeyVersion: d.hhKeyVersion };
+}
+
+/** PUT /v1/household/blob — store the shared blob, LWW by version (accepted only when strictly newer). */
+export async function householdBlobPut(
+  session: Session,
+  document: string,
+  version: number,
+  hhKeyVersion: number,
+): Promise<boolean> {
+  const r = await api("/v1/household/blob", {
+    method: "PUT",
+    token: session.token,
+    body: { document, version, hhKeyVersion },
+  });
+  if (r.status !== 200) throw new Error("Could not save the household.");
+  return r.data?.accepted !== false; // false = a newer version already won; caller re-fetches + merges
+}
+
+/** Joiner: POST /v1/household/key-request — publish our ephemeral public key so the owner can wrap hhKey. */
+export async function householdKeyRequest(session: Session, joinerPublicKey: string): Promise<void> {
+  const r = await api("/v1/household/key-request", {
+    method: "POST",
+    token: session.token,
+    body: { joinerPublicKey },
+  });
+  if (r.status !== 200) throw new Error("Could not request the household key.");
+}
+
+/** Owner: GET /v1/household/key-requests — pending hhKey requests from members (owner only). */
+export async function householdKeyRequests(session: Session): Promise<HouseholdKeyRequest[]> {
+  const r = await api("/v1/household/key-requests", { token: session.token });
+  if (r.status !== 200) return [];
+  return (r.data?.requests as HouseholdKeyRequest[]) ?? [];
+}
+
+/** Owner: POST /v1/household/key-answer — relay the wrapped hhKey + our ephemeral public key to a member. */
+export async function householdKeyAnswer(
+  session: Session,
+  accountId: string,
+  ownerPublicKey: string,
+  wrappedHhKey: string,
+  hhKeyVersion: number,
+): Promise<void> {
+  const r = await api("/v1/household/key-answer", {
+    method: "POST",
+    token: session.token,
+    body: { accountId, ownerPublicKey, wrappedHhKey, hhKeyVersion },
+  });
+  if (r.status !== 200) throw new Error("Could not answer the household key request.");
+}
+
+/** Joiner: GET /v1/household/key-status — poll for the owner's answer. The worker returns the wrapped key
+ *  ONCE (and deletes the request), so call unwrapHhKey immediately on an "answered" status. */
+export async function householdKeyStatus(session: Session): Promise<{
+  status: "none" | "pending" | "expired" | "answered";
+  ownerPublicKey?: string;
+  wrappedHhKey?: string;
+  hhKeyVersion?: number;
+}> {
+  const r = await api("/v1/household/key-status", { token: session.token });
+  if (r.status !== 200) return { status: "none" };
+  return r.data as {
+    status: "none" | "pending" | "expired" | "answered";
+    ownerPublicKey?: string;
+    wrappedHhKey?: string;
+    hhKeyVersion?: number;
+  };
+}

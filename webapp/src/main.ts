@@ -23,6 +23,7 @@ import { loadLive, renderLive } from "./views/live";
 import { closeDetail, handleDetailClick, openDetail } from "./views/detail";
 import { handleSettingsClick, renderSettings } from "./views/settings";
 import { handleLoginClick, renderLogin } from "./views/login";
+import { renderApprove, handleApproveClick } from "./views/approve";
 import { applySettings } from "./lib/settings";
 import { ensureValidSession, hydrateFromAccount } from "./lib/account";
 
@@ -169,6 +170,10 @@ async function renderRoute(route: Route): Promise<void> {
       renderLogin(mainHost());
       return;
     }
+    case "approve": {
+      renderApprove(mainHost());
+      return;
+    }
     case "detail": {
       const host = el("detail-host");
       if (!host) return;
@@ -298,6 +303,10 @@ function wireGlobalClicks(): void {
       return;
     }
     if (parseRoute().name === "login" && handleLoginClick(ev.target)) {
+      ev.preventDefault();
+      return;
+    }
+    if (parseRoute().name === "approve" && handleApproveClick(ev.target)) {
       ev.preventDefault();
       return;
     }

@@ -22,7 +22,7 @@ import {
 import { mergeSyncedProfiles, type SyncedProfile } from "./profiles";
 import { updateSettings, onSettingsChange, type Settings } from "./settings";
 import { settingsPatchFromDoc, mergeWebappSettingsIntoProfile, effectiveMainSettings, mainProfileId } from "./syncSettings";
-import { CINEMETA_URL } from "./addon";
+import { CINEMETA_URL, loadAddon } from "./addon";
 import type { MetaItem } from "./types";
 
 // The in-memory cache. `undefined` = not yet hydrated from storage; `null` = hydrated, signed out.
@@ -319,8 +319,26 @@ async function pushSettings(session: Session, s: Settings): Promise<void> {
  *  add-on). Fail-soft. */
 async function pushAddons(session: Session, urls: string[]): Promise<void> {
   try {
+    // Resolve each add-on's FULL manifest so the synced entry is the descriptor the native app needs:
+    // {transportUrl, name, manifest}. The app DROPS doc.addons entries that lack a manifest (it installs
+    // them into the engine network-free, see VortXSyncManager.ownedAddons), so a URL-only entry would
+    // never reach the apps - that was the "add-ons added on web don't sync to the apps" bug. Cinemeta is a
+    // universal built-in and is excluded. Resolve in parallel; on a manifest-fetch failure fall back to a
+    // URL-only entry so at least web clients still record the membership.
+    const descriptors = await Promise.all(
+      urls
+        .filter((u) => u !== CINEMETA_URL)
+        .map(async (u) => {
+          try {
+            const a = await loadAddon(u);
+            return { transportUrl: a.transportUrl, name: a.manifest.name, manifest: a.manifest };
+          } catch {
+            return { transportUrl: u };
+          }
+        }),
+    );
     await mutateSyncDoc(session, (doc) => {
-      doc.addons = urls.filter((u) => u !== CINEMETA_URL).map((u) => ({ transportUrl: u }));
+      doc.addons = descriptors;
     });
   } catch {
     // fail-soft: the add-on is already installed locally; a later change re-pushes.
