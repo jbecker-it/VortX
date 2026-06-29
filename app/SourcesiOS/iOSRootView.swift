@@ -893,8 +893,8 @@ struct DownloadsView: View {
         .padding(Theme.Space.sm)
         .background(Theme.Palette.surface1.opacity(0.6),
                     in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
-        .contentShape(Rectangle())
-        .onTapGesture { if record.state == .completed { play(record) } }
+        // No whole-row .onTapGesture: it swallowed the taps meant for the Play / Pause / Resume / Delete
+        // buttons inside the row (none of them fired). The dedicated Play button handles playback.
     }
 
     @ViewBuilder private func leadingGlyph(_ record: DownloadRecord) -> some View {
