@@ -104,8 +104,11 @@ enum CommunityTrickplay {
         do {
             var req = URLRequest(url: url, timeoutInterval: 8)
             req.setValue("application/json", forHTTPHeaderField: "accept")
+            VortXEdgeAuth.sign(&req)   // gated host (trickplay.vortx.tv /tp/<key>): stamp X-VX-Ts / X-VX-Sig
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else { return nil }
+            // NOTE: the sprite (meta.sprite) is on the R2 public asset host, NOT a gated *.vortx.tv
+            // service host, so it intentionally stays unsigned (that route is exempt).
             let meta = try JSONDecoder().decode(FetchResponse.self, from: data)
             guard meta.frame_count > 0, meta.cols > 0, meta.tile_w > 0, meta.tile_h > 0,
                   meta.interval_s > 0, let spriteURL = URL(string: meta.sprite) else { return nil }
@@ -262,6 +265,7 @@ enum CommunityTrickplay {
         req.httpMethod = "POST"
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "content-type")
         req.httpBody = body
+        VortXEdgeAuth.sign(&req)   // gated host (trickplay.vortx.tv /tp/<key> POST): stamp X-VX-Ts / X-VX-Sig
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
             guard let http = resp as? HTTPURLResponse, http.statusCode == 200,

@@ -36,6 +36,12 @@ app/Resources/server.js
 #     scripts/fetch-node-macos.sh; ~95MB; nodejs-mobile has no macOS slice) ---
 app/Resources/node-darwin-arm64
 
+# --- edge-signing secret (build-time HMAC key for the hardened VortX edge workers) ---
+#     The repo is PUBLIC; this real xcconfig must NEVER be committed (a secret in git history is
+#     leaked forever). Only the committed *.example template is tracked. Owner provisions the real
+#     value locally here + as a CI GitHub repo secret. See app/SourcesShared/VortXEdgeAuth.swift.
+app/Config/VortXEdge.xcconfig
+
 # --- tooling / misc ---
 .DS_Store
 .playwright-mcp/

@@ -9,6 +9,14 @@ packages:
   MPVKit:
     url: https://github.com/mpvkit/MPVKit
     exactVersion: "0.41.0"
+# Project-wide defaults. VORTX_EDGE_SECRET is the build-time HMAC key for the hardened VortX edge
+# workers; it is EMPTY here so the build never fails when the gitignored Config/VortXEdge.xcconfig
+# is absent (e.g. a fresh clone, or CI before the secret is injected). When that xcconfig is present
+# (local dev) or CI writes it from a GitHub repo secret, it OVERRIDES this empty default. The repo is
+# public, so a real value must never appear here. The Info.plist VortXEdgeSecret key substitutes it.
+settings:
+  base:
+    VORTX_EDGE_SECRET: ""
 targets:
   VortX:
     type: application
@@ -60,6 +68,13 @@ targets:
         INFOPLIST_KEY_UIRequiresFullScreen: "YES"
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+    # Build-time edge-signing secret. The real value lives ONLY in the gitignored
+    # Config/VortXEdge.xcconfig (and CI); the committed *.example documents it. Empty by default
+    # (workers are in OBSERVE mode, so an empty key is a no-op). Defaults VORTX_EDGE_SECRET so the
+    # build never fails when the file is absent; the Info.plist VortXEdgeSecret key reads it.
+    configFiles:
+      Debug: Config/VortXEdge.xcconfig
+      Release: Config/VortXEdge.xcconfig
   # Native iPhone/iPad client on stremio-core + libmpv (0.3.0), the same engine + player as the
   # Apple TV app, with a touch UI in SourcesiOS. Replaces the web-host VortX target once it
   # reaches parity (see docs/REBASE-iOS.md). Built alongside it so the web host keeps working
@@ -124,6 +139,10 @@ targets:
         INFOPLIST_KEY_UIStatusBarStyle: UIStatusBarStyleLightContent
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+    # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+    configFiles:
+      Debug: Config/VortXEdge.xcconfig
+      Release: Config/VortXEdge.xcconfig
   # Native macOS app (NOT Catalyst, which MPVKit can't link). Reuses the same native SwiftUI UI
   # (SourcesiOS), shared engine, and the now-cross-platform libmpv player. Streaming server:
   # nodejs-mobile has no macOS slice, so instead of embedding node as a library (iOS/tvOS), the Mac
@@ -190,6 +209,10 @@ targets:
         # VortXMac (internal; the deeper bundle-id/target rename is the 0.4 work).
         PRODUCT_NAME: VortX
         CODE_SIGNING_ALLOWED: "NO"
+    # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+    configFiles:
+      Debug: Config/VortXEdge.xcconfig
+      Release: Config/VortXEdge.xcconfig
   # tvOS has NO WebKit, so this is a native client (SwiftUI + addon HTTP + libmpv),
   # NOT the iOS web-host app. It shares only the MPVKit player core (Sources/Player).
   VortXTV:
@@ -247,6 +270,10 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: VortX
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+    # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+    configFiles:
+      Debug: Config/VortXEdge.xcconfig
+      Release: Config/VortXEdge.xcconfig
   # Lite/debrid-only tvOS build. This omits NodeMobile and server.js entirely,
   # so the app cannot create or play torrents even if old preferences say otherwise.
   VortXTVLite:
@@ -297,6 +324,10 @@ targets:
         INFOPLIST_KEY_CFBundleDisplayName: VortX Lite
         CODE_SIGNING_ALLOWED: "YES"
         CODE_SIGNING_REQUIRED: "NO"
+    # Build-time edge-signing secret (gitignored xcconfig; empty default; see project-level note).
+    configFiles:
+      Debug: Config/VortXEdge.xcconfig
+      Release: Config/VortXEdge.xcconfig
 schemes:
   VortX:
     build:

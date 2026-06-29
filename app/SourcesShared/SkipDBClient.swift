@@ -61,6 +61,7 @@ enum SkipDBClient {
         urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
         urlReq.httpBody = try JSONEncoder().encode(req)
         urlReq.timeoutInterval = 10
+        VortXEdgeAuth.sign(&urlReq)   // gated host (skip.vortx.tv /skip/contribute): stamp X-VX-Ts / X-VX-Sig
         let (data, response) = try await URLSession.shared.data(for: urlReq)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard (200..<300).contains(http.statusCode) else {

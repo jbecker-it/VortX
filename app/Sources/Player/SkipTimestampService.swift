@@ -69,6 +69,7 @@ enum SkipTimestampService {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
+        VortXEdgeAuth.sign(&request)   // gated host (skip.vortx.tv /skip read): stamp X-VX-Ts / X-VX-Sig
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
