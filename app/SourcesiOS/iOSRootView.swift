@@ -475,6 +475,16 @@ struct iOSHomeView: View {
                                             },
                                             onTap: handleTap))
                     }
+                    // "Upcoming Movies": library movies with a future release date in the next 45 days, soonest
+                    // first; hidden when nothing is upcoming. Each card routes to the movie detail like any card.
+                    if !releaseCalendar.upcomingMovies.isEmpty {
+                        homeRail(PosterRail(title: "Upcoming Movies",
+                                            items: releaseCalendar.upcomingMovies.map {
+                                                RailItem(id: $0.id, type: "movie", name: $0.name,
+                                                         poster: $0.poster, progress: 0, caption: $0.releaseDateLabel)
+                                            },
+                                            onTap: handleTap))
+                    }
                     ForEach(core.boardRows) { row in
                         if !row.items.isEmpty {
                             homeRail(PosterRail(title: row.title,
@@ -644,11 +654,15 @@ struct iOSHomeView: View {
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
-        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
-        guard !series.isEmpty else { releaseCalendar.clear(); return }
-        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let catalog = core.library?.catalog ?? []
         let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshMovies(movieIDs: movies.map(\.id), movieNames: movieNames, moviePosters: moviePosters, metaBases: bases)
     }
 
     /// Continue-Watching one-tap direct resume (#11): play the exact last-played stream straight away

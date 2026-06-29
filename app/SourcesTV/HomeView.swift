@@ -75,6 +75,24 @@ struct HomeView: View {
                         if !releaseCalendar.upcoming.isEmpty {
                             UpcomingEpisodesRow(items: releaseCalendar.upcoming, focusModel: focusModel)
                         }
+                        // "Upcoming Movies": library movies with a future release date in the next 45 days,
+                        // soonest first; hidden when nothing is upcoming. Each card routes to the movie DetailView.
+                        if !releaseCalendar.upcomingMovies.isEmpty {
+                            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                                RailHeader(eyebrow: "Coming soon", title: "Upcoming Movies")
+                                ScrollView(.horizontal, showsIndicators: false) {
+                                    LazyHStack(alignment: .top, spacing: Theme.Space.lg) {
+                                        ForEach(releaseCalendar.upcomingMovies) { m in
+                                            PosterCard(title: m.name, poster: m.poster, type: "movie", id: m.id, menu: .catalog,
+                                                       onFocus: { focusModel.focus(FocusedHero(id: m.id, type: "movie", title: m.name,
+                                                                                               backdrop: m.poster, metaLine: m.releaseDateLabel,
+                                                                                               overview: nil, genreLine: nil)) })
+                                        }
+                                    }
+                                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.lg)
+                                }
+                            }
+                        }
                         ForEach(core.boardRows) { row in
                             CoreCatalogRowView(row: row, focusModel: focusModel)
                         }
@@ -121,11 +139,15 @@ struct HomeView: View {
     /// EXACTLY like the new-episode notification sweep (series-typed library ids + names, `providesMeta`
     /// add-on base URLs). The model no-ops when the series set is unchanged, so this is cheap to re-call.
     private func refreshReleaseCalendar() {
-        let series = (core.library?.catalog ?? []).filter { $0.type == "series" }
-        guard !series.isEmpty else { releaseCalendar.clear(); return }
-        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let catalog = core.library?.catalog ?? []
         let bases = account.addons.filter { $0.providesMeta }.map(\.baseUrl)
+        let series = catalog.filter { $0.type == "series" }
+        let names = Dictionary(series.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
         releaseCalendar.refresh(seriesIDs: series.map(\.id), seriesNames: names, metaBases: bases)
+        let movies = catalog.filter { $0.type == "movie" }
+        let movieNames = Dictionary(movies.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let moviePosters = Dictionary(movies.compactMap { m in m.poster.map { (m.id, $0) } }, uniquingKeysWith: { a, _ in a })
+        releaseCalendar.refreshMovies(movieIDs: movies.map(\.id), movieNames: movieNames, moviePosters: moviePosters, metaBases: bases)
     }
 
     /// The hero enrichment asks the user's own meta add-ons, so every id scheme resolves.
