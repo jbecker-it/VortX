@@ -1000,6 +1000,17 @@ struct iOSSearchView: View {
                     .buttonStyle(ChipButtonStyle(selected: false))
                     .padding(.horizontal, Theme.Space.md)
 
+                    // macOS search lives inline here, NOT in a toolbar `.searchable`: the toolbar search
+                    // item is realized as an NSToolbarItem on the single shared window toolbar, and under
+                    // SwiftUI's rapid toolbar reconciliation it threw inside _insertNewItemWithItemIdentifier
+                    // (the same Mac crash class the wordmark/sign-in toolbar items are #if os(iOS)-gated for).
+                    #if os(macOS)
+                    TextField("Movies or series", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { core.suggestSearch(query); core.search(query) }
+                        .padding(.horizontal, Theme.Space.md)
+                    #endif
+
                     if !history.isEmpty && !isTyping { historySection }
 
                     results
@@ -1011,12 +1022,14 @@ struct iOSSearchView: View {
             .navigationDestination(for: FeaturedHeroItem.self) { item in
                 iOSDetailView(id: item.id, type: item.type, title: item.name)
             }
+            #if os(iOS)
             .searchable(text: $query, prompt: "Movies or series")
             .searchSuggestions {
                 ForEach(suggestionTitles, id: \.self) { title in
                     Text(title).searchCompletion(title)
                 }
             }
+            #endif
             .onSubmit(of: .search) {
                 searchTask?.cancel()
                 searchDebouncePending = false
