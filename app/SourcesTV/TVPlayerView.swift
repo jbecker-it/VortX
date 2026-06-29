@@ -67,6 +67,21 @@ struct TVPlayerView: View {
     @AppStorage(SubtitleStyle.Key.color) private var subColor = SubtitleStyle.defaultColor
     @AppStorage(SubtitleStyle.Key.background) private var subBackground = SubtitleStyle.defaultBackground
     @State private var optionRow = 0                   // highlighted row in the options panel
+    // Skip-segment editor (tvOS): the inline iOS/Mac editor bar is unavailable here, so the editor
+    // lives in its own focus-driven options panel. State is tvOS-local; submission reuses SkipDBClient
+    // (keyless to skip.vortx.tv, plus skipdb.tv / custom when keyed), exactly like the iOS path. The
+    // editor is offered for any tt####### title (the same gate the iOS control-bar button uses).
+    @State private var skipEditType: SkipDBSubmitView.SegmentType = .intro
+    @State private var skipEditStart: Double = 0       // segment start, seconds; Left/Right adjust, Select = playhead
+    @State private var skipEditEnd: Double = 30        // segment end, seconds
+    @State private var skipEditSubmitting = false
+    @State private var skipEditDone = false            // true once the current segment posted (shows the success row)
+    @State private var skipEditError: String?          // last submit failure message, shown inline
+    @State private var skipEditSubmittedKeys: Set<String> = []   // imdb:S:E:type already submitted this session
+    // Time-row adjust acceleration, mirroring the scrubber's press-repeat ramp (10s → 75s on a hold).
+    @State private var skipEditStep = 10.0
+    @State private var skipEditLastAdjustAt = 0.0
+    @State private var skipEditLastDir = 0   // last adjust direction; a reversal resets the ramp so it does not overshoot
     // Cached so the player body does not rebuild a string and rescan skip spans on
     // every playhead tick (audit #1): updated only when their inputs change.
     @State private var metadataLine = ""
@@ -163,8 +178,8 @@ struct TVPlayerView: View {
     @State private var localTrickplayCaptureInFlight = false
 
     /// Which on-screen control is currently highlighted (driven by remote left/right, not SwiftUI focus).
-    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings }
-    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings }
+    private enum Control: Hashable { case close, scrub, restart, back, play, fwd, audio, subs, aspect, playback, prev, next, episodes, chapters, sources, quality, settings, skipEdit }
+    private enum PanelKind { case audio, audioSettings, subtitles, subtitleSettings, aspect, playback, episodes, chapters, sources, quality, playerSettings, skipEditor }
     @State private var selected: Control = .play
     @State private var lastButton: Control = .play     // remembered button-row spot, so up-then-down returns to it
     // Scrub-to-seek: left/right on the scrubber moves a preview playhead (accelerating on rapid/held
@@ -433,6 +448,10 @@ struct TVPlayerView: View {
             case .upArrow: moveOption(-1)
             case .downArrow: moveOption(1)
             case .select: activateOption()
+            // Left/Right adjust a focused Start/End row in the skip editor (the only panel that uses
+            // horizontal input); every other panel ignores it, so the default no-op is unchanged.
+            case .leftArrow:  if let f = focusedSkipField { adjustSkipTime(f, -1) }
+            case .rightArrow: if let f = focusedSkipField { adjustSkipTime(f, 1) }
             default: break
             }
             return
@@ -480,6 +499,14 @@ struct TVPlayerView: View {
         }
     }
 
+    /// True for an IMDb tt####### title, the same gate the iOS control-bar uses to offer the skip
+    /// editor. Live streams and non-tt ids (e.g. add-on/Kitsu ids) are excluded: the SkipDB worker keys
+    /// off imdb:S:E, so a non-tt id has nothing to submit against.
+    private var canEditSkip: Bool {
+        guard !isCurrentLiveStream, let m = curMeta else { return false }
+        return m.libraryId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil
+    }
+
     /// The bottom transport row in remote left/right order. `.close` (top bar) and `.scrub` (the seek
     /// bar) are separate rows above this one; up/down moves between the three.
     private var buttonRow: [Control] {
@@ -498,6 +525,7 @@ struct TVPlayerView: View {
         c.append(.fwd)
         if !audioTracks.isEmpty { c.append(.audio) }
         c.append(.subs)
+        if canEditSkip { c.append(.skipEdit) }
         if allEpisodes.count > 1 { c.append(.episodes) }
         if hasChapters { c.append(.chapters) }
         return c
@@ -562,7 +590,22 @@ struct TVPlayerView: View {
         case .sources:  openPanel(.sources)
         case .quality:  openPanel(.quality)
         case .settings: openPanel(.playerSettings)
+        case .skipEdit: openSkipEditor()
         }
+    }
+
+    /// Seed the skip editor from the current playhead and open its panel. Reset on every open so a fresh
+    /// segment never inherits stale times / type / result from a prior submission, matching the iOS bar.
+    private func openSkipEditor() {
+        let snapped = (currentTime * 2).rounded() / 2
+        skipEditStart = max(0, snapped)
+        skipEditEnd = min(snapped + 30, duration > 0 ? duration : snapped + 60)
+        skipEditType = .intro
+        skipEditDone = false
+        skipEditError = nil
+        skipEditSubmitting = false
+        skipEditStep = 10
+        openPanel(.skipEditor)
     }
 
     /// The loaded source currently on screen (its playable URL matches what mpv is playing), used to
@@ -698,6 +741,7 @@ struct TVPlayerView: View {
                     HStack(spacing: Theme.Space.md) {
                         if !audioTracks.isEmpty { ctrlButton(.audio, "waveform") }
                         ctrlButton(.subs, "captions.bubble")
+                        if canEditSkip { ctrlButton(.skipEdit, "checkmark.bubble") }
                         if allEpisodes.count > 1 { ctrlButton(.episodes, "list.bullet") }
                         if hasChapters { ctrlButton(.chapters, "list.bullet.below.rectangle") }
                     }
@@ -794,12 +838,17 @@ struct TVPlayerView: View {
 
     // MARK: - Options panel (audio / subtitles / episodes), driven by optionRow
 
+    /// Tags a skip-editor row so the remote handler knows a focused Start/End row takes Left/Right to
+    /// adjust the time (every other panel ignores Left/Right). nil for all non-editor rows.
+    private enum SkipField { case start, end }
+
     private struct OptionRow: Identifiable {
         let id = UUID()
         let label: String
         var detail: String = ""        // right-aligned secondary text (e.g. current value)
         var isSelected: Bool = false
         var isHeader: Bool = false     // section header, not focusable, skipped in navigation
+        var skipField: SkipField? = nil   // non-nil only on the skip editor's Start/End rows
         var action: () -> Void = {}
     }
 
@@ -886,6 +935,8 @@ struct TVPlayerView: View {
             return rows
         case .playerSettings:
             return playerSettingsRows()
+        case .skipEditor:
+            return skipEditorRows()
         case .episodes:
             return allEpisodes.map { ep in
                 OptionRow(label: "E\(ep.episodeNumber)  ·  \(ep.episodeTitle)", isSelected: ep.id == curMeta?.videoId) {
@@ -943,6 +994,123 @@ struct TVPlayerView: View {
         let c = code.lowercased()
         if c.isEmpty || c == "und" { return "Unknown" }
         return Locale.current.localizedString(forLanguageCode: c)?.capitalized ?? code.uppercased()
+    }
+
+    // MARK: - Skip-segment editor panel (tvOS)
+
+    /// The skip editor's rows. Type section (intro / recap / outro / preview), Start + End time rows
+    /// (Left/Right adjust, Select snaps to the playhead), then a Submit row that reflects in-flight /
+    /// success / error / already-submitted state. A previously-submitted type shows a check in its row.
+    private func skipEditorRows() -> [OptionRow] {
+        guard let m = curMeta else { return [OptionRow(label: "Unavailable for this title", isHeader: true)] }
+        let key = skipSubmitKey(m, type: skipEditType)
+        let already = skipEditSubmittedKeys.contains(key)
+        let segLen = max(0, skipEditEnd - skipEditStart)
+
+        var rows: [OptionRow] = [OptionRow(label: "Type", isHeader: true)]
+        for t in SkipDBSubmitView.SegmentType.allCases {
+            let tKey = skipSubmitKey(m, type: t)
+            rows.append(OptionRow(label: t.label, detail: skipEditSubmittedKeys.contains(tKey) ? "submitted" : "",
+                                  isSelected: skipEditType == t) {
+                guard skipEditType != t else { return }
+                skipEditType = t
+                skipEditDone = false
+                skipEditError = nil
+            })
+        }
+
+        rows.append(OptionRow(label: "Times", isHeader: true))
+        rows.append(OptionRow(label: "Start", detail: timeString(skipEditStart),
+                              skipField: .start) { skipEditStart = max(0, (currentTime * 2).rounded() / 2) })
+        rows.append(OptionRow(label: "End", detail: timeString(skipEditEnd),
+                              skipField: .end) { skipEditEnd = max((currentTime * 2).rounded() / 2, skipEditStart + 0.5) })
+        rows.append(OptionRow(label: "Length", detail: String(format: "%.1fs", segLen), isHeader: true))
+
+        rows.append(OptionRow(label: "Submit", isHeader: true))
+        if skipEditSubmitting {
+            rows.append(OptionRow(label: "Submitting…"))
+        } else if skipEditDone {
+            rows.append(OptionRow(label: "Submitted. Thank you", isSelected: true))
+        } else if already {
+            rows.append(OptionRow(label: "Resubmit this \(skipEditType.label.lowercased())") { submitSkipEditor(meta: m) })
+        } else {
+            rows.append(OptionRow(label: "Submit \(skipEditType.label.lowercased())") { submitSkipEditor(meta: m) })
+        }
+        if let err = skipEditError {
+            rows.append(OptionRow(label: err, isHeader: true))
+        }
+        return rows
+    }
+
+    /// imdb:S:E:type key for the "already submitted" check, matching the iOS editor's key shape.
+    private func skipSubmitKey(_ m: PlaybackMeta, type: SkipDBSubmitView.SegmentType) -> String {
+        "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0):\(type.rawValue)"
+    }
+
+    /// Adjust the focused Start/End row by one accelerating step, reusing the scrubber's press-repeat ramp
+    /// (fine 10s taps, growing to 75s on a hold) so crossing a long film takes a few presses, not dozens.
+    /// Clamped so Start stays >= 0 and End stays > Start; both within the file duration when it is known.
+    private func adjustSkipTime(_ field: SkipField, _ dir: Int) {
+        let now = Date().timeIntervalSinceReferenceDate
+        if now - skipEditLastAdjustAt < 0.4, dir == skipEditLastDir {
+            skipEditStep = min(skipEditStep + 6, 75)
+        } else {
+            skipEditStep = 10   // a pause, or a direction reversal, resets to fine steps so it does not overshoot
+        }
+        skipEditLastAdjustAt = now
+        skipEditLastDir = dir
+        let upper = duration > 0 ? duration : .greatestFiniteMagnitude
+        let delta = Double(dir) * skipEditStep
+        switch field {
+        case .start:
+            skipEditStart = min(max(0, skipEditStart + delta), max(0, min(upper, skipEditEnd) - 0.5))
+        case .end:
+            skipEditEnd = min(max(skipEditStart + 0.5, skipEditEnd + delta), upper)
+        }
+        skipEditDone = false
+        skipEditError = nil
+        // Preview the new boundary under the playhead so the user sees where it lands, like the scrubber.
+        let target = field == .start ? skipEditStart : skipEditEnd
+        coordinator.player?.seek(to: target)
+        currentTime = target
+        if showOptions { panelRows = optionRows }   // refresh the time readout in place
+        scheduleHide()
+    }
+
+    /// Submit the edited segment. Reuses SkipDBClient.submit (keyless skip.vortx.tv, plus skipdb.tv /
+    /// custom provider when keyed) exactly like the iOS editor; on success it invalidates the cache and
+    /// re-fetches so the new span shows on the scrubber. The panel stays open to show the result.
+    private func submitSkipEditor(meta: PlaybackMeta) {
+        guard !skipEditSubmitting else { return }
+        skipEditSubmitting = true
+        skipEditError = nil
+        skipEditDone = false
+        if showOptions { panelRows = optionRows }
+        let req = SkipDBClient.SubmitRequest(
+            imdb_id: meta.libraryId,
+            season: meta.season,
+            episode: meta.episode,
+            segment_type: skipEditType.rawValue,
+            start_ms: Int(skipEditStart * 1000),
+            end_ms: Int(skipEditEnd * 1000),
+            duration_ms: duration > 0 ? Int(duration * 1000) : nil
+        )
+        let key = skipSubmitKey(meta, type: skipEditType)
+        Task { @MainActor in
+            do {
+                try await SkipDBClient.submit(req)
+                await SkipDBClient.invalidateCache(imdbId: meta.libraryId, season: meta.season,
+                                                   episode: meta.episode, durationSeconds: duration)
+                skipEditSubmittedKeys.insert(key)
+                skipEditDone = true
+                skipFetchKey = ""        // force a re-fetch so the submitted span resolves onto the bar
+                fetchSkipTimestamps()
+            } catch {
+                skipEditError = error.localizedDescription
+            }
+            skipEditSubmitting = false
+            if showOptions { panelRows = optionRows }
+        }
     }
 
     // MARK: - Source switching (swap to another loaded source without leaving the player)
@@ -1209,6 +1377,7 @@ struct TVPlayerView: View {
         case .sources:          return "Sources"
         case .quality:          return "Quality"
         case .playerSettings:   return "Player Settings"
+        case .skipEditor:       return "Edit Skip Segment"
         }
     }
 
@@ -1292,6 +1461,15 @@ struct TVPlayerView: View {
         // Selection state may have changed (speed, tracks, aspect, stats); one
         // recompute per press keeps the checkmarks honest.
         if showOptions { panelRows = optionRows }
+    }
+
+    /// The skip-editor Start/End field under the cursor, or nil when the highlighted row is not a time
+    /// row (or the panel is not the editor). Drives whether Left/Right adjusts a time vs. does nothing.
+    private var focusedSkipField: SkipField? {
+        guard panelKind == .skipEditor else { return nil }
+        let rows = panelRows
+        guard optionRow >= 0, optionRow < rows.count else { return nil }
+        return rows[optionRow].skipField
     }
 
     private func openPanel(_ kind: PanelKind) {
