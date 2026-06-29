@@ -6,6 +6,10 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## Unreleased
 
+## 0.3.8 Beta 15 - 2026-06-29 (pre-release)
+
+A big one: a Collections hub (Discover cards, Streaming Services with their logos, and Genres) on Home and Discover with a tap-to-browse grid, native debrid playback that plays cached torrents instantly, budget and box office on movies, spoiler-blurred unwatched episodes, an in-player AirPlay button, a download queue, upcoming-movie release dates, and the Apple TV 47-second crash plus the Mac crash fixes from your reports. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV stability and the new hub on real hardware. Thanks to OrigamiSpace, whose open SkipDB and in-player editor several of these features build on.
+
 ### Fixed
 
 - **Apple TV no longer crashes about 47 seconds into playback when the streaming cache is on.** The on-disk cache budget was being held as an in-memory buffer and pushed the Apple TV past its memory limit; it is now capped to a device-safe amount of RAM, so the cache can be on without the crash.
