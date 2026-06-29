@@ -76,8 +76,10 @@ struct iOSServiceTile: View {
             ZStack {
                 Theme.Palette.surface2
                 if let logo = provider.logoURL, let url = URL(string: logo) {
+                    // Tight padding so the (square) provider logo fills the tile instead of reading as a tiny
+                    // centered icon; the .fit logo is height-bound here, so small vertical padding = bigger logo.
                     AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fit) } placeholder: { Color.clear }
-                        .padding(Theme.Space.sm)
+                        .padding(.horizontal, 6).padding(.vertical, 4)
                 } else {
                     Text(provider.name).font(.system(size: 13, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
                         .multilineTextAlignment(.center).padding(4)

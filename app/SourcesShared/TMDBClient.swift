@@ -385,7 +385,7 @@ enum TMDBClient {
         let name: String
         let logoPath: String?
         var id: Int { providerID }
-        var logoURL: String? { logoPath.map { "https://image.tmdb.org/t/p/w154\($0)" } }
+        var logoURL: String? { logoPath.map { "https://image.tmdb.org/t/p/w300\($0)" } }
     }
 
     /// Curated front-of-row ordering for well-known SVOD services (lower = earlier). Anything not listed

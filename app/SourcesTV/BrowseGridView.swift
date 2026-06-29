@@ -89,7 +89,10 @@ struct TVServiceTile: View {
             ZStack {
                 Theme.Palette.surface2
                 if provider.logoURL != nil {
-                    RemoteLogo(url: provider.logoURL).padding(Theme.Space.lg)
+                    // Tight padding so the (square) provider logo fills most of the tile instead of reading as
+                    // a tiny centered icon. The .fit logo is height-bound in this wide tile, so the vertical
+                    // padding is what governs its size - keep it small.
+                    RemoteLogo(url: provider.logoURL).padding(.horizontal, Theme.Space.md).padding(.vertical, Theme.Space.sm)
                 } else {
                     Text(provider.name).font(.system(size: 20, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
                         .multilineTextAlignment(.center).padding(Theme.Space.sm)
