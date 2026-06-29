@@ -1,13 +1,16 @@
 import Foundation
 import os
 
-/// Submission client for skip segments. A submit fires TWO legs:
+/// Submission client for skip segments. A submit fires up to THREE legs concurrently:
 ///  - skip.vortx.tv (our self-hosted, keyless worker): ALWAYS, no API key required. This is the
 ///    authoritative leg; overall success means our worker accepted the segment.
 ///  - api.skipdb.tv (the community database we mirror reads from): best-effort, ONLY when the user
 ///    has configured a skipdb.tv API key. We give back to the open ecosystem, but a missing key or a
 ///    community-side failure never blocks the success UI.
-/// Reads are handled by SkipTimestampService (skip.vortx.tv first, then theIntroDB/SkipDB/AniSkip).
+///  - the user's optional custom SkipDB-compatible provider (ApiKeys.customSkipURL): best-effort, ONLY
+///    when configured. A self-hosted mirror the user points at; a missing URL, missing key, or any
+///    failure never blocks the success UI. It is a THIRD-PARTY host, so it is NOT VortX edge-signed.
+/// Reads are handled by SkipTimestampService (skip.vortx.tv first, then theIntroDB/SkipDB/custom/AniSkip).
 enum SkipDBClient {
 
     private static let log = Logger(subsystem: "com.stremiox.app", category: "skipsubmit")
@@ -42,12 +45,14 @@ enum SkipDBClient {
     /// Submit to both databases. Throws only when the authoritative skip.vortx.tv leg fails; the
     /// community skipdb.tv leg is best-effort and its outcome is logged but never surfaced.
     static func submit(_ req: SubmitRequest) async throws {
-        // Run both POSTs concurrently. The community leg is gated on a configured key.
+        // Run all legs concurrently. The community + custom legs are gated on their own config.
         async let vortx: Void = submitToVortX(req)
         async let community: Void = submitToCommunity(req)
+        async let custom: Void = submitToCustom(req)
 
-        // The community leg never throws (best-effort); await it so its task completes and logs.
-        _ = try? await community
+        // The best-effort legs never throw; await them so their tasks complete and log.
+        _ = await community
+        _ = await custom
 
         // Authoritative leg: propagate its failure to the caller.
         try await vortx
@@ -89,6 +94,31 @@ enum SkipDBClient {
             }
         } catch {
             log.info("skipdb.tv submit failed (best-effort, ignored): \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// The user's optional custom SkipDB-compatible leg. Best-effort, exactly like the community leg:
+    /// no configured URL means no submission and no error; any failure is logged, not thrown. POSTs the
+    /// same SubmitRequest body to `<customBase>/api/segments`. NOT VortX edge-signed: this is a
+    /// third-party host (VortXEdgeAuth only stamps our own *.vortx.tv hosts), so we never call sign() here.
+    private static func submitToCustom(_ req: SubmitRequest) async {
+        guard let base = CustomSkipProvider.baseURL() else { return }   // no/invalid URL: silently skip
+        guard let url = URL(string: base + "/api/segments") else { return }
+        var urlReq = URLRequest(url: url)
+        urlReq.httpMethod = "POST"
+        urlReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let key = ApiKeys.customSkipKey() {   // optional: some mirrors are keyless
+            urlReq.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+        urlReq.timeoutInterval = 10
+        do {
+            urlReq.httpBody = try JSONEncoder().encode(req)
+            let (_, response) = try await URLSession.shared.data(for: urlReq)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                log.info("custom skip provider submit returned \(http.statusCode, privacy: .public) (best-effort, ignored)")
+            }
+        } catch {
+            log.info("custom skip provider submit failed (best-effort, ignored): \(String(describing: error), privacy: .public)")
         }
     }
 

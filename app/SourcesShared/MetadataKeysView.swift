@@ -17,6 +17,14 @@ struct MetadataKeysView: View {
                 keyField("MDBList", text: $keys.mdblist, hint: "Free at mdblist.com, Preferences then API.")
                 keyField("fanart.tv", text: $keys.fanart, hint: "Free at fanart.tv, your profile then API.")
                 keyField("SkipDB", text: $keys.skipdb, hint: "Optional. Create an account at skipdb.tv, then generate an API key in Account settings to also share edits there.")
+
+                Text("Custom skip provider").font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                    .padding(.top, Theme.Space.md)
+                Text("Optional. A SkipDB-compatible endpoint (e.g. a self-hosted mirror) to also read from and contribute to. Submissions go to VortX, skipdb.tv (if keyed), and this, all at once.")
+                    .font(Theme.Typography.label)
+                    .foregroundStyle(Theme.Palette.textTertiary)
+                urlField("Provider URL", text: $keys.customSkipURL, hint: "Base URL only, e.g. https://my-mirror.example")
+                keyField("Provider API key", text: $keys.customSkipKey, hint: "Optional. Leave blank if the provider is keyless.")
             }
             .padding(.horizontal, Theme.Space.screenInset)
             .padding(.vertical, Theme.Space.xl)
@@ -40,6 +48,31 @@ struct MetadataKeysView: View {
                 #if os(iOS)
                 .textContentType(.password)
                 .textInputAutocapitalization(.never)
+                #endif
+            Text(hint).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+        }
+        .padding(Theme.Space.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Theme.Palette.surface1, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+    }
+
+    // A plain (non-masked) field: a base URL is configuration, not a credential.
+    @ViewBuilder private func urlField(_ title: String, text: Binding<String>, hint: String) -> some View {
+        VStack(alignment: .leading, spacing: Theme.Space.sm) {
+            HStack {
+                Text(title).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                Spacer()
+                if !text.wrappedValue.isEmpty {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(Theme.Palette.accent)
+                }
+            }
+            TextField("https://", text: text)
+                .font(.system(size: 15, design: .monospaced))
+                #if os(iOS)
+                .keyboardType(.URL)
+                .textContentType(.URL)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
                 #endif
             Text(hint).font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
         }

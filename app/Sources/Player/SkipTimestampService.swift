@@ -18,11 +18,13 @@ enum SkipTimestampService {
     }
 
     /// All skip candidates for a title, merging our own skip.vortx.tv worker (primary, keyless) with
-    /// the chosen third-party crowd source(s) and AniSkip (anime). The VortX worker already aggregates
-    /// SkipDB plus capture-on-miss server-side, so it leads; the other providers stay as fallback.
+    /// the chosen third-party crowd source(s), the user's optional custom SkipDB-compatible provider,
+    /// and AniSkip (anime). The VortX worker already aggregates SkipDB plus capture-on-miss server-side,
+    /// so it leads; the other providers stay as fallback.
     static func candidates(imdbId: String, season: Int?, episode: Int?,
                            durationSeconds: Double) async -> [SegmentCandidate] {
         async let vortx   = vortxSkip(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
+        async let custom  = customSkip(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
         async let aniskip = AniSkipService.candidates(metaId: imdbId, episode: episode, durationSeconds: durationSeconds)
         let crowd: [SegmentCandidate]
         switch provider {
@@ -35,7 +37,7 @@ enum SkipTimestampService {
         default: // "theintrodb"
             crowd = await theIntroDB(imdbId: imdbId, season: season, episode: episode, durationSeconds: durationSeconds)
         }
-        return (await vortx) + crowd + (await aniskip)
+        return (await vortx) + crowd + (await custom) + (await aniskip)
     }
 
     /// Cache key for the VortX worker, bucketed by runtime like the other providers so a different
@@ -140,15 +142,40 @@ enum SkipTimestampService {
     /// Layer 2b: SkipDB crowd spans (any media, keyed by IMDB id only).
     private static func skipDB(imdbId: String, season: Int?, episode: Int?,
                                durationSeconds: Double) async -> [SegmentCandidate] {
+        await skipDBCompatible(base: "https://api.skipdb.tv", apiKey: ApiKeys.skipDBKey(),
+                               cachePrefix: "skipdb", label: "SkipDB",
+                               imdbId: imdbId, season: season, episode: episode,
+                               durationSeconds: durationSeconds)
+    }
+
+    /// Layer 2c: the user's optional custom SkipDB-compatible provider (a self-hosted mirror they point
+    /// VortX at). Reuses the exact SkipDB read path + decoder, just parameterized by base URL and key,
+    /// so the user also benefits from reads. Cached under a distinct `customskip:<host>:...` prefix so it
+    /// never collides with the public skipdb.tv cache. Fail-soft (no URL / 404 / error / offline -> []).
+    /// NOT VortX edge-signed: third-party host.
+    private static func customSkip(imdbId: String, season: Int?, episode: Int?,
+                                   durationSeconds: Double) async -> [SegmentCandidate] {
+        guard let base = CustomSkipProvider.baseURL(), let host = URL(string: base)?.host else { return [] }
+        return await skipDBCompatible(base: base, apiKey: ApiKeys.customSkipKey(),
+                                      cachePrefix: "customskip:\(host)", label: "custom skip provider",
+                                      imdbId: imdbId, season: season, episode: episode,
+                                      durationSeconds: durationSeconds)
+    }
+
+    /// Shared read path for any SkipDB-compatible `<base>/api/segments` endpoint (the public skipdb.tv
+    /// and the user's custom mirror both speak it). Keyed by IMDB id only; decodes with `SkipDBResponse`.
+    private static func skipDBCompatible(base: String, apiKey: String?, cachePrefix: String, label: String,
+                                         imdbId: String, season: Int?, episode: Int?,
+                                         durationSeconds: Double) async -> [SegmentCandidate] {
         guard imdbId.range(of: #"^tt\d{7,8}$"#, options: .regularExpression) != nil else { return [] }
         let durationBucket = Int(durationSeconds / 10) * 10
-        let key = "skipdb:\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
+        let key = "\(cachePrefix):\(imdbId):\(season ?? 0):\(episode ?? 0):\(durationBucket)"
         if let cached = await SkipTimestampStore.shared.entry(for: key) {
             log.info("cache hit \(key, privacy: .public): \(cached.spans.count, privacy: .public) spans")
             return candidates(from: cached.spans, duration: durationSeconds)
         }
 
-        var components = URLComponents(string: "https://api.skipdb.tv/api/segments")!
+        guard var components = URLComponents(string: base + "/api/segments") else { return [] }
         var items: [URLQueryItem] = [URLQueryItem(name: "imdb_id", value: imdbId)]
         if let season, let episode {
             items.append(URLQueryItem(name: "season", value: String(season)))
@@ -162,31 +189,32 @@ enum SkipTimestampService {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
-        if let apiKey = ApiKeys.skipDBKey() {
+        if let apiKey {
             request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
+        // No VortXEdgeAuth.sign here: skipdb.tv and the custom mirror are third-party hosts.
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else { return [] }
             if http.statusCode == 404 {
-                log.info("\(key, privacy: .public): not in SkipDB")
+                log.info("\(key, privacy: .public): not in \(label, privacy: .public)")
                 await SkipTimestampStore.shared.store(.miss(), for: key)
                 return []
             }
             guard http.statusCode == 200 else {
-                log.info("\(key, privacy: .public): SkipDB HTTP \(http.statusCode, privacy: .public)")
+                log.info("\(key, privacy: .public): \(label, privacy: .public) HTTP \(http.statusCode, privacy: .public)")
                 return []
             }
             let raw = String(data: data, encoding: .utf8) ?? "<non-utf8>"
-            log.debug("SkipDB response for \(key, privacy: .public): \(raw, privacy: .public)")
+            log.debug("\(label, privacy: .public) response for \(key, privacy: .public): \(raw, privacy: .public)")
             let media = try JSONDecoder().decode(SkipDBResponse.self, from: data)
-            log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from SkipDB")
+            log.info("\(key, privacy: .public): \(media.spans.count, privacy: .public) spans from \(label, privacy: .public)")
             let entry = SkipTimestampStore.Entry(fetchedAt: Date(), spans: media.spans,
                                                  introEstimateMs: media.intro_length_estimate_ms)
             await SkipTimestampStore.shared.store(entry, for: key)
             return candidates(from: media.spans, duration: durationSeconds)
         } catch {
-            log.info("\(key, privacy: .public): SkipDB failed, \(String(describing: error), privacy: .public)")
+            log.info("\(key, privacy: .public): \(label, privacy: .public) failed, \(String(describing: error), privacy: .public)")
             return []
         }
     }
@@ -301,6 +329,23 @@ enum SkipTimestampService {
                 stored(segments.preview, kind: "preview"),
             ].compactMap { $0 }
         }
+    }
+}
+
+/// The user's optional custom SkipDB-compatible provider. Shared by the read path
+/// (SkipTimestampService.customSkip) and the submit path (SkipDBClient.submitToCustom).
+enum CustomSkipProvider {
+    /// The configured base URL, normalized (trailing slash stripped) and validated as http(s).
+    /// Returns nil when unset or not a valid http(s) URL, so callers fail-soft / silently skip.
+    static func baseURL() -> String? {
+        guard let raw = ApiKeys.customSkipURL() else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let base = trimmed.hasSuffix("/") ? String(trimmed.dropLast()) : trimmed
+        guard let scheme = URL(string: base)?.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              URL(string: base)?.host != nil else { return nil }
+        return base
     }
 }
 
