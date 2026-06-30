@@ -6,6 +6,24 @@ What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or rep
 
 ## Unreleased
 
+## 0.3.8 Beta 16 - 2026-06-30 (pre-release)
+
+The first public build since Beta 13, folding in Beta 14 and Beta 15 and a final fix pass (build 138). The Mac crash is fully closed, brand-new releases show their sources, scrub previews capture on every kind of stream, downloads survive an app relaunch, and a batch of Apple TV playback fixes are in. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV playback notes on real hardware.
+
+### Fixed
+
+- **Mac no longer crashes when you open Downloads, a title, a browse grid, or sign in.** Beta 15 fixed the search bar; this closes every remaining screen that built a window toolbar, so the Mac app is stable as you move through it.
+- **Brand-new releases now show their sources from the Collections hub.** A title too new to be in the metadata catalog still loads its artwork and its streams from its IMDb id, instead of opening to an empty page with no sources.
+- **Scrub-preview thumbnails capture on debrid and other direct streams.** They keyed off a length signal that some direct files never send, so those titles captured nothing; previews now start from the title's runtime and refine once playback reports the real length, on Apple TV, iPhone, iPad, and Mac.
+- **A finished download saves even if the app was relaunched while it ran.** A background download that completed after the app restarted could not find where to save and failed; it now recovers the destination, so the file lands in your library.
+- **Apple TV plays Dolby Vision through the right engine, keeps audio at 48 kHz, and restores the full streaming read-ahead buffer,** so large 4K files buffer well ahead again instead of stalling early.
+
+### Changed
+
+- **Downloads is one pill inside Library.** It is no longer a separate catalog and no longer sits on Home, Discover, or the top of Library, just a single pill in Library that opens your downloads.
+- **Mac browsing has a visible search field and a Back button.** Search is easy to find, and Back, or the Escape key, returns you from any screen.
+- **Catalog cards and hub pills share one size** so rows line up cleanly.
+
 ## 0.3.8 Beta 15 - 2026-06-29 (pre-release)
 
 A big one: a Collections hub (Discover cards, Streaming Services with their logos, and Genres) on Home and Discover with a tap-to-browse grid, native debrid playback that plays cached torrents instantly, budget and box office on movies, spoiler-blurred unwatched episodes, an in-player AirPlay button, a download queue, upcoming-movie release dates, and the Apple TV 47-second crash plus the Mac crash fixes from your reports. In-place update, nothing resets. Please install it and report anything off, especially the Apple TV stability and the new hub on real hardware. Thanks to OrigamiSpace, whose open SkipDB and in-player editor several of these features build on.
