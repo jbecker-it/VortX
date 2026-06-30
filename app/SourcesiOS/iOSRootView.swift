@@ -436,11 +436,11 @@ struct iOSHomeView: View {
             // Its bottom fades cleanly into canvas with a small gap before the first rail (#52) — the
             // old negative-overlap tuck made the hero bleed into Continue Watching.
             ScrollView {
-                // Sticky hero (like tvOS): the band is a pinned section HEADER, so it stays a first-class,
-                // hit-tested, in-flow subview that pins to the top as the rails scroll under it. NOT a
-                // ZStack-behind-the-scroll (that ate the hero's Play/Trailer/poster taps before).
-                LazyVStack(alignment: .leading, spacing: Theme.Space.lg, pinnedViews: [.sectionHeaders]) {
-                    Section {
+                // In-flow hero: the band is the FIRST scrolling child of the column (not a pinned section
+                // header). Pinning put it ON TOP of the rails on macOS, where it intercepted every tap;
+                // as a normal first child it scrolls with the content and its own controls stay hit-tested.
+                LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
+                    FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     if !continueWatchingItems.isEmpty {
                         // A CW card tap resumes the exact last-played stream straight into the player
                         // (#11), falling back to opening detail when no remembered link fits. Long-press
@@ -528,9 +528,6 @@ struct iOSHomeView: View {
                     // empty, and one with none still shows the empty state honestly.
                     if core.boardRows.isEmpty && continueWatchingItems.isEmpty {
                         emptyState
-                    }
-                    } header: {
-                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     }
                 }
                 .padding(.bottom, Theme.Space.md)
@@ -775,18 +772,16 @@ struct iOSLibraryView: View {
                     // plain VStack adopt the chips' wider-than-screen content width and shift the whole
                     // column left/clipped (the beta7 "weird viewport"). Greedy-width LazyVStack pins it
                     // to the viewport, matching Home. See the iOSDiscoverView note for the full rationale.
-                    // Sticky hero (like tvOS): pinned section HEADER so it stays in-flow + hit-tested and
-                    // pins to the top while the grid scrolls under it. Not a behind-scroll ZStack (taps).
-                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg, pinnedViews: [.sectionHeaders]) {
-                        Section {
+                    // In-flow hero: FIRST scrolling child of the column, not a pinned section header.
+                    // Pinning put it on top of the grid on macOS and ate every tap; as a normal first
+                    // child it scrolls with the content and its own controls stay hit-tested.
+                    LazyVStack(alignment: .leading, spacing: Theme.Space.lg) {
+                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                         VStack(alignment: .leading, spacing: Theme.Space.xs) {
                             if profiles.activeUsesEngineHistory, let lib = core.library {
                                 filterChips(lib.selectable)
                             }
                             PosterGrid(items: libraryItems, onTap: handleTap, menu: .library)
-                        }
-                        } header: {
-                            FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                         }
                     }
                     .padding(.bottom, Theme.Space.md)
@@ -1264,12 +1259,11 @@ struct iOSDiscoverView: View {
                 // (the intermittent beta7 "weird viewport" on Discover/Library). LazyVStack is greedy
                 // on the cross axis — it always takes the full viewport width — so it can't overflow.
                 // Home already uses LazyVStack and never exhibited the shift.
-                LazyVStack(alignment: .leading, spacing: Theme.Space.md, pinnedViews: [.sectionHeaders]) {
-                    // Sticky hero (like tvOS): the band is a pinned section HEADER so it leads
-                    // UNCONDITIONALLY (the model tolerates an empty pool and re-seeds on addons/revision)
-                    // and pins to the top while the chips/grid scroll under it. Kept as an in-flow,
-                    // hit-tested header (never a behind-scroll ZStack, which ate the hero's taps).
-                    Section {
+                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                    // In-flow hero: FIRST scrolling child so it leads UNCONDITIONALLY (the model tolerates
+                    // an empty pool and re-seeds on addons/revision) and scrolls with the chips/grid. Not a
+                    // pinned section header: pinning put it on top on macOS and ate every tap.
+                    FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     if showCollectionsHub, CollectionsHubModel.isAvailable {
                         iOSCollectionsHub(model: collectionsHub)
                     }
@@ -1304,9 +1298,6 @@ struct iOSDiscoverView: View {
                     } else {
                         ContentUnavailableViewCompat(title: "Discover", systemImage: "safari",
                             message: "Sign in to browse your add-ons' catalogs.").frame(minHeight: 420)
-                    }
-                    } header: {
-                        FeaturedHeroView(model: hero, onOpen: { path.append($0) })
                     }
                 }
                 .padding(.top, core.discover != nil ? 0 : Theme.Space.md)
