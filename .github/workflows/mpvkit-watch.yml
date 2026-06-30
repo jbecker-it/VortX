@@ -44,17 +44,21 @@ jobs:
           TITLE="MPVKit update available: $LATEST (pinned $PINNED)"
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number --jq 'length')
           if [ "$EXISTING" != "0" ]; then echo "Already filed for $LATEST."; exit 0; fi
-          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$(cat <<EOF
-MPVKit \`$LATEST\` is out; we pin \`$PINNED\` in \`app/project.yml\`.
-
-Player, audio (AO / passthrough / Atmos / eARC), and YouTube-extraction fixes land in MPVKit, so review and consider bumping.
-
-Release notes: https://github.com/mpvkit/MPVKit/releases/tag/$LATEST
-
-How to bump SAFELY (never auto-merge a player-dependency change):
-1. Set \`exactVersion: "$LATEST"\` in \`app/project.yml\`.
-2. \`cd app && xcodegen generate\`, then re-resolve SPM (delete Package.resolved + \`xcodebuild -resolvePackageDependencies\`).
-3. Rebuild all schemes and DEVICE-TEST playback, especially audio: Atmos/eARC, passthrough, and a DTS/EAC3 stream on Apple TV.
-4. Only ship after it plays clean on a real device.
-EOF
-)"
+          # Build the issue body in a temp file so every line stays at this block's indentation. A flush-left
+          # heredoc inside a YAML "run: |" block scalar terminates the scalar early and makes the workflow
+          # unparseable (startup_failure on every push), so we never do that.
+          BODY_FILE="$(mktemp)"
+          printf '%s\n' \
+            "MPVKit \`$LATEST\` is out; we pin \`$PINNED\` in \`app/project.yml\`." \
+            "" \
+            "Player, audio (AO / passthrough / Atmos / eARC), and YouTube-extraction fixes land in MPVKit, so review and consider bumping." \
+            "" \
+            "Release notes: https://github.com/mpvkit/MPVKit/releases/tag/$LATEST" \
+            "" \
+            "How to bump SAFELY (never auto-merge a player-dependency change):" \
+            "1. Set \`exactVersion: \"$LATEST\"\` in \`app/project.yml\`." \
+            "2. \`cd app && xcodegen generate\`, then re-resolve SPM (delete Package.resolved + \`xcodebuild -resolvePackageDependencies\`)." \
+            "3. Rebuild all schemes and DEVICE-TEST playback, especially audio: Atmos/eARC, passthrough, and a DTS/EAC3 stream on Apple TV." \
+            "4. Only ship after it plays clean on a real device." \
+            > "$BODY_FILE"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file "$BODY_FILE"
