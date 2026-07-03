@@ -25,6 +25,29 @@ android {
         }
     }
 
+    // Product flavors split by DISTRIBUTION + LICENSING boundary, per the Android plan §1.3 / §3.
+    //   - `full`  = the sideloaded VortX release. Carries libmpv (the GPLv3 mpv/ffmpeg native .so via
+    //               dev.jdtech.mpv:libmpv, scoped to `fullImplementation` in dependencies {}), so
+    //               libmpv is the PRIMARY player with Media3/ExoPlayer as the DV/Atmos fallback. This
+    //               is the flavor we ship FIRST (mirrors the Apple sideload-IPA model).
+    //   - `play`  = a lean Play-Store/Google-TV-bound build with NO GPL native libs (ExoPlayer only).
+    //               It exists so a future Play listing stays clean of GPL/LGPL codec bits; it is NOT
+    //               "the real player" -- libmpv-primary `full` is the product.
+    // The flavor split is the licensing boundary ONLY. Keep the applicationId identical so sideload
+    // update continuity + account migration are unaffected (the com.stremiox.android namespace is a
+    // hard invariant); flavors differ only by which player native libs are packaged.
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("full") {
+            dimension = "distribution"
+            // No applicationIdSuffix: the sideloaded `full` build keeps the canonical
+            // com.stremiox.android id so it updates existing sideloads in place.
+        }
+        create("play") {
+            dimension = "distribution"
+        }
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -66,6 +89,20 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:$media3")
     implementation("androidx.media3:media3-ui:$media3")
     implementation("androidx.media3:media3-session:$media3")
+
+    // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
+    // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME
+    // 0.41.0 line the Apple MPVKit-GPL build runs), ffmpeg 8.1 (--enable-gpl --enable-version3,
+    // mediacodec + jni hwaccel), libplacebo 7.360.1 (the gpu-next renderer), dav1d 1.5.3. It also
+    // ships a `dev.jdtech.mpv.MPVLib` JNI class that loads "mpv" + "player" via System.loadLibrary;
+    // our thin com.stremiox.android.player.mpv.MPVLib wraps it to the VortX contract, and MpvConfig
+    // holds the option set ported from the Apple player.
+    //
+    // LICENSING: the mpv/ffmpeg native code is GPLv3 (ffmpeg built --enable-gpl --enable-version3),
+    // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
+    // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
+    // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
+    "fullImplementation"("dev.jdtech.mpv:libmpv:1.0.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 
@@ -144,6 +181,18 @@ android {
     }
     // ndkVersion pins the NDK the cargo-ndk linker uses. Keep in sync with the NDK CI installs.
     ndkVersion = "27.2.12479018"
+
+    // In the `full` flavor two native-lib sources coexist: the cargo-ndk Rust output
+    // (libstremiox_core.so) and the libmpv AAR (libmpv.so + libplayer.so + libavcodec.so +
+    // libc++_shared.so). Both can ship a libc++_shared.so for the same ABI, which makes AGP's jniLibs
+    // merge fail with "More than one file with OS independent path 'lib/<abi>/libc++_shared.so'". Take
+    // the first; the C++ runtime is ABI-stable, so either copy is interchangeable. This is additive
+    // and no-ops in the `play` flavor (no libmpv AAR, so no duplicate).
+    packaging {
+        jniLibs {
+            pickFirsts += "**/libc++_shared.so"
+        }
+    }
 }
 
 // Make the native library exist before it is merged into the APK. merge*JniLibFolders is AGP's task
