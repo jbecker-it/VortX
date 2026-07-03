@@ -2557,6 +2557,11 @@ struct TVPlayerView: View {
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
+        // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
+        // source still fails over automatically instead of dead-ending an unattended binge on "choose another
+        // source". Also refresh the first-buffer grace budget for the fresh source. Mirrors iOS goToEpisode.
+        currentPickWasExplicit = false; bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         // New episode: reset the community-subtitle session (new content key + fingerprint) so pooled subs,
         // the seeded offset, and the embedded upload all re-run against the new episode (P2/P3/P4).
         subFingerprint = nil; subFingerprintKey = ""; pooledSubsKey = ""; pooledSubs = []

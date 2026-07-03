@@ -1586,16 +1586,18 @@ struct PlayerScreen: View {
     /// Switch the playing source in place: reload the picked stream's URL and resume at the current
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
-    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool, resumeOverride: Double? = nil) {
+    private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool, explicitPick: Bool = false, resumeOverride: Double? = nil) {
         guard newURL != curURL else { if userInitiated { close() }; return }
         if userInitiated { close() }
         let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         curURL = newURL
         curHeaders = stream.requestHeaders
         curIsTorrent = stream.isTorrent
-        // A manual pick makes THIS source explicit (honor it on a start-timeout); an automatic hop makes
-        // the new source non-explicit so it can hop onward normally.
-        currentPickWasExplicit = userInitiated
+        // `explicitPick` (a real source-row / quality tap) is DISTINCT from `userInitiated` (which resets the
+        // failover budget for any fresh load, including episode auto-advance). Only a real source pick honors
+        // the same source on a start-timeout; an auto-advanced episode or an auto-hop stays non-explicit so it
+        // still fails over automatically (an unattended binge must not dead-end on one slow/dead auto-picked source).
+        currentPickWasExplicit = explicitPick
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         bufferedTime = 0   // fresh source: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         if userInitiated {
@@ -2977,7 +2979,7 @@ struct PlayerScreen: View {
             return opts.map { opt in
                 Row(label: opt.label, detail: StreamRanking.sizeText(opt.stream) ?? "",
                     selected: opt.stream.playableURL == curURL) {
-                    if let url = opt.stream.playableURL { switchStream(to: opt.stream, url: url, userInitiated: true) }
+                    if let url = opt.stream.playableURL { switchStream(to: opt.stream, url: url, userInitiated: true, explicitPick: true) }
                 }
             }
         case .sources:
@@ -3180,7 +3182,7 @@ struct PlayerScreen: View {
                 let name = String(sourceLabel(stream).prefix(40))
                 rs.append(Row(label: "\(info.tags)   \(name)", detail: info.size ?? "",
                               selected: sURL == curURL) {
-                    switchStream(to: stream, url: sURL, userInitiated: true)
+                    switchStream(to: stream, url: sURL, userInitiated: true, explicitPick: true)
                 })
             }
         }

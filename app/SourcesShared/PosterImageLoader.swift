@@ -68,12 +68,14 @@ enum PosterImageLoader {
         init(limit: Int) { self.limit = limit }
         func acquire() async {
             if active < limit { active += 1; return }
+            // Wait for a permit HANDED OFF by release(); the permit is already counted in `active`, so we must
+            // NOT increment again here (doing so, plus a fresh acquire slipping in during the decrement/resume
+            // gap, let `active` exceed `limit` and over-admit loads, the very stampede this gate prevents).
             await withCheckedContinuation { waiters.append($0) }
-            active += 1
         }
         func release() {
-            active -= 1
-            if !waiters.isEmpty { waiters.removeFirst().resume() }
+            // Hand the permit to a waiter if any (active unchanged - the permit just moves); otherwise free it.
+            if !waiters.isEmpty { waiters.removeFirst().resume() } else { active -= 1 }
         }
     }
     private static let gate = ConcurrencyGate(limit: 6)
