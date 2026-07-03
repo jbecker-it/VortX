@@ -5,6 +5,10 @@ import UserNotifications
 /// Mirrors the official tvOS app's Settings sections, on the StremioX design system.
 struct SettingsView: View {
     @EnvironmentObject private var account: StremioAccount
+    // VortX-sync account (api.vortx.tv): the identity that mints the moat token which un-gates the Singularity
+    // SERVE read. The Singularity toggle gates on THIS, not the Stremio `account` -- a Stremio-only sign-in
+    // mints no token, so the toggle must require the VortX sign-in that the helper text already names.
+    @EnvironmentObject private var vortxSync: VortXSyncManager
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @ObservedObject private var updates = UpdateChecker.shared
@@ -407,7 +411,7 @@ struct SettingsView: View {
             Text(MoatConsent.disclosure)
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
             if moatContribute {
-                if account.isSignedIn {
+                if vortxSync.isSignedIn {
                     choiceRow(String(localized: "Singularity sources"), [("0", "Off"), ("1", "On")],
                               selection: Binding(get: { singularityServe ? "1" : "0" }, set: { singularityServe = ($0 == "1") }))
                     Text("Show extra community-corroborated sources alongside your own, pooled across signed-in VortX users.")
