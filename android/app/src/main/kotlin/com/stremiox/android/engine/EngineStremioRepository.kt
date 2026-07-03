@@ -2,6 +2,8 @@ package com.stremiox.android.engine
 
 import android.content.Context
 import com.stremiox.android.data.CatalogRepository
+import com.stremiox.android.debrid.DebridKeys
+import com.stremiox.android.debrid.DebridResolver
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
@@ -38,6 +40,12 @@ class EngineStremioRepository(
 ) : CatalogRepository {
 
     private val appContext = context.applicationContext
+
+    /// Native in-client debrid resolver: turns a raw-torrent infoHash into a DIRECT, playable HTTPS URL
+    /// through the user's own debrid account (keys in EncryptedSharedPreferences). Built lazily so no
+    /// key store is opened until a torrent is actually resolved; with no key configured it is a no-op
+    /// and torrents keep today's behavior (a clear error the player layer surfaces).
+    private val debridResolver by lazy { DebridResolver(DebridKeys(appContext)) }
 
     /// Field names that changed in the most recent engine event. extraBufferCapacity keeps fast
     /// back-to-back events from being dropped while a collector is between emissions.
@@ -125,14 +133,11 @@ class EngineStremioRepository(
 
     override suspend fun discover(type: MediaType): Result<List<Catalog>> = runCatching {
         val state = loadField(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscover())
-        // Discover is one filtered rail in the engine; surface it as a single-row catalog list so the
-        // UI's row-based Discover screen renders without special-casing.
-        EngineState.parseCatalogs(state).ifEmpty {
-            // CatalogWithFilters serializes differently from CatalogsWithExtra (a single rail, not a
-            // list of rails); a future iteration adds a dedicated parser. For now the typed request is
-            // dispatched and the UI degrades to empty rather than crashing.
-            emptyList()
-        }
+        // Discover is one selectable rail in the engine (a CatalogWithFilters: the selected catalog's
+        // flat pages, not the board's list-of-rails). parseCatalogWithFilters decodes that single rail
+        // into a one-row catalog list so the UI's row-based Discover screen renders without special-
+        // casing. Fail-soft: any miss (engine unavailable, still-loading, empty) yields an empty list.
+        EngineState.parseCatalogWithFilters(state)
     }
 
     override suspend fun library(): Result<List<MetaItem>> = runCatching {
@@ -171,18 +176,38 @@ class EngineStremioRepository(
     }
 
     override suspend fun resolve(source: StreamSource): Result<Playable> = runCatching {
-        // STUB pending the streaming-server bridge. A direct stream id encodes its URL (see
-        // EngineState.parseStream: id = handle#name#desc, handle is url/externalUrl/infoHash). Direct
-        // URLs are playable as-is; torrents need the in-process streaming server (nodejs-mobile on
-        // Android, not yet wired) to turn an infoHash into a local HLS URL. Until that lands, hand back
-        // the direct URL when present and surface a clear error for torrents so the player layer can
-        // show a real message instead of failing opaquely.
+        // A stream id encodes its handle (see EngineState.parseStream: id = handle#name#desc, handle is
+        // url/externalUrl/infoHash). Direct URLs are playable as-is. A raw torrent (handle = infoHash)
+        // resolves through the user's own debrid account when a key is configured (native in-client
+        // debrid, the Android port of the Apple DebridResolver); without a key it still needs the
+        // in-process streaming server (nodejs-mobile, not yet wired), so it surfaces a clear error the
+        // player layer can show instead of failing opaquely.
         val handle = source.id.substringBefore('#')
         if (!source.isTorrent && (handle.startsWith("http://") || handle.startsWith("https://"))) {
             Playable(url = handle, title = source.title, viaStreamingServer = false)
+        } else if (source.isTorrent) {
+            // Raw torrent: the handle IS the infoHash (see EngineState.parseStream: for a torrent
+            // url == null, so the id-handle is the infoHash). If the user has a debrid key configured,
+            // resolve it to a DIRECT, cached-instant HTTPS link through their own account (the Android
+            // port of the Apple DebridResolver). The resolved URL is a plain direct stream, NOT a
+            // torrent, so it plays without the streaming-server bridge (viaStreamingServer = false).
+            //
+            // Fail-soft: DebridResolver.resolve returns null on ANY failure (no key, not actually
+            // cached, no playable file, provider/network error). With no key it never opens the key
+            // store. On null we surface the SAME clear error as before so the player layer shows a real
+            // message rather than failing opaquely, and torrents keep today's behavior when no debrid
+            // is configured.
+            val resolved = debridResolver.resolve(infoHash = handle)
+            if (resolved != null) {
+                Playable(url = resolved, title = source.title, viaStreamingServer = false, isTorrent = false)
+            } else {
+                throw UnsupportedOperationException(
+                    "Torrent playback needs a debrid key or the streaming-server bridge (not yet wired on Android).",
+                )
+            }
         } else {
             throw UnsupportedOperationException(
-                "Torrent/debrid resolution needs the streaming-server bridge, not yet wired on Android.",
+                "This source type is not playable on Android yet.",
             )
         }
     }

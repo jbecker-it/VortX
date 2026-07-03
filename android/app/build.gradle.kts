@@ -71,6 +71,14 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.core:core-ktx:1.13.1")
 
+    // EncryptedSharedPreferences, so debrid API keys (credentials) are stored AES-encrypted at rest,
+    // never in plain SharedPreferences. This is the Android analogue of the Apple Keychain the debrid
+    // keys live in (app/SourcesShared/DebridKeys.swift). security-crypto 1.1.0-alpha06 is the last
+    // published line of the artifact; it resolves from mavenCentral() (already in settings.gradle.kts)
+    // and pulls Tink transitively. DebridKeys reads it reflectively and falls back to plain prefs if
+    // the artifact is ever absent, so the boundary never hard-fails the build.
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
