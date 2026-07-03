@@ -189,8 +189,10 @@ enum SourceIndexClient {
             let quality = (src.quality?.isEmpty == false) ? src.quality! : "Source"
             let sizeSuffix = (src.sizeBytes ?? 0) > 0 ? " · \(byteSize(src.sizeBytes!))" : ""
             let seedSuffix = src.seeders.map { " · 👤 \($0)" } ?? ""
-            let name = "\(quality) · Community"
-            let desc = "Community source\(sizeSuffix)\(seedSuffix)"
+            // Name/desc both say "Singularity" so the source ROW is visibly a Singularity source (the group
+            // label is discarded by the quality re-grouping, but this per-stream text survives and renders).
+            let name = "\(quality) · Singularity"
+            let desc = "Singularity source\(sizeSuffix)\(seedSuffix)"
             return make(name: name, description: desc, infoHash: hash.lowercased())
         }
     }
