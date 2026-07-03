@@ -105,7 +105,22 @@ class EngineStremioRepository(
     override suspend fun home(): Result<List<Catalog>> = runCatching {
         StremioXCore.dispatch(EngineActions.loadBoard())
         val state = loadField(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
-        EngineState.parseCatalogs(state)
+        val boardRows = EngineState.parseCatalogs(state)
+        // Prepend Continue Watching, the leading Home rail on iOS/tvOS. It is DERIVED state the engine
+        // hydrated from the library at construction (it emits no NewState of its own, mirroring Apple
+        // CoreBridge.seedInitialState), so we read the field straight rather than dispatching a load.
+        // The board load above has already pumped the event loop, so the field is populated by now.
+        // Fail-soft: an empty CW list simply yields no row, never an error, so Home still renders the
+        // add-on rails on a fresh (never-watched) account.
+        val continueWatching = runCatching {
+            EngineState.parseContinueWatching(StremioXCore.getState(EngineActions.continueWatchingPreviewField()))
+        }.getOrDefault(emptyList())
+        if (continueWatching.isEmpty()) {
+            boardRows
+        } else {
+            // id = "continue" is the contract HomeScreen keys its editorial eyebrow off of.
+            listOf(Catalog(id = "continue", title = "Continue Watching", items = continueWatching)) + boardRows
+        }
     }
 
     override suspend fun discover(type: MediaType): Result<List<Catalog>> = runCatching {
@@ -139,10 +154,19 @@ class EngineStremioRepository(
             ?: throw IllegalStateException("meta_details not ready for $id")
     }
 
-    override suspend fun streams(type: MediaType, id: String): Result<List<StreamGroup>> = runCatching {
+    override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = runCatching {
         // Meta + a guessed stream were already requested by meta(); re-pull meta_details for its
         // stream groups. If meta() was not called first, this Load brings both in.
-        val state = loadField(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id))
+        //
+        // For a series with a chosen [episodeId], pass a streamPath so the engine fetches THAT episode's
+        // streams (the engine stream resource type is the meta type, its id is the episode's video id);
+        // otherwise (movie, or no episode chosen yet) leave the streamPath null and take the guessed set.
+        val action = if (episodeId != null) {
+            EngineActions.loadMeta(type.id, id, streamType = type.id, streamId = episodeId)
+        } else {
+            EngineActions.loadMeta(type.id, id)
+        }
+        val state = loadField(EngineActions.FIELD_META_DETAILS, action)
         EngineState.parseStreamGroups(state)
     }
 

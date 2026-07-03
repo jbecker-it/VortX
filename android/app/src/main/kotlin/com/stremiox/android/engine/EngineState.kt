@@ -50,6 +50,28 @@ internal object EngineState {
         return rows
     }
 
+    /// Parse the `continue_watching_preview` field (`{ items: [CoreCWItem] }`) into UI [MetaItem]s for
+    /// the leading Home rail. Each item mirrors Apple `CoreCWItem`: `_id`, `type`, `name`, `poster`,
+    /// a `state` progress block, and `removed`/`temp` library-bookkeeping flags. We drop `removed`
+    /// entries (they linger in the bucket but are not "in Continue Watching"), matching the reference
+    /// apps, and keep engine order (already sorted most-recent-first by the core).
+    fun parseContinueWatching(json: String): List<MetaItem> {
+        val root = json.toJsonObjectOrNull() ?: return emptyList()
+        val items = root.optJSONArray("items") ?: return emptyList()
+        val out = mutableListOf<MetaItem>()
+        for (i in 0 until items.length()) {
+            val obj = items.optJSONObject(i) ?: continue
+            if (obj.optBoolean("removed", false)) continue
+            out += MetaItem(
+                id = obj.optString("_id").ifEmpty { obj.optString("id") },
+                type = MediaType.fromId(obj.optString("type", "movie")),
+                name = obj.optString("name"),
+                poster = obj.optStringOrNull("poster"),
+            )
+        }
+        return out
+    }
+
     /// Parse a `LibraryWithFilters` (`catalog: [libraryItem]`) into UI [MetaItem]s.
     fun parseLibrary(json: String): List<MetaItem> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
