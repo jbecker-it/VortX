@@ -65,24 +65,22 @@ struct LoginView: View {
 
     private var passwordLogin: some View {
         VStack(spacing: Theme.Space.md) {
-            // H22 CONTINUITY KEYBOARD: the iPhone Continuity Keyboard detected the Apple TV but never
-            // connected on these fields (it works in the Search tab, which uses the system .searchable
-            // field). Continuity attaches to the standard tvOS credential-entry path, which the OS
-            // recognizes when the identifier + secret are declared as a `.username`/`.password` CREDENTIAL
-            // PAIR (not a bare `.emailAddress`), and each field carries an explicit `keyboardType` +
-            // `submitLabel` so the system keyboard (and thus Continuity) presents its full entry sheet.
-            // The `focused($focusedField)` binding gives each field a real first-responder identity so the
-            // Continuity session binds to a concrete field the way the search controller does. This makes
-            // the fields use the same standard tvOS text-entry path Search uses.
+            // H22 CONTINUITY KEYBOARD (attempt 2, NEEDS device verification on a real Apple TV + iPhone):
+            // the earlier fix declared these as a `.username`/`.password` CREDENTIAL PAIR (textContentType),
+            // but users still report the iPhone Continuity Keyboard DETECTS the Apple TV yet never CONNECTS on
+            // login, while it works fine in the Search tab. The Search tab uses `.searchable`, which is PLAIN
+            // text entry with NO textContentType, so it never enters the tvOS AutoFill-Passwords / iCloud
+            // Keychain CREDENTIAL negotiation that a `.password` / `.username` field triggers. That autofill
+            // negotiation stalling over Continuity is the most likely cause of "detected but won't connect".
+            // So drop textContentType (and the tvOS-irrelevant keyboardType) and use plain text entry like
+            // Search; the SecureField still masks the password. Trade-off: no saved-password autofill, but the
+            // priority is that Continuity can type at all. focused()/submitLabel/onSubmit are kept.
             field { TextField("Email or username", text: $email)
-                .textContentType(.username)
-                .keyboardType(.emailAddress)
                 .submitLabel(.next)
                 .focused($focusedField, equals: .email)
                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                 .onSubmit { focusedField = .password } }
             field { SecureField("Password", text: $password)
-                .textContentType(.password)
                 .submitLabel(.go)
                 .focused($focusedField, equals: .password)
                 .onSubmit { if !email.isEmpty && !password.isEmpty { submitSignIn() } } }
