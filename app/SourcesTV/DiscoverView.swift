@@ -113,7 +113,7 @@ struct DiscoverView: View {
             LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
                 ForEach(items) { item in
                     PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                               menu: .catalog,
+                               width: kPosterWidth, landscapeWidth: kLandscapeCardWidth, menu: .catalog,
                                onFocus: { focusModel.focus(item.focusedHero) })
                         // Infinite scroll: load the next catalog page when focus reaches the last card
                         // (same shared engine path the touch grid uses). Fixes "next catalog not

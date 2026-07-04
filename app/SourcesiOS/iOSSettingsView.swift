@@ -49,6 +49,7 @@ struct iOSSettingsView: View {
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.keepPlayingInBackground) private var keepPlayingInBackground = true
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
+    @AppStorage(VXProbe.defaultsKey) private var probeLogging = false   // gated diagnostic logging + heartbeat
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
@@ -520,6 +521,13 @@ struct iOSSettingsView: View {
                 #if os(iOS)
                 .textInputAutocapitalization(.never)
                 #endif
+            // Gated diagnostic logging: turning it on starts the once-a-second heartbeat immediately
+            // (no relaunch); the same key can also be set with VORTX_PROBE=1 at launch.
+            Toggle("Diagnostic logging", isOn: $probeLogging)
+                .tint(Theme.Palette.accent)
+                .onChange(of: probeLogging) { on in if on { VXProbeHeartbeat.start() } }
+            Text("Logs detailed activity for troubleshooting.")
+                .font(.caption).foregroundStyle(.secondary)
         } header: {
             Text("Advanced (mpv options)")
         } footer: {

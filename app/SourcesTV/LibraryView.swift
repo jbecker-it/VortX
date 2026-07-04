@@ -109,7 +109,8 @@ struct LibraryView: View {
         LazyVGrid(columns: columns, spacing: Theme.Space.xl) {
             ForEach(items) { item in
                 PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
-                           progress: item.progress > 0 ? item.progress : nil, menu: .library,
+                           progress: item.progress > 0 ? item.progress : nil,
+                           width: kPosterWidth, landscapeWidth: kLandscapeCardWidth, menu: .library,
                            onFocus: { focusModel.focus(item.focusedHero) })
             }
         }

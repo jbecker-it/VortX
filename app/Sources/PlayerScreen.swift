@@ -308,6 +308,10 @@ struct PlayerScreen: View {
 
     // Load failure / recovery state (mirrors TVPlayerView).
     @State private var loadFailed = false            // playback couldn't start (dead/uncached link)
+    // [src-probe] Diagnostic-only: wall-clock anchor for the CURRENT load attempt, stamped at every
+    // (re)load / hop / switch entry, so every probe line can print elapsedSinceLoadStart for a readable
+    // startup timeline. Pure instrumentation; nothing reads this to change behaviour.
+    @State private var srcProbeLoadStart = Date()
     #if os(iOS) || os(macOS)
     @State private var avEngineFailed = false        // AVPlayer couldn't open this stream; fell back to libmpv
     /// The engine routing decision, LATCHED once at playback start (onAppear). Routing inputs are not all
@@ -571,6 +575,8 @@ struct PlayerScreen: View {
         #endif
         .tint(Theme.Palette.accent)
         .onAppear {
+            // Diagnostic-only: this is the player surface, so the heartbeat reports the player route.
+            VXProbeState.shared.setRoute("player")
             #if os(iOS) || os(macOS)
             // Auto-route to the user's chosen default external player (Infuse / VLC), when one is set, for a
             // header-free direct/debrid stream. Torrents, header-gated streams (external apps can't apply our
@@ -585,6 +591,19 @@ struct PlayerScreen: View {
             #if os(iOS) || os(macOS)
             if engineLatch == nil { engineLatch = routedToAVPlayer }   // engine picked ONCE per playback
             #endif
+            // [src-probe] Load-start anchor + launch classification. `resume=Y` + `explicit=N` is the
+            // Continue-Watching auto-pick path (the one that produces "Tried 5 sources, none worked");
+            // `explicit=Y` is a tapped source. `debridRef=Y` means the launch URL is a native-debrid link
+            // that a CW resume may need to reresolve. This is the first line of the timeline for every play.
+            srcProbeLoadStart = Date()
+            #if os(iOS) || os(macOS)
+            let srcProbeRouteAV = routedToAVPlayer ? "Y" : "N"
+            #else
+            let srcProbeRouteAV = "n/a"
+            #endif
+            srcProbe("LOAD START host=\(url.host ?? "-") resume=\(resumeSeconds > 5 ? "Y@\(Int(resumeSeconds))s" : "N") explicit=\(startedFromExplicitPick ? "Y" : "N") debridRef=\(recordDebridRef != nil ? "Y(\(recordDebridRef!.service))" : "N") trailer=\(isTrailer ? "Y" : "N") willRouteAV=\(srcProbeRouteAV)")
+            // Diagnostic-only: a notable transition (a source begins loading) surfaced in the heartbeat too.
+            VXProbe.event("player", "open \(curTitle.isEmpty ? "-" : curTitle)")
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
             configureCommunityTrickplayProvisional()
             startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
@@ -698,6 +717,11 @@ struct PlayerScreen: View {
         case MPVProperty.timePos:
             if let d = data as? Double {
                 if d > 0, !hasStartedPlaying {      // playback actually began
+                    // [src-probe] FIRST FRAME: the overlay/spinner is about to clear and real playback begins.
+                    // The gap between LOAD START and this line is the true startup latency; if a reconnect/hop
+                    // message showed during that window (see the overlay-set probes) it was a transient shown
+                    // then cleared here, not a real failure.
+                    srcProbe("FIRST FRAME at pos=\(String(format: "%.1f", d))s (playback started, clearing overlays)")
                     hasStartedPlaying = true
                     loadTimeout?.cancel(); autoRetryTask?.cancel()
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
@@ -829,15 +853,22 @@ struct PlayerScreen: View {
             // A pre-first-frame failure demotes SILENTLY (no notice); a genuine mid-play decode failure keeps
             // the informative DV notice. Either way it re-loads the SAME source on libmpv, never a source hop.
             if coordinator.player is AVPlayerEngineController, !avEngineFailed {
+                srcProbe("endFileError on AVPlayer -> demote to libmpv in place (not a hop) reason=\((data as? String) ?? "-")")
                 demoteAVPlayerToMPV(silent: !hasStartedPlaying)
                 return
             }
             // Stale error from the just-dismounted AVPlayer engine (a queued event can land after the swap):
             // swallow it so it never burns the fresh mpv load's retry budget or paints the error overlay.
-            if let t = avDemotedAt, Date().timeIntervalSince(t) < 2 { return }
+            if let t = avDemotedAt, Date().timeIntervalSince(t) < 2 {
+                srcProbe("endFileError SWALLOWED (stale post-demote grace <2s) reason=\((data as? String) ?? "-")")
+                return
+            }
             #endif
             if !hasStartedPlaying {                  // only flag failures BEFORE playback
+                srcProbe("endFileError -> handleLoadFailure reason=\((data as? String) ?? "-")")
                 handleLoadFailure((data as? String) ?? "")
+            } else {
+                srcProbe("endFileError IGNORED (already playing) reason=\((data as? String) ?? "-")")
             }
         case MPVProperty.endFileEof:
             // Mark watched if the 90% tick didn't already (short clips), then advance or finish.
@@ -1192,6 +1223,27 @@ struct PlayerScreen: View {
     }
 
     /// Hand the active stream to mpv with the right proxy routing + live tuning. Used by every reload
+    /// [src-probe] Diagnostic-only, side-effect-free. Emits a single `[src-probe]` NSLog line with the
+    /// current attempt/hop counters + elapsed-since-load-start, so a single play (and a CW resume) produce a
+    /// readable source-lifecycle timeline on Terminal stdout. Pure logging: never mutates state, never
+    /// changes control flow. Remove once the error-flash / 5-source-fail root cause is understood.
+    private func srcProbe(_ event: String) {
+        let elapsed = Date().timeIntervalSince(srcProbeLoadStart)
+        NSLog("[src-probe] %@ | loadFailed=%@ started=%@ reconnecting=%@ buffering=%@ hops=%d/%d retry=%d/%d explicit=%@ torrent=%@ av=%@ elapsed=%.2fs errMsg=%@",
+              event,
+              loadFailed ? "Y" : "N",
+              hasStartedPlaying ? "Y" : "N",
+              reconnecting ? "Y" : "N",
+              buffering ? "Y" : "N",
+              sourceHops, maxSourceHops,
+              autoRetryCount, maxAutoRetries,
+              currentPickWasExplicit ? "Y" : "N",
+              curIsTorrent ? "Y" : "N",
+              isAVPlayerActive ? "Y" : "N",
+              elapsed,
+              loadErrorMsg.isEmpty ? "-" : loadErrorMsg)
+    }
+
     /// (retry, stall recovery, source switch), mirroring tvOS `loadIntoPlayer`.
     private func loadIntoPlayer(_ u: URL, headers h: [String: String]?, live: Bool) {
         let p = playback(for: u, headers: h)
@@ -1206,17 +1258,23 @@ struct PlayerScreen: View {
     /// auto-retry a couple of times, then hop to another source, then show the manual error overlay.
     /// Now at full parity with tvOS `handleLoadFailure`, including the embedded-server torrent warm-up.
     private func handleLoadFailure(_ msg: String) {
-        guard !hasStartedPlaying, !loadFailed else { return }
+        guard !hasStartedPlaying, !loadFailed else {
+            srcProbe("handleLoadFailure NO-OP (started=\(hasStartedPlaying ? "Y" : "N") loadFailed=\(loadFailed ? "Y" : "N")) msg=\(msg.isEmpty ? "-" : msg)")
+            return
+        }
+        srcProbe("handleLoadFailure ENTER msg=\(msg.isEmpty ? "-" : msg)")
         loadErrorMsg = msg
         loadTimeout?.cancel()
         if curIsTorrent {
             // A torrent that errors (or never starts) before the first frame usually just isn't warm
             // yet — no peers / no data. mpv's reconnect=1 would otherwise buffer it forever. Warm the
             // engine, then hand back to mpv. Bounded + capped, so a dead torrent still errors.
+            srcProbe("handleLoadFailure -> torrent, warm up")
             warmUpTorrent()
             return
         }
         if isLive {
+            srcProbe("handleLoadFailure -> live reconnect")
             scheduleReconnect(reason: "live load failure", message: "Reconnecting live stream…", backoff: 0.5)
             return
         }
@@ -1227,9 +1285,11 @@ struct PlayerScreen: View {
             // source. Only the auto path (Watch Now / resume) falls through to the failover hop below.
             if currentPickWasExplicit {
                 if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
+                srcProbe("OVERLAY SET: explicit pick failed after \(maxAutoRetries) retries -> loadFailed msg=\(loadErrorMsg)")
                 withAnimation { loadFailed = true }
                 return
             }
+            srcProbe("handleLoadFailure -> auto path, retries exhausted, trying hopToNextSource")
             if hopToNextSource(reason: "load failed") { return }
             // CW-resume of a debrid/direct stream whose stored link expired (debrid URLs are time-limited):
             // iOSDirectResume kicks off a background reload of the title's streams, but they may not have
@@ -1238,23 +1298,32 @@ struct PlayerScreen: View {
             // One wait-cycle per playback; only for a metadata-backed (resumed) non-torrent play.
             if recordMeta != nil, !curIsTorrent, !awaitedFreshSources {
                 awaitedFreshSources = true
+                srcProbe("CW-RESUME wait-and-hop: stored link failed + no untried source yet, waiting up to ~4s for fresh streams to load")
                 reconnectMsg = "Finding a fresh source…"; withAnimation { reconnecting = true }
+                srcProbe("OVERLAY SET (spinner): reconnect='Finding a fresh source…' (CW-resume awaiting fresh streams)")
                 autoRetryTask?.cancel()
                 autoRetryTask = Task { @MainActor in
-                    for _ in 0 ..< 16 {   // up to ~4s for the background stream load to land
+                    for i in 0 ..< 16 {   // up to ~4s for the background stream load to land
                         try? await Task.sleep(for: .milliseconds(250))
                         if Task.isCancelled { return }
-                        if hopToNextSource(reason: "fresh sources after wait") { reconnecting = false; return }
+                        if hopToNextSource(reason: "fresh sources after wait") {
+                            srcProbe("CW-RESUME wait-and-hop SUCCEEDED after ~\(String(format: "%.2f", Double(i + 1) * 0.25))s")
+                            reconnecting = false; return
+                        }
                     }
+                    srcProbe("CW-RESUME wait-and-hop EXHAUSTED (~4s, no untried source ever appeared) -> error overlay")
                     reconnecting = false
+                    srcProbe("OVERLAY SET: loadFailed=true (CW-resume, no fresh source)")
                     withAnimation { loadFailed = true }
                 }
                 return
             }
+            srcProbe("OVERLAY SET: loadFailed=true (auto path, hop budget/candidates exhausted, not eligible for CW wait-and-hop)")
             withAnimation { loadFailed = true }
             return
         }
         autoRetryCount += 1
+        srcProbe("handleLoadFailure -> scheduleReconnect (auto-retry \(autoRetryCount)/\(maxAutoRetries))")
         scheduleReconnect(reason: "load failure \(autoRetryCount)", message: "Recovering…", backoff: autoRetryBackoff)
     }
 
@@ -1262,6 +1331,7 @@ struct PlayerScreen: View {
     private func scheduleReconnect(reason: String, message: String, backoff: Double) {
         buffering = true
         reconnectMsg = message
+        srcProbe("OVERLAY SET (spinner): reconnect='\(message)' reason=\(reason) backoff=\(backoff)s (transient reconnect, NOT the error overlay)")
         withAnimation { reconnecting = true }
         autoRetryTask?.cancel()
         autoRetryTask = Task { @MainActor in
@@ -1285,9 +1355,11 @@ struct PlayerScreen: View {
             bufferGraceUsed = 0; lastBufferedAtWatchdog = -1
         }
         autoRetryTask?.cancel()
+        srcProbe("retryLoad reload-in-place (resetAutoRetries=\(resetAutoRetries)) host=\((curURL ?? url).host ?? "-")")
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         buffering = true; hasStartedPlaying = false; isSeekable = true; appliedSize = false; loadErrorMsg = ""
+        srcProbeLoadStart = Date()   // [src-probe] a reload is a fresh attempt: re-anchor the elapsed clock
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isLive)
         startLoadTimeout()
     }
@@ -1300,9 +1372,11 @@ struct PlayerScreen: View {
         startAVStartWatchdog()    // AVPlayer-only fast, silent, in-place demote to libmpv when it mounts but never frames
         #endif
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
+        srcProbe("start-watchdog ARMED (30s) bufferedEdge=\(String(format: "%.1f", bufferedTime))")
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
             guard !hasStartedPlaying, !loadFailed else { return }
+            srcProbe("start-watchdog FIRED (30s elapsed, no first frame) -> handleStartTimeout")
             handleStartTimeout()
         }
     }
@@ -1319,14 +1393,17 @@ struct PlayerScreen: View {
     ///    with the source list, rather than dropping to a 480p different source.
     ///  - Only the AUTO path (Watch Now / resume) hops to another source.
     private func handleStartTimeout() {
+        srcProbe("handleStartTimeout ENTER bufferGraceUsed=\(bufferGraceUsed)/\(maxBufferGraceExtensions) bufferedNow=\(String(format: "%.1f", bufferedTime)) bufferedAtArm=\(String(format: "%.1f", lastBufferedAtWatchdog))")
         // THE HANG: a cold torrent never emits an end-file error (mpv reconnect=1 keeps retrying the
         // peerless loopback URL), so it would buffer forever with no recovery. Warm it up instead of
         // hopping/failing.
-        if curIsTorrent { warmUpTorrent(); return }
+        if curIsTorrent { srcProbe("handleStartTimeout -> torrent warm up"); warmUpTorrent(); return }
         // Bytes still arriving on a slow (typically 4K remux) first-buffer: extend rather than give up.
         if bufferGraceUsed < maxBufferGraceExtensions, bufferedTime > lastBufferedAtWatchdog + 0.25 {
             bufferGraceUsed += 1
+            srcProbe("handleStartTimeout -> EXTEND (bytes still arriving) grace \(bufferGraceUsed)/\(maxBufferGraceExtensions)")
             reconnectMsg = "Buffering… this source is large"
+            srcProbe("OVERLAY SET (spinner): reconnect='Buffering… this source is large' (large-source grace, NOT error)")
             withAnimation { reconnecting = true }
             buffering = true
             lastBufferedAtWatchdog = bufferedTime
@@ -1344,19 +1421,24 @@ struct PlayerScreen: View {
         if currentPickWasExplicit {
             if bufferGraceUsed < maxBufferGraceExtensions {
                 bufferGraceUsed += 1
+                srcProbe("handleStartTimeout -> explicit pick, retry SAME source in place grace \(bufferGraceUsed)/\(maxBufferGraceExtensions)")
                 reconnectMsg = "Still starting this source…"
+                srcProbe("OVERLAY SET (spinner): reconnect='Still starting this source…' (explicit-pick in-place retry, NOT error)")
                 withAnimation { reconnecting = true }
                 retryLoad(resetAutoRetries: false)
                 return
             }
             reconnecting = false
             if loadErrorMsg.isEmpty { loadErrorMsg = "This source isn't ready (still downloading on your debrid, or slow). Choose another source." }
+            srcProbe("OVERLAY SET: explicit pick timed out, grace spent -> loadFailed msg=\(loadErrorMsg)")
             withAnimation { loadFailed = true }
             return
         }
         // Auto path (Watch Now / resume): hop to the next-best untried source (quality-drop-capped inside).
+        srcProbe("handleStartTimeout -> auto path, trying hopToNextSource")
         if hopToNextSource(reason: "load timeout") { return }
         if loadErrorMsg.isEmpty { loadErrorMsg = "Timed out, the source never started." }
+        srcProbe("OVERLAY SET: auto-path timeout, no untried source -> loadFailed msg=\(loadErrorMsg)")
         withAnimation { loadFailed = true }
     }
 
@@ -1367,9 +1449,11 @@ struct PlayerScreen: View {
     /// error overlay. Ported from tvOS `warmUpTorrent`.
     private func warmUpTorrent() {
         guard torrentWarmupsUsed < 2, let u = curURL, u.pathComponents.count >= 2 else {
+            srcProbe("warmUpTorrent EXHAUSTED (used=\(torrentWarmupsUsed)) -> hop or error")
             reconnecting = false; torrentStatus = nil
             if hopToNextSource(reason: "torrent warm-up exhausted") { return }
             if loadErrorMsg.isEmpty { loadErrorMsg = "The torrent never started sending data. Try another source." }
+            srcProbe("OVERLAY SET: torrent warm-up exhausted, no untried source -> loadFailed msg=\(loadErrorMsg)")
             withAnimation { loadFailed = true }
             return
         }
@@ -1377,6 +1461,7 @@ struct PlayerScreen: View {
         let hash = u.pathComponents[1]
         buffering = true
         reconnectMsg = "Starting torrent…"
+        srcProbe("OVERLAY SET (spinner): torrent warm-up round \(torrentWarmupsUsed) hash=\(hash) (NOT error)")
         withAnimation { reconnecting = true }
         torrentStatus = "Starting torrent…"
         NSLog("[Player] torrent warm-up round \(torrentWarmupsUsed) for \(hash)")
@@ -1399,10 +1484,12 @@ struct PlayerScreen: View {
             guard !Task.isCancelled, !hasStartedPlaying else { torrentStatus = nil; return }
             torrentStatus = nil
             if warm {
+                srcProbe("warmUpTorrent WARM (>3MB down) -> retryLoad")
                 retryLoad(resetAutoRetries: true)   // hand the now-warm torrent back to mpv
             } else {
                 loadErrorMsg = "The torrent never started sending data. Try another source."
                 reconnecting = false
+                srcProbe("OVERLAY SET: torrent warm-up round finished cold (no data) -> loadFailed msg=\(loadErrorMsg)")
                 withAnimation { loadFailed = true }
             }
         }
@@ -1435,6 +1522,7 @@ struct PlayerScreen: View {
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             loadTimeout?.cancel(); autoRetryTask?.cancel(); stallWatchdog?.cancel()
             if loadErrorMsg.isEmpty { loadErrorMsg = "Couldn't start playback after trying several sources." }
+            srcProbe("OVERLAY SET: overall recovery deadline (\(Int(maxRecoverySeconds))s) hit -> loadFailed msg=\(loadErrorMsg)")
             withAnimation { loadFailed = true }
         }
     }
@@ -1468,16 +1556,20 @@ struct PlayerScreen: View {
     }
 
     private func recoverFromStall() {
+        srcProbe("recoverFromStall ENTER (mid-play freeze) stallRecoveries=\(stallRecoveries)/3 at pos=\(String(format: "%.1f", currentTime))s")
         guard stallRecoveries < 3 else {
             // Repeated stalls on one source: hop to another at the current position, falling back to
             // the error overlay once candidates run out.
+            srcProbe("recoverFromStall -> stall budget exhausted, trying hopToNextSource")
             if hopToNextSource(reason: "stall budget exhausted") { return }
             loadErrorMsg = "Playback kept stalling on this source."
+            srcProbe("OVERLAY SET: stall budget exhausted, no untried source -> loadFailed msg=\(loadErrorMsg)")
             withAnimation { loadFailed = true }
             return
         }
         stallRecoveries += 1
         reconnectMsg = "Recovering…"
+        srcProbe("OVERLAY SET (spinner): recoverFromStall reconnect='Recovering…' reload-in-place (NOT error)")
         withAnimation { reconnecting = true }
         // Resume where it froze: reload in place, the seek lands once duration is known again.
         let resume = currentTime
@@ -1505,7 +1597,13 @@ struct PlayerScreen: View {
     /// tone-maps a DV link to HDR10 (an acceptable fallback). `silent` suppresses the DV notice: the no-frame
     /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
     private func demoteAVPlayerToMPV(silent: Bool) {
+        srcProbe("demoteAVPlayerToMPV (AVPlayer -> libmpv, SAME url, silent=\(silent), NOT a hop)")
         avStartWatchdog?.cancel(); avStartWatchdog = nil
+        // Fully tear down the outgoing AVFoundation engine BEFORE flipping `avEngineFailed` mounts the libmpv
+        // surface, so the old AVPlayer decoder cannot straddle into the mpv mount (the player-teardown-straddle
+        // that has jetsam-hung the device). Mirrors the tvOS twin's order. stop() is idempotent with the
+        // SwiftUI dismantle path.
+        coordinator.player?.stop()
         avEngineFailed = true
         avDemotedAt = Date()
         let resume = hasStartedPlaying ? currentTime : 0
@@ -1515,6 +1613,7 @@ struct PlayerScreen: View {
         // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
         appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
         buffering = true; loadFailed = false; loadErrorMsg = ""
+        srcProbeLoadStart = Date()   // [src-probe] fresh mpv mount: re-anchor the elapsed clock
         startLoadTimeout()
         if resume > 5 { nudgeResume(to: resume) }
         // The fresh mpv mount auto-loads the LAUNCH url; if this session had switched sources, re-point it at
@@ -1545,6 +1644,7 @@ struct PlayerScreen: View {
             guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
             guard coordinator.player is AVPlayerEngineController else { return }   // already on libmpv / torn down
             NSLog("[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
+            srcProbe("AV start-watchdog FIRED (\(Int(avStartWatchdogSeconds))s, AVPlayer mounted but no frame) -> silent demote to libmpv")
             demoteAVPlayerToMPV(silent: true)
         }
     }
@@ -1617,13 +1717,24 @@ struct PlayerScreen: View {
         if isTrailer {
             DiagnosticsLog.log("player", "trailer load failed (\(reason)); not hopping to content streams")
             loadErrorMsg = "Trailer unavailable."
+            srcProbe("OVERLAY SET: trailer load failed (\(reason)) -> loadFailed msg=\(loadErrorMsg)")
             withAnimation { loadFailed = true }
             return true
         }
-        guard sourceHops < maxSourceHops, let stream = nextUntriedStream(), let newURL = stream.playableURL else { return false }
+        // [src-probe] Count how many candidate rows are visible to failover at all. On CW resume this is the
+        // key number: if the fresh streams haven't loaded yet this is ~0, so the hop returns false and the
+        // "Tried N sources, none worked" overlay appears even though a working cached source exists in a row
+        // the user CAN pick manually a moment later (once currentSourceGroups has populated).
+        let srcProbeCandidateCount = currentSourceGroups.reduce(0) { $0 + $1.streams.filter { $0.playableURL != nil }.count }
+        let srcProbeUntried = nextUntriedStream()
+        guard sourceHops < maxSourceHops, let stream = srcProbeUntried, let newURL = stream.playableURL else {
+            srcProbe("hopToNextSource(\(reason)) FALSE: hops=\(sourceHops)/\(maxSourceHops) untriedFound=\(srcProbeUntried != nil ? "Y" : "N") totalPlayableCandidates=\(srcProbeCandidateCount) exhausted=\(exhaustedURLs.count) -> caller shows error overlay")
+            return false
+        }
         var tried = exhaustedURLs
         if let dead = curURL { tried.insert(dead) }
         let resume: Double = hasStartedPlaying ? currentTime : resumeSeconds
+        srcProbe("hopToNextSource(\(reason)) HOP \(sourceHops)->\(sourceHops + 1) to host=\(newURL.host ?? "-") torrent=\(stream.isTorrent ? "Y" : "N") (candidates=\(srcProbeCandidateCount))")
         switchStream(to: stream, url: newURL, userInitiated: false)
         exhaustedURLs = tried
         sourceHops += 1
@@ -1635,7 +1746,12 @@ struct PlayerScreen: View {
     /// position, so a buffering or low-quality source can be swapped without leaving the player. A
     /// deliberate pick resets the failover budget; an automatic hop restores it in `hopToNextSource`.
     private func switchStream(to stream: CoreStream, url newURL: URL, userInitiated: Bool, explicitPick: Bool = false, resumeOverride: Double? = nil) {
-        guard newURL != curURL else { if userInitiated { close() }; return }
+        guard newURL != curURL else {
+            srcProbe("switchStream NO-OP (same url as current) userInitiated=\(userInitiated) explicit=\(explicitPick)")
+            if userInitiated { close() }; return
+        }
+        srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
+        srcProbeLoadStart = Date()   // [src-probe] a source switch is a fresh attempt: re-anchor the elapsed clock
         if userInitiated { close() }
         let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         curURL = newURL
@@ -1771,6 +1887,7 @@ struct PlayerScreen: View {
             switchingEpisode = false
             guard let es = resolved else {
                 reconnecting = false; buffering = false
+                srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
                 if autoAdvance { onClose() }            // nothing playable on auto-advance: leave, don't hang on a spinner
                 else { loadErrorMsg = "Couldn't load that episode" }
                 return
@@ -2653,6 +2770,7 @@ struct PlayerScreen: View {
             let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: m.videoId)
             guard addonSubsKey == key else { return }   // episode changed mid-fetch
             addonSubs = subs
+            VXProbe.log("subs", "add-on subtitles listed count=\(subs.count)")
             if panel == .subtitles { panelRows = rows(for: .subtitles) }
         }
     }
@@ -2705,6 +2823,7 @@ struct PlayerScreen: View {
                                                               isSignedIn: VortXSyncManager.shared.isSignedIn)
             guard communityContentKey == contentKey else { return }   // title changed mid-fetch
             pooledSubs = result.subs
+            VXProbe.log("subs", "community subtitles listed count=\(result.subs.count)")
             // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
             // maps it to `sub-delay`; the AVPlayer engine applies it as the offset on the external-subtitle
             // overlay it renders itself (a no-op until an external cue set is loaded, then it lands correctly).
@@ -2714,6 +2833,7 @@ struct PlayerScreen: View {
                 let seconds = (Double(offsetMs) / 1000.0 * 10).rounded() / 10
                 subDelay = seconds
                 coordinator.player?.setSubDelay(seconds)
+                VXProbe.log("subs", "community sync seeded offset=\(String(format: "%+.1f", seconds))s")
             }
             if panel == .subtitles { panelRows = rows(for: .subtitles) }
         }
@@ -2725,6 +2845,7 @@ struct PlayerScreen: View {
         guard subtitleLoadingURL == nil else { return }
         let marker = sub.url.absoluteString
         subtitleLoadingURL = marker
+        VXProbe.log("subs", "community subtitle selected lang=\(sub.lang)")
         if panel == .subtitles { panelRows = rows(for: .subtitles) }
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
@@ -2736,6 +2857,7 @@ struct PlayerScreen: View {
             let title = pooledLabel(sub)
             coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
                 subtitleLoadingURL = nil
+                VXProbe.log("subs", "community subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
                 if ok { addedPooledIDs.insert(sub.id) } else { subtitleLoadFailed = true }
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
             }
@@ -2936,9 +3058,13 @@ struct PlayerScreen: View {
             return rs
         case .subtitles:
             var rs: [Row] = [Row(label: String(localized: "Off"), selected: subtitleTracks.allSatisfy { !$0.selected }) {
+                VXProbe.log("subs", "selected track off")
                 coordinator.player?.setSubtitleTrack(-1)
             }]
-            rs += groupedTrackRows(subtitleTracks) { coordinator.player?.setSubtitleTrack($0) }
+            rs += groupedTrackRows(subtitleTracks) { id in
+                VXProbe.log("subs", "selected embedded track \(id)")
+                coordinator.player?.setSubtitleTrack(id)
+            }
             // External subtitles from the account's subtitle add-ons. These work on BOTH engines now: libmpv
             // sub-adds the downloaded file; AVPlayer parses it and renders the cues over the video itself.
             let available = addonSubs.filter { !addedSubURLs.contains($0.url) }
@@ -2953,9 +3079,11 @@ struct PlayerScreen: View {
                         // reuses its on-disk file and loads instantly (no network).
                         guard subtitleLoadingURL == nil else { return }
                         subtitleLoadingURL = sub.url
+                        VXProbe.log("subs", "add-on subtitle selected lang=\(sub.lang) src=\(sub.addonName)")
                         if panel == .subtitles { panelRows = rows(for: .subtitles) }   // reflect Loading… in place
                         coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
                             subtitleLoadingURL = nil
+                            VXProbe.log("subs", "add-on subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
                             if ok { addedSubURLs.insert(sub.url) } else { subtitleLoadFailed = true }
                             if panel == .subtitles { panelRows = rows(for: .subtitles) }
                         }
@@ -3252,6 +3380,7 @@ struct PlayerScreen: View {
     private func adjustSubDelay(_ delta: Double) {
         subDelay = ((subDelay + delta) * 10).rounded() / 10
         coordinator.player?.setSubDelay(subDelay)
+        VXProbe.log("subs", "synced delay=\(String(format: "%+.1f", subDelay))s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
     }
     private func adjustAudioDelay(_ delta: Double) {
@@ -3354,6 +3483,7 @@ struct PlayerScreen: View {
     private func refreshTracks() {
         audioTracks = coordinator.player?.tracks(ofType: "audio") ?? []
         subtitleTracks = coordinator.player?.tracks(ofType: "sub") ?? []
+        VXProbe.log("subs", "tracks loaded embedded=\(subtitleTracks.count) audio=\(audioTracks.count)")
     }
     private func refreshSoon() {
         refreshTask?.cancel()
@@ -3371,6 +3501,7 @@ struct PlayerScreen: View {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
         if let a = pick.audio { coordinator.player?.setAudioTrack(a) }
         if let s = pick.subtitle { coordinator.player?.setSubtitleTrack(s) }   // -1 = off
+        VXProbe.log("subs", "auto-select sub=\(pick.subtitle.map(String.init) ?? "none") audio=\(pick.audio.map(String.init) ?? "none")")
         refreshSoon()
     }
 

@@ -1441,6 +1441,12 @@ struct CoreStreamList: View {
         let watchReady = !loadingAddons || settleTimedOut
 
         return VStack(alignment: .leading, spacing: Theme.Space.md) {
+            // PINNED Singularity: the best few community-corroborated sources floated to the VERY top, above
+            // the Watch/quality controls and the add-on grouping, so at least one Singularity-labeled source
+            // is always visible without scrolling past a popular title's thousands of add-on rows. `groups`
+            // is already ranked + merged, so this slice is best-first. Empty pool → nothing renders. The rest
+            // of the Singularity sources still live under the normal grouping / the All-sources list.
+            singularitySection(groups)
             if let best {
                 // Watch-Now first: one press plays the best source; long-press picks another resolution;
                 // the full ranked list stays tucked behind "All sources".
@@ -1767,6 +1773,32 @@ struct CoreStreamList: View {
     }
 
     @MainActor private func playBestResolving(_ best: CoreStream, in groups: [CoreStreamSourceGroup]) async {
+        // EXACT-SOURCE RESUME (owner requirement): if this title was last played through a specific debrid
+        // source, resume THAT source directly - reresolve a fresh link for the same file - instead of
+        // re-running source selection across every add-on (the "Tried N sources / this source didn't load"
+        // failure). Only when the stored source is genuinely gone do we drop to the auto-pick race below.
+        if let m = meta,
+           let entry = LastStreamStore.entry(for: m.libraryId, profileID: ProfileStore.shared.activeID),
+           entry.debridService != nil, let hash = entry.infoHash, !hash.isEmpty,
+           // Movie: always this title. Series: only when the stored episode is the one being played.
+           (m.type != "series" || entry.videoId == m.videoId),
+           !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
+            let (url, refreshed) = await CWResume.resolvedURL(for: entry)
+            if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)) {
+                // A fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
+                // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
+                // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
+                core.loadEnginePlayer(for: best)
+                presenter.request = PlaybackRequest(url: url, title: title, meta: meta, episodes: episodes,
+                                                    sourceHint: entry.qualityText, torrent: false,
+                                                    bingeGroup: entry.bingeGroup, headers: entry.headers,
+                                                    debridRef: DebridPlaybackRef(url: url, service: service,
+                                                        infoHash: hash, torrentId: entry.debridTorrentId,
+                                                        fileId: entry.debridFileId, fileIdx: entry.fileIdx),
+                                                    wasExplicitPick: true)
+                return
+            }
+        }
         // Candidate order = the already-ranked list order (continuity/binge/pin preserved), best first.
         let candidates = groups.flatMap(\.streams)
         if let win = await DebridCoordinator.shared.resolveFirstPlayable(
@@ -1824,6 +1856,32 @@ struct CoreStreamList: View {
                 }
             }
             .padding(.vertical, Theme.Space.xs)
+        }
+    }
+
+    /// A pinned, labeled "Singularity" section at the very top of the source list. Shows the best few
+    /// community-corroborated Singularity sources (sliced from the already-ranked `groups`, best-first, capped
+    /// at `pinnedSectionMax`) so at least one Singularity-labeled source is always visible without scrolling.
+    /// Empty pool (SERVE off / signed out / nothing corroborated) → nothing renders (pure pass-through). Rows
+    /// reuse `streamRow`, so they play / pin exactly like any other source and stay clearly labeled.
+    @ViewBuilder private func singularitySection(_ groups: [CoreStreamSourceGroup]) -> some View {
+        let pinned = SourceIndexClient.pinnedStreams(from: groups)
+        if !pinned.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.sm) {
+                    Image(systemName: "sparkles").font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text(SourceIndexClient.groupAddon.uppercased())
+                        .font(Theme.Typography.eyebrow).tracking(1.5)
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text("Community").font(Theme.Typography.label)
+                        .foregroundStyle(Theme.Palette.textTertiary)
+                }
+                .padding(.horizontal, Theme.Space.md)
+                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
+                    streamRow(SourceIndexClient.groupAddon, stream)
+                }
+            }
         }
     }
 

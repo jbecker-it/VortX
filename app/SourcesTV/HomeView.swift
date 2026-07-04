@@ -422,7 +422,7 @@ struct CoreContinueWatchingRow: View {
         guard let entry = LastStreamStore.entry(for: item.id, profileID: pid) else {
             LastStreamStore.logResume("noEntry", libraryId: item.id, profileID: pid); return nil
         }
-        guard let url = URL(string: entry.url) else {
+        guard URL(string: entry.url) != nil else {   // validity gate; CWResume re-parses entry.url itself
             LastStreamStore.logResume("badURL", libraryId: item.id, profileID: pid); return nil
         }
         if PlaybackSettings.torrentsDisabled && entry.torrent == true {
@@ -433,22 +433,48 @@ struct CoreContinueWatchingRow: View {
         }
         LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
         return {
-            // For a MOVIE, kick off a background load of the title's streams so a stale stored link (debrid
-            // URLs are time-limited and expire between sessions) auto-hops to a FRESH source instead of
-            // dead-ending on the "sources didn't load" overlay. The stored link still plays immediately; the
-            // player's failover picks up the fresh streams on a failure.
-            let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
-            if entry.type == "movie",
-               bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
-                bridge.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+            let meta = PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
+                                    name: entry.name, poster: entry.poster,
+                                    season: entry.season, episode: entry.episode)
+            // Reresolve the EXACT stored source FIRST (same debrid file, fresh link), so the card tap resumes
+            // the source the user chose instead of replaying a stale, expired URL and dead-ending into the
+            // cross-source auto-pick ("Tried N sources / this source didn't load"). CWResume mints a fresh
+            // link for the SAME file when the entry carries debrid provenance; a non-debrid entry returns the
+            // stored url unchanged (refreshed == false), so those paths are byte-identical to before.
+            Task { @MainActor in
+                let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
+                let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+                let bridge = CoreBridge.shared   // this row has no `core` env-object; use the shared engine bridge
+                if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
+                   let hash = entry.infoHash, !hash.isEmpty {
+                    // Fresh link for the SAME source: play it as an EXPLICIT pick (no silent hop) so the resume
+                    // honors the user's chosen source, exactly as a manual source-row tap would. Carry the debrid
+                    // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
+                    NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
+                    bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
+                    presenter.request = PlaybackRequest(
+                        url: resolvedURL, title: entry.title, meta: meta, episodes: [],
+                        sourceHint: entry.qualityText, torrent: false,
+                        bingeGroup: entry.bingeGroup, headers: entry.headers,
+                        debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
+                                                     torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
+                                                     fileIdx: entry.fileIdx),
+                        wasExplicitPick: true)
+                    return
+                }
+                // No fresh link (non-debrid entry, or the source is genuinely gone): replay the stored url as
+                // before. For a MOVIE, kick off a background load of the title's streams so a stale stored link
+                // auto-hops to a FRESH source instead of dead-ending; the stored link still plays immediately.
+                NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL path=fallback-stored-url", entry.debridService ?? "-", hashShort, entry.fileIdx.map(String.init) ?? "-")
+                if entry.type == "movie",
+                   bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
+                    bridge.loadMeta(type: "movie", id: item.id, streamType: "movie", streamId: entry.videoId)
+                }
+                presenter.request = PlaybackRequest(
+                    url: resolvedURL, title: entry.title, meta: meta,
+                    episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
+                    headers: entry.headers)
             }
-            presenter.request = PlaybackRequest(
-                url: url, title: entry.title,
-                meta: PlaybackMeta(libraryId: item.id, videoId: entry.videoId, type: entry.type,
-                                   name: entry.name, poster: entry.poster,
-                                   season: entry.season, episode: entry.episode),
-                episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
-                headers: entry.headers)
         }
     }
 }

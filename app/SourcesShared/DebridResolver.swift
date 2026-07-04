@@ -1,6 +1,15 @@
 import Foundation
 import CryptoKit
 
+/// Verbose source-resolve diagnostic probe. TEMPORARY (stripped before release): every resolve decision
+/// logs `[src-probe]` to stdout so the debrid resolve, cache-gate, and fail path are traceable end to end.
+enum DebridProbe {
+    static func log(_ category: String, _ message: String) { NSLog("[src-probe] %@: %@", category, message) }
+    static func h8(_ s: String) -> String { String(s.prefix(8)) }
+    static func since(_ start: Date) -> Int { Int(Date().timeIntervalSince(start) * 1000) }
+    static func ms(_ d: Duration) -> Int { Int(d.components.seconds) * 1000 }
+}
+
 /// Native in-client debrid resolution: turn a torrent (infohash / magnet) into a DIRECT, streamable
 /// HTTPS URL through the user's own debrid account, so cached torrents play instantly without a debrid
 /// add-on. The keys live in `DebridKeys.shared`; this is the resolver layer that finally USES them
@@ -216,6 +225,8 @@ actor TorBoxResolver: DebridResolving {
     /// directly (no re-add) to mint a fresh link (see `reresolveLink`).
     func resolveWithIds(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?)
         async throws -> (url: URL, torrentId: Int?, fileId: Int?) {
+        let srcProbeStart = Date()
+        DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) createtorrent + resolve begin")
         // 1. Add the magnet (idempotent; returns the existing torrent_id if already in the library).
         let created: Envelope<Created> = try await postMultipart("\(Self.base)/createtorrent", fields: ["magnet": magnet])
         var torrentId = created.data?.torrentId
@@ -227,13 +238,18 @@ actor TorBoxResolver: DebridResolving {
         } else {
             files = try await pollByHash(infoHash.lowercased(), into: &torrentId)
         }
-        guard let id = torrentId else { throw DebridError.notReady }
+        guard let id = torrentId else {
+            DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> notReady (no torrentId after poll) elapsed=\(DebridProbe.since(srcProbeStart))ms")
+            throw DebridError.notReady
+        }
         guard let pick = DebridResolve.pickFile(files, episode: episode, fileIdx: fileIdx) else {
+            DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> noMatchingFile (files=\(files.count)) elapsed=\(DebridProbe.since(srcProbeStart))ms")
             throw DebridError.noMatchingFile
         }
 
         // 3. Request the direct stream URL.
         let url = try await requestDL(torrentId: id, fileId: pick.id)
+        DebridProbe.log("resolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) -> OK torrentId=\(id) fileId=\(pick.id) elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return (url, id, pick.id)
     }
 
@@ -241,15 +257,22 @@ actor TorBoxResolver: DebridResolving {
     /// `requestdl` (no add step) — the fast path a debrid resume wants. If TorBox 404s the file (evicted),
     /// fall back to a full re-add via the default resolve. Nil ids also fall back.
     func reresolveLink(infoHash: String, torrentId: Int?, fileId: Int?, fileIdx: Int?) async throws -> URL {
+        // [src-probe] CW-resume fast path: mint a fresh link from the stored torrentId+fileId (no re-add). A
+        // fall-through here means the stored ids were stale/evicted and we drop to a full re-add.
+        DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path ids torrentId=\(torrentId.map(String.init) ?? "nil") fileId=\(fileId.map(String.init) ?? "nil")")
         if let tid = torrentId, let fid = fileId {
             // Any provider-side failure on this fast path (evicted file -> .notCached, non-2xx -> .providerError,
             // a transient 401/403 during a key refresh -> .invalidKey, or a not-yet-ready blip -> .notReady) is
             // recoverable by the full re-add below, so fall through on all of them rather than aborting.
-            do { return try await requestDL(torrentId: tid, fileId: fid) }
-            catch DebridError.notCached { /* fall through to re-add */ }
-            catch DebridError.providerError { /* file/torrent likely evicted: re-add below */ }
-            catch DebridError.invalidKey { /* transient auth blip: re-add below */ }
-            catch DebridError.notReady { /* not ready yet on the fast path: re-add below */ }
+            do {
+                let u = try await requestDL(torrentId: tid, fileId: fid)
+                DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path requestdl OK")
+                return u
+            }
+            catch DebridError.notCached { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path notCached (file evicted) -> re-add") }
+            catch DebridError.providerError { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path providerError -> re-add") }
+            catch DebridError.invalidKey { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path invalidKey (auth blip) -> re-add") }
+            catch DebridError.notReady { DebridProbe.log("reresolve.torbox", "infoHash=\(DebridProbe.h8(infoHash)) fast-path notReady -> re-add") }
         }
         let magnet = DebridResolve.magnet(forHash: infoHash)
         return try await resolve(infoHash: infoHash, magnet: magnet, fileIdx: fileIdx, episode: nil)
@@ -565,6 +588,8 @@ actor RealDebridResolver: DebridResolving {
     private struct Unrestrict: Decodable { let download: String }
 
     func resolve(infoHash: String, magnet: String, fileIdx: Int?, episode: DebridEpisode?) async throws -> URL {
+        let srcProbeStart = Date()
+        DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) addMagnet + resolve begin")
         let add: AddResp = try await form("\(Self.base)/torrents/addMagnet", ["magnet": magnet])
         let id = add.id
         // Wait for RD to parse the magnet into its file list (magnet_conversion -> waiting_files_selection).
@@ -600,12 +625,17 @@ actor RealDebridResolver: DebridResolving {
             // truly-cached source in a couple of seconds instead of hanging out the 15s play-resolve timeout
             // on every false-cached tap (the "first 5 Cached sources timed out" report).
             if attempt >= 1, ["downloading", "queued", "compressing", "uploading"].contains(i.status) {
+                DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) NOT-CACHED fast-fail (status=\(i.status), active download) elapsed=\(DebridProbe.since(srcProbeStart))ms")
                 throw DebridError.notReady
             }
         }
-        guard let link else { throw DebridError.notReady }
+        guard let link else {
+            DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) -> notReady (never reached 'downloaded') elapsed=\(DebridProbe.since(srcProbeStart))ms")
+            throw DebridError.notReady
+        }
         let un: Unrestrict = try await form("\(Self.base)/unrestrict/link", ["link": link])
         guard let u = URL(string: un.download) else { throw DebridError.providerError("no download url") }
+        DebridProbe.log("resolve.rd", "infoHash=\(DebridProbe.h8(infoHash)) -> OK unrestricted link elapsed=\(DebridProbe.since(srcProbeStart))ms")
         return u
     }
 
@@ -976,7 +1006,11 @@ extension DebridCoordinator {
             // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
             // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
             // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
-            if let confirmed = confirmedUsenetURLs, !confirmed.contains(nzb) { return nil }
+            if let confirmed = confirmedUsenetURLs, !confirmed.contains(nzb) {
+                DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=NOT-CONFIRMED (confirmedSet=\(confirmed.count)) -> nil ZERO-NETWORK, embedded path")
+                return nil
+            }
+            DebridProbe.log("resolve", "usenet nzb=\(DebridProbe.h8(nzb)) gate=\(confirmedUsenetURLs == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking usenet resolve")
             let mustInclude = stream.fileMustInclude
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
@@ -1002,14 +1036,25 @@ extension DebridCoordinator {
         // infoHash (YouTube / external) isn't ours to resolve. Branch out before any provider work.
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
         // No-key fast path: zero await, zero behaviour change. This is the byte-identical guarantee.
-        guard hasAnyResolver else { return nil }
+        guard hasAnyResolver else {
+            DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) NO-KEY (no resolver configured) -> nil, embedded path")
+            return nil
+        }
         // CACHE-GATE (instant first-play, restores pre-511c973 snap): when the caller passed a confirmed-cached
         // set, only a pick whose infoHash is account-confirmed cached runs the blocking resolve (~1 round trip
         // to the instant direct link). A NOT-confirmed pick returns nil here with ZERO network, no createtorrent,
         // no pollByHash, no timeout burn, so the caller falls straight through to the pre-regression embedded
         // path (the row's own playableURL + prepareTorrent) and plays in a snap. nil set (the default) keeps the
         // pre-gate behaviour for `resolveFirstPlayable`'s already-cached-filtered legs and any unconditional caller.
-        if let confirmed = confirmedCachedHashes, !confirmed.contains(hash) { return nil }
+        // [src-probe] CACHE-GATE decision: on CW resume this is the crux. A `gate=NOT-CONFIRMED` return means the
+        // pick's infoHash was NOT in the account-confirmed cached set, so this returns nil with ZERO network and
+        // the caller falls to the embedded/torrent path; if the confirmed set had not populated yet (cache-check
+        // in flight), a genuinely-cached source is treated as uncached and skipped.
+        if let confirmed = confirmedCachedHashes, !confirmed.contains(hash) {
+            DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) gate=NOT-CONFIRMED (confirmedSet=\(confirmed.count) hashes) -> nil ZERO-NETWORK, caller uses embedded path")
+            return nil
+        }
+        DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) gate=\(confirmedCachedHashes == nil ? "OPEN(no set)" : "CONFIRMED-CACHED") -> running blocking resolve (\(DebridProbe.ms(DebridCoordinator.resolveTimeout))ms budget)")
 
         // Build the magnet from the infohash (+ the add-on's `sources`, which carry trackers some providers
         // use to add the magnet); fileIdx biases the season-pack pick when present, the episode SxEy refines it.
@@ -1019,7 +1064,8 @@ extension DebridCoordinator {
 
         // Bounded resolve: race the provider resolve against a timeout sleep; whichever finishes first wins and
         // the loser is cancelled. Any throw / timeout collapses to `nil` → the caller falls soft.
-        return await withTaskGroup(of: DebridPlaybackRef?.self) { group in
+        let srcProbeStart = Date()
+        let result = await withTaskGroup(of: DebridPlaybackRef?.self) { group in
             group.addTask {
                 guard let (r, service) = try? await DebridCoordinator.shared.resolveWithIds(
                     infoHash: hash, magnet: magnet, fileIdx: fileIdx, episode: episode) else { return nil }
@@ -1034,6 +1080,10 @@ extension DebridCoordinator {
             group.cancelAll()
             return first
         }
+        // [src-probe] Blocking-resolve outcome. url=nil = the resolve threw (dead/evicted/uncached link) OR the
+        // 5s timeout sentinel won the race (a stall). Either way the caller falls soft to the embedded path.
+        DebridProbe.log("resolve", "infoHash=\(DebridProbe.h8(hash)) blocking-resolve RESULT -> \(result.map { "\($0.service) url ok" } ?? "nil (throw or 5s timeout)") elapsed=\(DebridProbe.since(srcProbeStart))ms")
+        return result
     }
 
     /// PARALLEL cached-source race for the AUTO-PICK play path: resolve up to the top `max` CACHED

@@ -484,25 +484,37 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // AV_INPUT_BUFFER_PADDING_SIZE zeroed bytes (libav readers over-read the tail); allocate + copy into one.
         let newSize = out.count
         guard let dst = av_malloc(newSize + AV_INPUT_BUFFER_PADDING_SIZE_CONST)?
-            .assumingMemoryBound(to: UInt8.self) else { return }
+            .assumingMemoryBound(to: UInt8.self) else { return }   // original packet untouched
         out.withUnsafeBufferPointer { buf in
             if let b = buf.baseAddress { memcpy(dst, b, newSize) }
         }
         memset(dst + newSize, 0, AV_INPUT_BUFFER_PADDING_SIZE_CONST)
-        // av_packet_from_data overwrites pkt->buf/data/size but does NOT unref the old buffer, so release the
-        // demuxer's buffer ref first (this leaves pts/dts/flags/side_data intact, which is what we want). If the
-        // wrap fails, free our buffer and leave the now-empty packet: a zero-size video packet the muxer skips,
-        // preferable to a use-after-free. The AVPlayer -> libmpv demotion still backstops a truly broken stream.
-        if let b = pkt.pointee.buf {
-            var bref: UnsafeMutablePointer<AVBufferRef>? = b
-            av_buffer_unref(&bref)
-            pkt.pointee.buf = nil
+
+        // Wrap the converted bytes in a SCRATCH packet first, so the original packet stays byte-for-byte intact
+        // on every error path. Only once the new ref-counted buffer is fully built do we hand it to `pkt`.
+        // av_packet_from_data owns `dst` on success (freeing it on unref) and does NOT take it on failure.
+        guard let tmp = av_packet_alloc() else { av_free(dst); return }   // original packet untouched
+        if av_packet_from_data(tmp, dst, Int32(newSize)) < 0 {
+            av_free(dst)                                 // wrap failed: we still own dst, free it
+            var t: UnsafeMutablePointer<AVPacket>? = tmp
+            av_packet_free(&t)
+            return                                       // original packet untouched: fail-soft stream-copies it
         }
-        pkt.pointee.data = nil
-        pkt.pointee.size = 0
-        if av_packet_from_data(pkt, dst, Int32(newSize)) < 0 {
-            av_free(dst)
-        }
+
+        // The scratch packet now solely owns a valid buffer ref for the converted access unit. Move that single
+        // ref into `pkt`: release the demuxer's old buffer ref, then transfer buf/data/size and blank the scratch
+        // so freeing it drops only the empty AVPacket struct, never the buffer. pts/dts/flags/stream_index/
+        // side_data on `pkt` are never touched, exactly as required.
+        var oldBuf: UnsafeMutablePointer<AVBufferRef>? = pkt.pointee.buf
+        av_buffer_unref(&oldBuf)                         // no-op if pkt.buf was already nil
+        pkt.pointee.buf = tmp.pointee.buf
+        pkt.pointee.data = tmp.pointee.data
+        pkt.pointee.size = tmp.pointee.size
+        tmp.pointee.buf = nil
+        tmp.pointee.data = nil
+        tmp.pointee.size = 0
+        var t: UnsafeMutablePointer<AVPacket>? = tmp
+        av_packet_free(&t)                               // frees the scratch struct only; buffer now owned by pkt
     }
 
     /// Append a NAL slice from a source pointer to `out`, writing the big-endian length prefix first.

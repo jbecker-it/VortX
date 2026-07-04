@@ -41,6 +41,7 @@ struct TVPlayerView: View {
     @State private var markedWatched = false   // mark the engine watched once, near end of playback
     @State private var autoAddedThisPlayback = false   // D8/D9: the ~60s auto-add + watch-ping fires once per playback
     @AppStorage("stremiox.autoAddLibrary") private var autoAddLibrary = true   // "Auto-add watched to Library" (default ON)
+    @AppStorage("stremiox.playerVolume") private var playerVolume = 100.0   // "Default volume" (D5): level a new playback starts at, SAME key as iOS/Mac
     @StateObject private var coordinator = MPVMetalPlayerView.Coordinator()
     @State private var buffering = true
     @State private var isPaused = false
@@ -123,6 +124,7 @@ struct TVPlayerView: View {
     /// wait-and-hop runs at most once per playback (TVPlayerView is fresh per playback, so it starts false).
     @State private var awaitedFreshSources = false
     @State private var hasStartedPlaying = false
+    @State private var appliedVolume = false   // D5: the persisted default-volume apply runs once per load (re-armed on source switch/reload)
     // #76: AVPlayer could not open this stream (item status .failed); fell back to libmpv for it in place.
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
@@ -287,6 +289,7 @@ struct TVPlayerView: View {
             }
         }
         .onAppear {
+            VXProbeState.shared.setRoute("player")
             if curURL == nil {   // seed from initial request
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
@@ -414,6 +417,7 @@ struct TVPlayerView: View {
                     hasStartedPlaying = true; loadTimeout?.cancel(); recoveryDeadline?.cancel(); recoveryDeadline = nil; loadFailed = false
                     avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: cancel the AVPlayer fallback
                     autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()   // playback started: clear auto-recovery
+                    applyDefaultVolume()            // D5: start at the user's saved "Default volume" (the launch mount begins at 100%)
                     // Live has no resumable position, so don't seed Continue-Watching direct-resume
                     // for it (mirrors PlayerScreen.recordLastStream's live guard).
                     if !isCurrentLiveStream, let m = curMeta, let u = curURL {   // remember the working link for direct resume
@@ -494,6 +498,8 @@ struct TVPlayerView: View {
             metadataLine = computeMetadataLine()
             if !appliedAutoTracks, !(audioTracks.isEmpty && subtitleTracks.isEmpty) {
                 appliedAutoTracks = true
+                let langs = subtitleTracks.map { langName($0.lang) }.joined(separator: ",")
+                VXProbe.log("subs", "subs available n=\(subtitleTracks.count) langs=\(langs)")
                 autoSelectTracks()
             }
         case MPVProperty.endFileError:
@@ -981,8 +987,13 @@ struct TVPlayerView: View {
         case .subtitles:
             var rows = [OptionRow(label: String(localized: "Off"), isSelected: subtitleTracks.allSatisfy { !$0.selected }) {
                 coordinator.player?.setSubtitleTrack(-1); refreshTracksSoon()
+                VXProbe.event("subs", "subs selected off")
             }]
-            rows += groupedTrackRows(subtitleTracks) { coordinator.player?.setSubtitleTrack($0); refreshTracksSoon() }
+            rows += groupedTrackRows(subtitleTracks) { id in
+                coordinator.player?.setSubtitleTrack(id); refreshTracksSoon()
+                let lang = subtitleTracks.first { $0.id == id }.map { langName($0.lang) } ?? "\(id)"
+                VXProbe.event("subs", "subs selected \(lang)")
+            }
             // External subtitles from the account's subtitle add-ons. Work on BOTH engines now: libmpv sub-adds
             // the downloaded file (it joins the embedded list above); AVPlayer parses it and renders the cues
             // over the video itself.
@@ -1003,6 +1014,7 @@ struct TVPlayerView: View {
                             subtitleLoadingURL = nil
                             if ok { addedSubURLs.insert(sub.url) }
                             refreshTracksSoon()
+                            VXProbe.event("subs", "subs selected \(langName(sub.lang)) (add-on ok=\(ok))")
                         }
                     })
                 }
@@ -1121,9 +1133,9 @@ struct TVPlayerView: View {
     }
 
     private func langName(_ code: String) -> String {
-        let c = code.lowercased()
-        if c.isEmpty || c == "und" { return "Unknown" }
-        return Locale.current.localizedString(forLanguageCode: c)?.capitalized ?? code.uppercased()
+        // Delegate to the shared helper so tvOS shows FULL names (English/French/Italian) and handles
+        // 3-letter ISO 639-2 codes (eng/fre/ita) and region-tagged codes (pt-BR) gracefully, matching iOS/Mac.
+        fullLanguageName(code)
     }
 
     // MARK: - Skip-segment editor panel (tvOS)
@@ -1424,7 +1436,7 @@ struct TVPlayerView: View {
         resumeSeconds = currentTime
         appliedResume = false
         bufferedTime = 0   // new stream: clear the buffered-ahead band until the new demuxer reports
-        buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; loadErrorMsg = ""
+        buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; appliedVolume = false; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
         // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
@@ -1499,11 +1511,21 @@ struct TVPlayerView: View {
     private func adjustSubDelay(_ delta: Double) {
         subDelay = ((subDelay + delta) * 10).rounded() / 10
         coordinator.player?.setSubDelay(subDelay)
+        VXProbe.event("subs", "subs sync \(subDelay)s")
         captureSubOffset()   // P3: pool the user-corrected offset (debounced, gated, fail-soft)
     }
     private func adjustAudioDelay(_ delta: Double) {
         audioDelay = ((audioDelay + delta) * 10).rounded() / 10
         coordinator.player?.setAudioDelay(audioDelay)
+    }
+    /// Apply the persisted "Default volume" (D5) to the live engine at playback start. The launch mount begins
+    /// at the engine's default (100%), so this restores the user's chosen level; re-armed on source switch /
+    /// reload (which re-mount the engine). Idempotent per load. tvOS has no in-player volume/mute control, so
+    /// this only sets the starting level and never touches mute. SAME `stremiox.playerVolume` key as iOS/Mac.
+    private func applyDefaultVolume() {
+        guard !appliedVolume else { return }
+        appliedVolume = true
+        coordinator.player?.setVolume(playerVolume)
     }
     // In-player style tweaks also stick to the active profile (Settings does the same).
     private func setSubtitleFont(_ id: String) {
@@ -1667,7 +1689,11 @@ struct TVPlayerView: View {
     private func autoSelectTracks() {
         let pick = TrackSelector.select(audio: audioTracks, subtitles: subtitleTracks, preferences: TrackPreferences.current)
         if let a = pick.audio { coordinator.player?.setAudioTrack(a) }
-        if let s = pick.subtitle { coordinator.player?.setSubtitleTrack(s) }   // -1 = off
+        if let s = pick.subtitle {
+            coordinator.player?.setSubtitleTrack(s)   // -1 = off
+            let lang = s < 0 ? "off" : (subtitleTracks.first { $0.id == s }.map { langName($0.lang) } ?? "\(s)")
+            VXProbe.event("subs", "subs selected \(lang) (auto)")
+        }
         refreshTracksSoon()
     }
 
@@ -2109,7 +2135,7 @@ struct TVPlayerView: View {
         autoRetryTask?.cancel()
         withAnimation { loadFailed = false }
         bufferedTime = 0   // reload: clear the buffered-ahead band until the demuxer re-reports
-        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; loadErrorMsg = ""
+        buffering = true; hasStartedPlaying = false; appliedResume = false; appliedAutoTracks = false; appliedVolume = false; loadErrorMsg = ""
         loadIntoPlayer(curURL ?? url, headers: curHeaders, live: isCurrentLiveStream)
         startLoadTimeout()
     }
@@ -2205,6 +2231,7 @@ struct TVPlayerView: View {
                                                               isSignedIn: VortXSyncManager.shared.isSignedIn)
             guard communityContentKey == contentKey else { return }   // title changed mid-fetch
             pooledSubs = result.subs
+            VXProbe.log("subs", "subs pooled n=\(result.subs.count)")
             // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
             // maps it to `sub-delay`; the AVPlayer engine applies it as the offset on the external-subtitle
             // overlay it renders itself (a no-op until an external cue set is loaded, then it lands correctly).
@@ -2214,6 +2241,7 @@ struct TVPlayerView: View {
                 let seconds = (Double(offsetMs) / 1000.0 * 10).rounded() / 10
                 subDelay = seconds
                 coordinator.player?.setSubDelay(seconds)
+                VXProbe.log("subs", "subs sync \(seconds)s (community seed)")
             }
             if showOptions, panelKind == .subtitles { panelRows = optionRows }
         }
@@ -2237,6 +2265,7 @@ struct TVPlayerView: View {
                 subtitleLoadingURL = nil
                 if ok { addedPooledIDs.insert(sub.id) }
                 if showOptions, panelKind == .subtitles { panelRows = optionRows }
+                VXProbe.event("subs", "subs selected \(langName(sub.lang)) (community ok=\(ok))")
             }
         }
     }
@@ -2566,7 +2595,7 @@ struct TVPlayerView: View {
         let leavingHash = currentTorrentHash
         withAnimation { showOptions = false }
         buffering = true; hasStartedPlaying = false; appliedResume = false
-        loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false
+        loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; appliedVolume = false
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
         // source still fails over automatically instead of dead-ending an unattended binge on "choose another

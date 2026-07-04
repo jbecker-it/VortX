@@ -346,10 +346,22 @@ enum CommunityTrickplay {
         VortXEdgeAuth.sign(&req)   // gated host (trickplay.vortx.tv /tp/<key> POST): stamp X-VX-Ts / X-VX-Sig
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
-            return (obj["stored"] as? Bool) == true
+            let http = resp as? HTTPURLResponse
+            let code = http?.statusCode ?? -1
+            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let ok = (obj?["ok"] as? Bool) == true
+            let stored = (obj?["stored"] as? Bool) == true
+            // Probe the POST so a failed upload (edge-auth sig rejection, 4xx, worker error) is visible with its
+            // reason in the terminal log, not just a silent false. Trim the body to the first 200 chars.
+            let bodyStr = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count)B>"
+            let bodyHead = String(bodyStr.prefix(200))
+            NSLog("[tp-probe] POST %@ httpStatus=%d ok=%@ stored=%@ body=%@",
+                  url.absoluteString, code, ok ? "true" : "false", stored ? "true" : "false", bodyHead)
+            guard code == 200 else { return false }
+            return stored
         } catch {
+            let errHead = String(String(describing: error).prefix(200))
+            NSLog("[tp-probe] POST %@ httpStatus=err ok=false stored=false body=%@", url.absoluteString, errHead)
             return false
         }
     }

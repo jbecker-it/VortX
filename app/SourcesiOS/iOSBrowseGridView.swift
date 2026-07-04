@@ -171,15 +171,18 @@ struct iOSServiceTile: View {
     var width: CGFloat = iOSPillMetrics.cardWidth
 
     private var tileHeight: CGFloat { width * 0.5 }
-    /// The provider mark sits at a medium, first-party size on the brand color - never a zoomed crop (H1).
-    /// ~44% of the tile width keeps a wordmark logo legible without touching the tile edges.
-    private var markSize: CGFloat { width * 0.44 }
-    /// The warm near-white plate behind a REMOTE (unbundled) mark (#95). It is a touch larger than `markSize`
-    /// so, after the shared inset, the mark itself still lands at ~the medium size; corner + inset are derived
-    /// from the same fractions the rasterized bundled/remote plate uses, so both stay pixel-consistent.
-    private var plateSize: CGFloat { width * 0.52 }
-    private var plateCorner: CGFloat { plateSize * BundledLogo.plateCornerFraction }
-    private var plateInset: CGFloat { plateSize * BundledLogo.plateInsetFraction }
+    /// The provider mark FILLS the tile (owner: "logo should fill the pill, not sit as a tiny mark on a plate").
+    /// The plated art is already inset inside its own art, so the mark frame spans most of the tile with only a
+    /// small breathing margin; .fit keeps a wordmark or a square icon whole and centered on the brand color.
+    private var markWidth: CGFloat { width * 0.82 }
+    private var markHeight: CGFloat { tileHeight * 0.72 }
+    /// The warm near-white plate behind a REMOTE (unbundled) mark (#95). It now FILLS the tile too; corner +
+    /// inset are derived from the same fractions the rasterized bundled/remote plate uses so both stay
+    /// pixel-consistent. Kept a touch under the full tile so the brand color still frames the plate.
+    private var plateWidth: CGFloat { width * 0.86 }
+    private var plateHeight: CGFloat { tileHeight * 0.76 }
+    private var plateCorner: CGFloat { plateWidth * BundledLogo.plateCornerFraction }
+    private var plateInset: CGFloat { plateWidth * BundledLogo.plateInsetFraction }
 
     var body: some View {
         // Clean, dedicated brand tile (H1): the provider's official TMDB mark, sized medium and centered on
@@ -200,27 +203,30 @@ struct iOSServiceTile: View {
                 bundled
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(maxWidth: markSize, maxHeight: markSize)
+                    .frame(maxWidth: markWidth, maxHeight: markHeight)
             } else if let logo = provider.logoURL, let url = URL(string: logo) {
                 // Fallback for the long tail we don't bundle: the TMDB mark, on the SAME warm near-white plate
                 // the bundled majors use (#95: the bare mark drawn straight onto the dark brand tile read as
                 // "very dark"; a cropped w300 raster read as "incomplete"). The mark is aspect-fit and centered
                 // inside the plate, never cropped; the light plate makes even a dark square app-icon legible.
-                // The brand initial stays as the load/failure fallback so the tile is never a blank box.
+                // The provider FULL NAME stays as the load/failure fallback so the tile is never a blank box.
                 RoundedRectangle(cornerRadius: plateCorner, style: .continuous)
                     .fill(BundledLogo.plateFill)
-                    .frame(width: plateSize, height: plateSize)
+                    .frame(width: plateWidth, height: plateHeight)
                     .overlay(
                         AsyncImage(url: url) { img in
                             img.resizable().aspectRatio(contentMode: .fit)
                         } placeholder: {
-                            // While the logo streams in (or on failure), show the brand initial so the tile is
-                            // never a blank box (H19c: the old opaque-blur AsyncImage collapsed to an empty box).
-                            Text(provider.name.prefix(1))
-                                .font(.system(size: markSize * 0.6, weight: .heavy))
-                                // Dark ink on the warm near-white plate (>= 4.5:1). textPrimary is #F6F1E9
-                                // (near white) and drew invisible on the ~0.96 plate; a dark neutral reads.
-                                .foregroundStyle(Color.black.opacity(0.55))
+                            // While the logo streams in (or on failure), show the provider FULL NAME so the tile
+                            // is never a blank box and NEVER a bare single letter (owner: "show the provider full
+                            // name, e.g. Hulu / Peacock, when there is no logo"). Dark ink on the warm near-white
+                            // plate (>= 4.5:1); wraps to 2 lines so a longer name stays legible.
+                            Text(provider.name)
+                                .font(.system(size: markHeight * 0.24, weight: .heavy))
+                                .foregroundStyle(Color.black.opacity(0.62))
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.6)
                         }
                         .padding(plateInset)
                     )

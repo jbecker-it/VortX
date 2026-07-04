@@ -37,6 +37,10 @@ struct StremioXiOSApp: App {
     #endif
 
     init() {
+        // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
+        // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
+        VXProbeHeartbeat.start()
+        VXProbe.log("boot", "VortX launched probe=\(VXProbe.enabled)")
         #if !STREMIOX_NO_EMBEDDED_SERVER
         if !PlaybackSettings.torrentsDisabled,
            !ProcessInfo.processInfo.arguments.contains("-stremiox-no-server") {

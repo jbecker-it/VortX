@@ -137,7 +137,7 @@ enum BundledLogo {
         static let width: CGFloat = 300
         static let height: CGFloat = 190
         static let corner: CGFloat = 34
-        static let inset: CGFloat = 34          // padding between the mark and the plate edge
+        static let inset: CGFloat = 18          // padding between the mark and the plate edge (tight so the mark FILLS the plate)
         static let scale: CGFloat = 3           // supersample for crisp downscale on the tile
         // Warm off-white, not #FFF, so the plate reads as part of the warm-neutral chrome rather than a
         // clinical white sticker. Every dark or brand-hued mark clears a wide luminance gap against it.

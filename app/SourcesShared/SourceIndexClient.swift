@@ -150,29 +150,53 @@ enum SourceIndexClient {
     /// on AND the user is signed in AND consent is granted AND the fleet flag is on. Fail-soft to `[]` on any
     /// error, on the worker's `login_required` empty read, or when disabled.
     static func fetchPooled(contentID: String, isSignedIn: Bool) async -> [PooledSource] {
-        guard isEnabled, serveEnabled, isSignedIn else { return [] }
+        // SERVE opt-in gate: toggle on/off + signed-in state + master enable, with the decision logged.
+        NSLog("[sing-probe] fetchPooled GATE contentID=%@ isEnabled=%@ serveEnabled=%@ isSignedIn=%@",
+              contentID, isEnabled ? "on" : "off", serveEnabled ? "on" : "off", isSignedIn ? "yes" : "no")
+        guard isEnabled, serveEnabled, isSignedIn else {
+            NSLog("[sing-probe] fetchPooled GATE CLOSED contentID=%@ -> [] (gate off / not signed in)", contentID)
+            return []
+        }
         guard var comps = URLComponents(url: baseURL.appendingPathComponent("sources"),
-                                        resolvingAgainstBaseURL: false) else { return [] }
+                                        resolvingAgainstBaseURL: false) else {
+            NSLog("[sing-probe] fetchPooled URLComponents FAILED contentID=%@ -> []", contentID)
+            return []
+        }
         comps.queryItems = [URLQueryItem(name: "content_id", value: contentID)]
-        guard let url = comps.url else { return [] }
+        guard let url = comps.url else {
+            NSLog("[sing-probe] fetchPooled url build FAILED contentID=%@ -> []", contentID)
+            return []
+        }
 
         var req = URLRequest(url: url, timeoutInterval: 8)
         req.httpMethod = "GET"
         req.setValue("application/json", forHTTPHeaderField: "accept")
         VortXEdgeAuth.sign(&req)
+        let signed = req.value(forHTTPHeaderField: "X-VX-Sig") != nil
         // Moat token: the SERVE gate is login-only AND moat-token-gated (the worker's verifyMoatToken returns
         // an empty list with no token). Stamp X-VX-Moat after the edge signature. Fail-soft: no token -> no
         // header -> the worker returns empty, which is the correct signed-out / cold-start SERVE result.
-        if let moat = await MoatToken.shared.current(isSignedIn: isSignedIn) {
+        let moat = await MoatToken.shared.current(isSignedIn: isSignedIn)
+        if let moat {
             req.setValue(moat, forHTTPHeaderField: MoatToken.header)
         }
+        NSLog("[sing-probe] fetchPooled GET %@ contentID=%@ edgeSigned=%@ moatToken=%@",
+              url.absoluteString, contentID, signed ? "yes" : "no", moat != nil ? "present" : "absent")
 
         do {
             let (data, resp) = try await URLSession.shared.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return [] }
+            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let status = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                NSLog("[sing-probe] fetchPooled HTTP non-2xx contentID=%@ status=%d -> []", contentID, status)
+                return []
+            }
             let decoded = try? JSONDecoder().decode(SourcesResponse.self, from: data)
-            return decoded?.sources ?? []
+            let sources = decoded?.sources ?? []
+            NSLog("[sing-probe] fetchPooled HTTP OK contentID=%@ status=%d corroboratedSources=%d reason=%@",
+                  contentID, http.statusCode, sources.count, decoded?.reason ?? "-")
+            return sources
         } catch {
+            NSLog("[sing-probe] fetchPooled HTTP ERROR contentID=%@ error=%@ -> []", contentID, error.localizedDescription)
             return []
         }
     }
@@ -183,7 +207,7 @@ enum SourceIndexClient {
     /// nzb link, usenet + direct pooled entries are NOT reconstructable and are dropped. So SERVE surfaces
     /// community-corroborated TORRENTS the user's own add-ons did not return. Fail-soft: empty on nothing usable.
     static func streams(from pooled: [PooledSource]) -> [CoreStream] {
-        pooled.compactMap { src -> CoreStream? in
+        let built: [CoreStream] = pooled.compactMap { src -> CoreStream? in
             guard src.kind == Kind.torrent.rawValue, let hash = src.id, !hash.isEmpty,
                   hash.range(of: #"^[0-9a-fA-F]{20,64}$"#, options: .regularExpression) != nil else { return nil }
             let quality = (src.quality?.isEmpty == false) ? src.quality! : "Source"
@@ -195,6 +219,9 @@ enum SourceIndexClient {
             let desc = "Singularity source\(sizeSuffix)\(seedSuffix)"
             return make(name: name, description: desc, infoHash: hash.lowercased())
         }
+        NSLog("[sing-probe] streams(from:) reconstruct pooled=%d -> playable torrents=%d (usenet/direct/non-torrent dropped)",
+              pooled.count, built.count)
+        return built
     }
 
     // MARK: - Feature gates
@@ -210,6 +237,29 @@ enum SourceIndexClient {
     /// which is exactly the intended default, so no object-presence dance is needed here.
     static let serveKey = "vortx.singularity.serve"
     static var serveEnabled: Bool { UserDefaults.standard.bool(forKey: serveKey) }
+
+    // MARK: - Singularity source-group identity (shared by the iOS + tvOS source lists)
+
+    /// The stable group id `merged(into:)` stamps on Singularity's merged source group, so the source lists
+    /// can find it without a magic string.
+    static let groupID = "vortx.singularity.sources"
+    /// The user-facing label on Singularity's source group + rows. Kept as one constant so the pinned section
+    /// header, the row labels, and the merge all read identically.
+    static let groupAddon = "Singularity"
+
+    /// The most Singularity sources the pinned top-of-list section may show, so a title with many corroborated
+    /// Singularity sources cannot drown the normal add-on grouping. The rest stay reachable in the full list.
+    static let pinnedSectionMax = 6
+
+    /// Pull the pinned-section streams (best few Singularity sources) out of the already-ranked, already-merged
+    /// `groups`, so the source lists can float them to the very top. `groups` MUST be the ranked output so the
+    /// slice is best-first (highest corroboration then quality). Returns `[]` when the pool contributed nothing
+    /// for this title, so the section is a pure pass-through (no header, list unchanged). Caps at
+    /// `pinnedSectionMax`; the remaining Singularity sources still render under the normal grouping.
+    static func pinnedStreams(from groups: [CoreStreamSourceGroup]) -> [CoreStream] {
+        guard let group = groups.first(where: { $0.id == groupID }) else { return [] }
+        return Array(group.streams.prefix(pinnedSectionMax))
+    }
 
     // MARK: - Helpers
 
@@ -281,7 +331,12 @@ final class SourceIndexServeSource: ObservableObject {
         task = Task { [weak self] in
             let pooled = await SourceIndexClient.fetchPooled(contentID: contentID, isSignedIn: isSignedIn)
             let built = SourceIndexClient.streams(from: pooled)
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self else {
+                NSLog("[sing-probe] refresh publish SKIPPED contentID=%@ (cancelled or self gone) built=%d",
+                      contentID, built.count)
+                return
+            }
+            NSLog("[sing-probe] refresh publish contentID=%@ streams=%d (now merge-ready)", contentID, built.count)
             self.streams = built
         }
     }
@@ -293,14 +348,26 @@ final class SourceIndexServeSource: ObservableObject {
     /// cover). We drop only internal duplicates within Singularity's own list, by infoHash. Empty pool (SERVE off
     /// / not signed in / fleet-off / nothing corroborated) is a pure pass-through, so the list is unchanged.
     func merged(into groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
-        guard !streams.isEmpty else { return groups }
+        guard !streams.isEmpty else {
+            NSLog("[sing-probe] merged PASS-THROUGH singularityStreams=0 -> groups unchanged (%d groups)", groups.count)
+            return groups
+        }
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in streams {
             guard let h = s.infoHash?.lowercased() else { continue }
             if seen.insert(h).inserted { own.append(s) }
         }
-        guard !own.isEmpty else { return groups }
-        return groups + [CoreStreamSourceGroup(id: "vortx.singularity.sources", addon: "Singularity", streams: own)]
+        // NOTE: `own` is deduped ONLY within Singularity's own list (by infoHash); it is deliberately NOT
+        // deduped against the user's add-on groups, so a release your add-ons already return still appears
+        // under the Singularity label.
+        guard !own.isEmpty else {
+            NSLog("[sing-probe] merged singularityStreams=%d survivingInternalDedup=0 -> groups unchanged (%d groups)",
+                  streams.count, groups.count)
+            return groups
+        }
+        NSLog("[sing-probe] merged GROUP produced addon=%@ streamCount=%d (from singularityStreams=%d, internal-dedup only, NOT deduped vs user add-ons) totalGroups=%d",
+              SourceIndexClient.groupAddon, own.count, streams.count, groups.count + 1)
+        return groups + [CoreStreamSourceGroup(id: SourceIndexClient.groupID, addon: SourceIndexClient.groupAddon, streams: own)]
     }
 }

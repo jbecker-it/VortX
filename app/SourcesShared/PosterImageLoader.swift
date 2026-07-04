@@ -42,6 +42,8 @@ enum PosterImageLoader {
         let diskCapacity = 512 * 1024 * 1024
         let cache = URLCache(memoryCapacity: memoryCapacity, diskCapacity: diskCapacity, diskPath: "vortx-images")
         URLCache.shared = cache
+        NSLog("[poster-probe] configureSharedCache installed memory=%dMB disk=%dMB diskPath=vortx-images",
+              memoryCapacity / (1024 * 1024), diskCapacity / (1024 * 1024))
     }
 
     // MARK: bounded-concurrency image session
@@ -64,18 +66,60 @@ enum PosterImageLoader {
     private actor ConcurrencyGate {
         private let limit: Int
         private var active = 0
-        private var waiters: [CheckedContinuation<Void, Never>] = []
+        // Waiters are FIFO but keyed by id so a cancelled waiter can be pulled out of the middle of the queue
+        // (a scrolled-off cell whose .task is cancelled while still waiting for a permit) without disturbing the
+        // others. `order` preserves the hand-off order; `pending` holds the suspended continuations. Each
+        // continuation resumes with a Bool: true = permit granted, false = removed by cancellation.
+        private var pending: [UInt64: CheckedContinuation<Bool, Never>] = [:]
+        private var order: [UInt64] = []
+        private var nextID: UInt64 = 0
         init(limit: Int) { self.limit = limit }
-        func acquire() async {
-            if active < limit { active += 1; return }
-            // Wait for a permit HANDED OFF by release(); the permit is already counted in `active`, so we must
-            // NOT increment again here (doing so, plus a fresh acquire slipping in during the decrement/resume
-            // gap, let `active` exceed `limit` and over-admit loads, the very stampede this gate prevents).
-            await withCheckedContinuation { waiters.append($0) }
+
+        /// Acquire a permit. Returns `true` if a permit was granted, `false` if the caller was cancelled while
+        /// waiting (in which case NO permit is held and the caller must not call `release()`). Cancellation-safe:
+        /// a cancelled waiter removes itself from the queue and hands its already-counted permit to the next
+        /// waiter, so a scroll-away cancel never leaks a permit and slowly starves the grid.
+        func acquire() async -> Bool {
+            if active < limit { active += 1; return true }
+            if Task.isCancelled { return false }
+            let id = nextID
+            nextID &+= 1
+            // Wait for a permit HANDED OFF by release() or pulled by cancelWaiter(); the permit is already
+            // counted in `active`, so we must NOT increment again on the grant path (doing so, plus a fresh
+            // acquire slipping in during the decrement/resume gap, let `active` exceed `limit` and over-admit
+            // loads, the very stampede this gate prevents). The continuation resumes with the outcome exactly
+            // once: true = permit held, false = removed by cancellation. Enqueue and removal are actor-
+            // serialized, so there is no double-resume.
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                    order.append(id)
+                    pending[id] = continuation
+                }
+            } onCancel: {
+                Task { await self.cancelWaiter(id) }
+            }
         }
+
         func release() {
-            // Hand the permit to a waiter if any (active unchanged - the permit just moves); otherwise free it.
-            if !waiters.isEmpty { waiters.removeFirst().resume() } else { active -= 1 }
+            // Hand the permit to the next waiter if any (active unchanged - the permit just moves); otherwise
+            // free it. `order` may hold ids already removed by cancellation, so skip past those.
+            while let id = order.first {
+                order.removeFirst()
+                if let continuation = pending.removeValue(forKey: id) { continuation.resume(returning: true); return }
+            }
+            active -= 1
+        }
+
+        /// A waiter cancelled while suspended: pull it from the queue and resume it with `false` so it holds no
+        /// permit, then hand the place it held in line to the NEXT waiter (or free it). No-op if it was already
+        /// granted a permit or already removed (release ran first): its id is gone from `pending`.
+        private func cancelWaiter(_ id: UInt64) {
+            guard let continuation = pending.removeValue(forKey: id) else { return }
+            order.removeAll { $0 == id }
+            continuation.resume(returning: false)
+            // A suspended waiter holds NO permit: `active` is incremented only on acquire's fast path or by
+            // release's hand-off, never on enqueue. So there is nothing to free or hand off here. Calling
+            // release() would spuriously drop a permit the waiter never held and drive `active` negative.
         }
     }
     private static let gate = ConcurrencyGate(limit: 6)
@@ -99,24 +143,52 @@ enum PosterImageLoader {
     /// real failure OR on cancellation (the caller treats nil-from-cancel as "retry next appear", so a
     /// scroll-away never latches a blank card). `maxPixel` downsamples very large art to a sane on-card size.
     static func load(_ urlString: String?, maxPixel: CGFloat = 900) async -> VXPosterImage? {
-        guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else { return nil }
-        if let hit = memory.object(forKey: url as NSURL) { return hit }
+        NSLog("[poster-probe] load ENTRY url=%@ maxPixel=%d",
+              (urlString?.isEmpty == false) ? urlString! : "nil/empty", Int(maxPixel))
+        guard let raw = urlString, !raw.isEmpty, let url = URL(string: raw) else {
+            NSLog("[poster-probe] load BAIL bad/empty url=%@ -> nil", (urlString?.isEmpty == false) ? urlString! : "nil/empty")
+            return nil
+        }
+        if let hit = memory.object(forKey: url as NSURL) {
+            NSLog("[poster-probe] memory-cache HIT url=%@ -> returning cached", raw)
+            return hit
+        }
+        NSLog("[poster-probe] memory-cache MISS url=%@", raw)
 
-        await gate.acquire()
+        // A cancelled acquire holds NO permit, so return without releasing (releasing here would free a permit
+        // we never took and let `active` drift below zero, over-admitting loads). Only release when granted.
+        guard await gate.acquire() else {
+            NSLog("[poster-probe] gate ACQUIRE cancelled url=%@ -> nil (no permit held)", raw)
+            return nil
+        }
+        NSLog("[poster-probe] gate ACQUIRE granted url=%@", raw)
         defer { Task { await gate.release() } }
         // A cancel between acquiring the gate and starting the fetch: bail without a network hit.
-        if Task.isCancelled { return nil }
+        if Task.isCancelled {
+            NSLog("[poster-probe] cancelled after gate, before fetch url=%@ -> nil-because-cancelled", raw)
+            return nil
+        }
 
         do {
             var req = URLRequest(url: url)
             req.cachePolicy = .returnCacheDataElseLoad   // poster art is immutable; prefer the (now large) disk cache
             let (data, _) = try await session.data(for: req)
-            if Task.isCancelled { return nil }
+            NSLog("[poster-probe] fetch OK url=%@ bytes=%d", raw, data.count)
+            if Task.isCancelled {
+                NSLog("[poster-probe] cancelled after fetch, before decode url=%@ -> nil-because-cancelled", raw)
+                return nil
+            }
             // Decode + downsample OFF the main thread so scrolling never blocks on a poster decode.
-            guard let image = decode(data, maxPixel: maxPixel) else { return nil }
+            guard let image = decode(data, maxPixel: maxPixel) else {
+                NSLog("[poster-probe] decode FAILED url=%@ bytes=%d -> nil-because-failed", raw, data.count)
+                return nil
+            }
             memory.setObject(image, forKey: url as NSURL)
+            NSLog("[poster-probe] load SUCCESS url=%@ image=%dx%d", raw, Int(image.size.width), Int(image.size.height))
             return image
         } catch {
+            NSLog("[poster-probe] fetch ERROR url=%@ error=%@ -> nil-because-failed (or cancel; caller retries)",
+                  raw, error.localizedDescription)
             return nil   // includes URLError.cancelled; the caller retries on the next appear
         }
     }
@@ -128,7 +200,10 @@ enum PosterImageLoader {
     private static func decode(_ data: Data, maxPixel: CGFloat) -> VXPosterImage? {
         let sourceOptions = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions) else {
-            return VXPosterImage(data: data)   // fall back to the platform decoder (e.g. a format ImageIO thumbnails oddly)
+            let fallback = VXPosterImage(data: data)   // fall back to the platform decoder (e.g. a format ImageIO thumbnails oddly)
+            NSLog("[poster-probe] decode ImageIO source-create FAILED bytes=%d -> platform-decoder fallback=%@",
+                  data.count, fallback != nil ? "ok" : "nil")
+            return fallback
         }
         let downsampleOptions = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
@@ -137,8 +212,12 @@ enum PosterImageLoader {
             kCGImageSourceThumbnailMaxPixelSize: Int(maxPixel),
         ] as [CFString: Any] as CFDictionary
         guard let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, downsampleOptions) else {
-            return VXPosterImage(data: data)
+            let fallback = VXPosterImage(data: data)
+            NSLog("[poster-probe] decode ImageIO thumbnail FAILED bytes=%d -> platform-decoder fallback=%@",
+                  data.count, fallback != nil ? "ok" : "nil")
+            return fallback
         }
+        NSLog("[poster-probe] decode ImageIO ok pixels=%dx%d", cg.width, cg.height)
         #if canImport(UIKit)
         return UIImage(cgImage: cg)
         #elseif canImport(AppKit)

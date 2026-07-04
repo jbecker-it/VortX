@@ -781,3 +781,31 @@ struct BigSpinner: View {
         ProgressView().scaleEffect(1.5).tint(Theme.Palette.accent)
     }
 }
+
+/// Full localized language NAME for an ISO 639 code, so tvOS shows "English", "French", "Italian"
+/// rather than bare codes ("en", "fr", "it") like iOS/Mac already do.
+///
+/// Handles the code shapes that reach us from mpv tracks and add-on tags:
+///   - a 2-letter ISO 639-1 code ("en") resolves directly;
+///   - a region/script-tagged code ("pt-BR", "zh-Hant") resolves on its base ("pt", "zh");
+///   - a 3-letter ISO 639-2 code ("eng", "fre", "ita") is normalized to its 2-letter base via
+///     `Locale(identifier:).language.languageCode` first (localizedString(forLanguageCode:) alone
+///     returns nil for many 3-letter codes on tvOS, which is what left "ENG"/"FRE"/"ITA" showing).
+///
+/// Fallback chain never blanks: unknown / und -> "Unknown"; a code the locale database can't name
+/// -> its uppercased self. Mirrors the intent of `LanguageIndexClient.displayLabel` but tolerant of
+/// 3-letter and region-carrying inputs.
+func fullLanguageName(_ code: String) -> String {
+    let trimmed = code.trimmingCharacters(in: .whitespaces).lowercased()
+    guard !trimmed.isEmpty, trimmed != "und", trimmed != "unknown" else { return "Unknown" }
+    // Try the raw code as-is first (handles clean 2-letter codes), then fold a region/script-tagged
+    // or 3-letter code down to its 2-letter base and try that.
+    if let name = Locale.current.localizedString(forLanguageCode: trimmed) { return name.capitalized }
+    let base = Locale(identifier: trimmed).language.languageCode?.identifier
+        ?? trimmed.split(separator: "-").first.map(String.init)
+        ?? trimmed
+    if base != trimmed, let name = Locale.current.localizedString(forLanguageCode: base) {
+        return name.capitalized
+    }
+    return trimmed.uppercased()
+}

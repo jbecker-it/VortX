@@ -1273,7 +1273,22 @@ final class CoreBridge: ObservableObject {
         let payload: [String: Any] = ["field": field ?? NSNull(), "action": action]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let json = String(data: data, encoding: .utf8) else { return }
+        // [engine] narrate every dispatched action (its name + the field it targets) so the log shows
+        // what we asked the engine to do. Gated + autoclosure: shipping builds build no string.
+        VXProbe.log("engine", "dispatch \(Self.actionName(action))\(field.map { " -> \($0)" } ?? "")")
         json.withCString { stremiox_core_dispatch($0) }
+    }
+
+    /// Compact human name for a dispatched action, for the [engine] probe. Reports the top-level
+    /// action plus a nested model/sub-action where the engine nests them (Load->model,
+    /// Ctx->inner action, CatalogsWithExtra->sub-action), so the log distinguishes the many
+    /// same-named dispatches. Cheap string reads only; never touches the engine.
+    private static func actionName(_ action: [String: Any]) -> String {
+        let top = (action["action"] as? String) ?? "?"
+        guard let args = action["args"] as? [String: Any] else { return top }
+        if let model = args["model"] as? String { return "\(top) \(model)" }   // Load -> model
+        if let inner = args["action"] as? String { return "\(top) \(inner)" }   // Ctx / model sub-action
+        return top
     }
 
     // MARK: State
@@ -1334,24 +1349,35 @@ final class CoreBridge: ObservableObject {
         // Decode the changed screens off the main thread, then publish on main.
         if fields.contains("continue_watching_preview") {
             let items = Self.pruneFinished(decode(CoreCWPreview.self, field: "continue_watching_preview")?.items ?? [])
+            VXProbe.log("engine", "continueWatching changed n=\(items.count)")
             DispatchQueue.main.async { [weak self] in self?.continueWatching = items }
         }
         // The board needs ctx (addon manifests) for row titles, so rebuild on either change. Coalesced: a
         // launch/page-land burst of `board` events collapses into a single trailing rebuild instead of N
         // full decodes + republishes (the on-open lag). The rebuild itself still decodes off-main.
         if fields.contains("board") || fields.contains("ctx") {
-            scheduleBoardRebuild()
+            scheduleBoardRebuild()   // [engine] board row count is logged there (coalesced, one per burst)
         }
         if fields.contains("ctx") {
+            VXProbe.log("engine", "ctx/settings changed addons=\(decode(CoreCtx.self, field: "ctx")?.profile.addons.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.addonNamesCache = nil }   // addon set changed → rebuild name map
             refreshAddons()
         }
         if fields.contains("meta_details") {
             let details = decode(CoreMetaDetails.self, field: "meta_details")
+            if VXProbe.enabled {
+                // Count ready streams across every source group so the log shows when streams actually
+                // ARRIVED (not just that meta_details re-emitted). On a non-zero arrival also stamp the
+                // heartbeat via note("streams N"). Ready-only pass, no per-item logging.
+                let readyStreams = (details?.streams ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
+                VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.streams.count ?? 0) streams=\(readyStreams)")
+                if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
+            }
             DispatchQueue.main.async { [weak self] in self?.metaDetails = details }
         }
         if fields.contains("discover") {
             let value = decode(CoreDiscover.self, field: "discover")
+            VXProbe.log("engine", "discover changed items=\(value?.items.count ?? 0)")
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 // End-stop (#95): a next-page load that has FULLY settled (no page still loading) without
@@ -1377,6 +1403,7 @@ final class CoreBridge: ObservableObject {
         }
         if fields.contains("library") {
             let value = decode(CoreLibrary.self, field: "library")
+            VXProbe.log("engine", "library changed n=\(value?.catalog.count ?? 0)")
             DispatchQueue.main.async { [weak self] in self?.library = value }
             // AddToLibrary / RemoveFromLibrary dispatch emits `library` but NOT `meta_details`.
             // If a detail page is open, re-read meta_details so detailInLibrary (the In-Library
@@ -1406,6 +1433,7 @@ final class CoreBridge: ObservableObject {
             let items = pages.compactMap { $0.content?.ready }.flatMap { $0 }
             var seen = Set<String>(); var unique: [CoreMeta] = []
             for item in items where seen.insert(item.id).inserted { unique.append(item) }
+            VXProbe.log("engine", "search changed results=\(unique.count) loading=\(hasLoadingPages)")
             DispatchQueue.main.async { [weak self] in
                 self?.searchIsLoading = hasLoadingPages
                 if !hasLoadingPages || !unique.isEmpty {
@@ -1443,6 +1471,8 @@ final class CoreBridge: ObservableObject {
                     guard let self else { return }
                     let rows = self.buildBoardRows()
                     let boardState = self.decode(CoreBoardState.self, field: "board")
+                    // [engine] one board line per coalesced rebuild (catalogs the engine holds -> visible rows).
+                    VXProbe.log("engine", "board changed catalogs=\(boardState?.catalogs.count ?? 0) rows=\(rows.count)")
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         self.reconcileBoardRowPagination(boardState)   // #95: settle per-row horizontal pagination

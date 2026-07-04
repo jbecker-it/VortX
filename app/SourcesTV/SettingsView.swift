@@ -38,6 +38,7 @@ struct SettingsView: View {
     @AppStorage(TrackPreferences.Key.subtitle) private var prefSubLang = TrackPreferences.deviceLanguages.first ?? "en"
     @AppStorage(PlaybackSettings.Key.directLinksOnly) private var directLinksOnly = false
     @AppStorage(PlaybackSettings.Key.customMpvOptions) private var customMpvOptions = ""
+    @AppStorage(VXProbe.defaultsKey) private var probeLogging = false   // gated diagnostic logging + heartbeat
     @AppStorage(PerformanceMode.overrideKey) private var perfMode = "auto"
     @AppStorage(AudioOutputMode.key) private var audioOutput = AudioOutputMode.auto.rawValue
     @AppStorage(PlaybackSettings.Key.videoUpscaling) private var videoUpscaling = PlaybackSettings.videoUpscaling.rawValue
@@ -80,9 +81,6 @@ struct SettingsView: View {
     // lives in a SourcesiOS file the tvOS target does not compile, so tvOS reads the raw key and requests
     // authorization through UNUserNotificationCenter directly (see setNotifyNewEpisodes below).
     @AppStorage("stremiox.notifyNewEpisodes") private var notifyNewEpisodes = true
-    // Show the built-in editorial Home rails (Critically Acclaimed, Hidden Gems, etc.), Cinemeta-backed and
-    // shown even with no add-ons installed. Default ON. SAME key iOS/Mac binds.
-    @AppStorage("vortx.home.showCuratedRails") private var showCuratedRails = true
     /// Deterministic Down-chain insurance across the three top account rows so the spatial focus
     /// engine cannot skip Log Out (it stranded far-right before 80fb9d2 and the owner could not reach it).
     private enum AccountFocus: Hashable { case vortx, logOut, importStremio }
@@ -598,13 +596,6 @@ struct SettingsView: View {
             Text("Hide the Live TV tab if you do not use it.")
                 .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
 
-            // Editorial Home rails (Critically Acclaimed, Hidden Gems, etc.), Cinemeta-backed and shown even
-            // with no add-ons installed; this hides them. SAME key iOS/Mac binds.
-            choiceRow(String(localized: "Show editorial Home rows"), [("1", "Show"), ("0", "Hide")],
-                      selection: Binding(get: { showCuratedRails ? "1" : "0" }, set: { showCuratedRails = ($0 == "1") }))
-            Text("Show the built-in editorial rows (Critically Acclaimed, Hidden Gems, and more) on Home, even with no add-ons installed.")
-                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-
             choiceRow(String(localized: "Cinematic catalog cards"), [("1", "Landscape"), ("0", "Portrait")],
                       selection: Binding(get: { catalogPrefs.landscapeCards ? "1" : "0" }, set: { catalogPrefs.landscapeCards = ($0 == "1") }))
             Text("Show catalog posters as wide cinematic cards using clean TMDB artwork. Needs a TMDB key (set one under API keys); without it cards stay portrait. Choose Portrait for the classic poster grid.")
@@ -831,6 +822,14 @@ struct SettingsView: View {
                 .lineLimit(3...10)
                 .autocorrectionDisabled(true)
                 .focusSection()
+            // Gated diagnostic logging: turning it on starts the once-a-second heartbeat immediately
+            // (no relaunch); the same key can also be set with VORTX_PROBE=1 at launch.
+            choiceRow(String(localized: "Diagnostic logging"),
+                      [("0", "Off"), ("1", "On")],
+                      selection: Binding(get: { probeLogging ? "1" : "0" },
+                                         set: { probeLogging = ($0 == "1"); if probeLogging { VXProbeHeartbeat.start() } }))
+            Text("Logs detailed activity for troubleshooting.")
+                .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
         }
     }
 

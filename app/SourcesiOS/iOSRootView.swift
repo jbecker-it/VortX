@@ -70,6 +70,20 @@ struct iOSRootView: View {
             case .settings: return TabScrollKeys.settings
             }
         }
+
+        /// Stable, unlocalized route name fed to the VXProbe diagnostic facility (heartbeat + nav
+        /// events). Kept separate from `title` so probe output stays constant across locales.
+        var probeName: String {
+            switch self {
+            case .home: return "Home"
+            case .discover: return "Discover"
+            case .live: return "Live"
+            case .library: return "Library"
+            case .search: return "Search"
+            case .addons: return "Add-ons"
+            case .settings: return "Settings"
+            }
+        }
     }
 
     @State private var tab: Tab = .home
@@ -139,7 +153,12 @@ struct iOSRootView: View {
 
             customTabBar
         }
-        .onChange(of: tab) { visitedTabs.insert($0.rawValue) }   // lazy mount: remember every visit (#24)
+        .onChange(of: tab) { newTab in
+            visitedTabs.insert(newTab.rawValue)   // lazy mount: remember every visit (#24)
+            // Diagnostic-only: record the current surface for the heartbeat and log the tab switch.
+            VXProbeState.shared.setRoute(newTab.probeName)
+            VXProbe.event("nav", "tab \(newTab.probeName)")
+        }
         .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
@@ -1766,6 +1785,10 @@ struct iOSPlayerLaunch: Identifiable {
     /// When a natively-resolved debrid link launched this, its provenance so the play-record can store enough
     /// to reresolve a fresh link on a later CW resume. Carried on a CW debrid-reresolve; nil for torrent/direct.
     var debridRef: DebridPlaybackRef? = nil
+    /// True when this launch is the user's exact chosen source (a CW-card-tap that reresolved the SAME debrid
+    /// file), so PlayerScreen HONORS it on a start-timeout (retries in place) instead of silently hopping to a
+    /// different, lower-quality source. False for a stale-url replay / paste-a-link (which may hop normally).
+    var wasExplicitPick: Bool = false
     /// Series only: the season's ordered episodes + a resolver, so a Continue-Watching resume gets the
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
@@ -1785,6 +1808,11 @@ extension View {
                 url: item.url, title: item.title, headers: item.headers, resumeSeconds: item.resume,
                 recordMeta: item.meta, recordQualityText: item.qualityText,
                 recordBingeGroup: item.bingeGroup, recordIsTorrent: item.isTorrent,
+                // Carry native-debrid provenance + the explicit-pick flag so a CW-card-tap that reresolved the
+                // SAME source resumes it as the user's chosen pick (honored on a start-timeout, re-recorded for
+                // the next resume), not a stale replay that hops across every source. Defaults keep other
+                // launch paths (paste-a-link, downloads) unchanged.
+                recordDebridRef: item.debridRef, startedFromExplicitPick: item.wasExplicitPick,
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
@@ -1829,6 +1857,28 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         LastStreamStore.logResume("episodeMoved:\(cwVideo)|\(entry.videoId)", libraryId: item.id, profileID: pid); return nil
     }
     LastStreamStore.logResume("hit", libraryId: item.id, profileID: pid)
+    // Reresolve the EXACT stored source FIRST (same debrid file, fresh link) so the card tap resumes the source
+    // the user chose instead of replaying a stale, expired URL and dead-ending into the cross-source auto-pick
+    // ("Tried N sources / this source didn't load"). CWResume mints a fresh link for the SAME file when the
+    // entry carries debrid provenance; a non-debrid entry returns the stored url unchanged (refreshed == false),
+    // so torrent / plain-direct resumes are byte-identical to before.
+    let (resolvedURL, refreshed) = await CWResume.resolvedURL(for: entry)
+    let playURL = refreshed ? resolvedURL : url
+    let hashShort = (entry.infoHash?.prefix(8)).map(String.init) ?? "-"
+    var explicitDebridRef: DebridPlaybackRef? = nil
+    var wasExplicitPick = false
+    if refreshed, let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
+       let hash = entry.infoHash, !hash.isEmpty {
+        // Fresh link for the SAME source: resume it as an EXPLICIT pick (no silent hop), carrying the debrid
+        // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
+        explicitDebridRef = DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
+                                              torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
+                                              fileIdx: entry.fileIdx)
+        wasExplicitPick = true
+        NSLog("[cw-probe] ios directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
+    } else {
+        NSLog("[cw-probe] ios directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=NIL path=fallback-stored-url", entry.debridService ?? "-", hashShort, entry.fileIdx.map(String.init) ?? "-")
+    }
     // Re-prime the torrent engine before resuming: the stored loopback URL carries NO trackers, so without
     // this the server opens a peerless DHT-only engine that never sends data (the "sources didn't load" red
     // triangle on most CW torrent resumes). POST /{hash}/create with reachable trackers first; /create is
@@ -1889,10 +1939,11 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
             }
         }
     }
-    return iOSPlayerLaunch(url: url, title: entry.title, headers: entry.headers,
+    return iOSPlayerLaunch(url: playURL, title: entry.title, headers: entry.headers,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
-                           isTorrent: entry.torrent ?? false,
+                           isTorrent: refreshed ? false : (entry.torrent ?? false),
+                           debridRef: explicitDebridRef, wasExplicitPick: wasExplicitPick,
                            episodes: episodes, loadEpisode: loadEpisode)
 }
 

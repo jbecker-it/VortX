@@ -35,6 +35,16 @@ enum YouTubeDirectResolver {
         let isMuxed: Bool
     }
 
+    /// The User-Agent googlevideo REQUIRES for the URLs this resolver returns. googlevideo binds an issued
+    /// URL to the InnerTube client that minted it: replay it with a DIFFERENT UA (mpv's stock "Lavf/*", or
+    /// even the app's Safari-like default) and googlevideo answers 403, which surfaces in libmpv as
+    /// `endFileError reason=loading failed` and the "Trailer unavailable" overlay. Because the IOS client is
+    /// first in the ladder and answers on residential IPs, its UA is the one that matches the returned host;
+    /// the player MUST send this exact UA for both the video URL and the `--audio-file` sidecar. This is the
+    /// same string as `clients[0].ua` (the IOS entry), hoisted to a public constant the player can apply
+    /// without re-deriving the ladder. Keep it in lockstep with the IOS `Client.ua` below.
+    static let googlevideoUserAgent = "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
+
     /// Resolve `videoID` by walking the InnerTube client ladder (IOS -> ANDROID -> TVHTML5 embedded), returning
     /// on the first client that yields a usable format. `maxHeight` caps the adaptive pick (default 1080).
     /// `wantMuxedOnly`: a pure-AVPlayer context that cannot take an audio sidecar; the resolver then returns a
@@ -55,6 +65,12 @@ enum YouTubeDirectResolver {
                 await cache.set(cacheKey, resolved)
                 NSLog("[yt-direct] id=%@ client=%@ %@ h=%d",
                       videoID, client.name, resolved.isMuxed ? "muxed" : "adaptive", resolved.height)
+                // Verbose probe: the exact video host, whether an audio sidecar rides along, and the UA the
+                // player MUST replay both legs with. If a reproduce shows this UA but libmpv still 403s, the
+                // failure is a stale client identity (refresh the ladder), not a header-wiring bug.
+                NSLog("[yt-probe] videoHost=%@ sidecar=%@ requiredUA=%@",
+                      resolved.videoURL.host ?? "?", resolved.audioURL == nil ? "none" : (resolved.audioURL!.host ?? "?"),
+                      googlevideoUserAgent)
                 return resolved
             }
         }
@@ -88,7 +104,7 @@ enum YouTubeDirectResolver {
     private static let clients: [Client] = [
         Client(
             name: "IOS",
-            ua: "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+            ua: googlevideoUserAgent,   // the exact UA googlevideo binds the returned URLs to; see the constant above
             clientNameNum: 5,
             clientVersion: "21.02.3",
             context: [

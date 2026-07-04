@@ -176,20 +176,19 @@ struct TVServiceTile: View {
             if let slug = ProviderBrandLogo.bundledLogoName(for: provider.providerID),
                let bundled = BundledLogo.image(named: slug) {
                 // A mapped major ALWAYS shows its real bundled brand logo instantly - no network, no TMDB
-                // fill-crop, no letters. ~46% tile width, .fit so a wordmark or square icon stays whole and
-                // centered on the brand color, never edge-to-edge (matches the iOS/Mac treatment).
+                // fill-crop, no letters. The mark now FILLS the tile (owner: "logo should fill the pill"),
+                // .fit so a wordmark or square icon stays whole and centered on the brand color.
                 bundled
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: kHubCardWidth * 0.46, height: kHubCardWidth * 0.52 - 40)
+                    .frame(width: kHubCardWidth * 0.82, height: kHubCardWidth * 0.52 * 0.72)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if provider.logoURL != nil {
-                // Fallback for the long tail we don't bundle: the TMDB mark. ~46% tile width, .fit so a
-                // wordmark logo is never cropped ("properly sized mark on the brand color", not a full crop).
-                // `brandInitial` gives RemoteLogo a plated brand-initial to show while loading / on failure,
-                // so a long-tail tile is never an empty box (parity with iOS iOSServiceTile).
-                RemoteLogo(url: provider.logoURL, brandInitial: provider.name.prefix(1))
-                    .frame(width: kHubCardWidth * 0.46, height: kHubCardWidth * 0.52 - 40)
+                // Fallback for the long tail we don't bundle: the TMDB mark, filling the tile too, .fit so a
+                // wordmark logo is never cropped. `brandName` gives RemoteLogo the provider FULL NAME to show
+                // while loading / on failure, so a long-tail tile is never an empty box and never a bare letter.
+                RemoteLogo(url: provider.logoURL, brandName: provider.name)
+                    .frame(width: kHubCardWidth * 0.86, height: kHubCardWidth * 0.52 * 0.76)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Text(provider.name).font(.system(size: 24, weight: .bold)).foregroundStyle(.white)
@@ -230,9 +229,10 @@ struct TVGenreTile: View {
 /// (scrolled away) just retries on the next appear.
 struct RemoteLogo: View {
     let url: String?
-    /// The provider's brand initial, shown on the shared plate while the mark loads or on failure so a
-    /// long-tail tile is never an empty box (#95 parity with iOS iOSServiceTile). Empty hides the fallback.
-    var brandInitial: Substring = ""
+    /// The provider's FULL NAME, shown on the shared plate while the mark loads or on failure so a long-tail
+    /// tile is never an empty box and NEVER a bare single letter (owner: show the provider full name, e.g.
+    /// Hulu / Peacock, when there is no logo). Empty hides the fallback (parity with iOS iOSServiceTile).
+    var brandName: String = ""
     @State private var plated: Image?
     // The rasterized plate is 300x190 (see BundledLogo.Plate), so the SwiftUI fallback plate fits that same
     // aspect inside the caller's frame and stays pixel-consistent with a decoded+plated mark.
@@ -241,8 +241,8 @@ struct RemoteLogo: View {
         Group {
             if let plated {
                 plated.resizable().aspectRatio(contentMode: .fit)
-            } else if !brandInitial.isEmpty {
-                // Same warm near-white plate + dark ink the iOS tile uses; the initial reads on the plate
+            } else if !brandName.isEmpty {
+                // Same warm near-white plate + dark ink the iOS tile uses; the full name reads on the plate
                 // (>= 4.5:1). Fit the plate aspect inside the frame so it lands where the decoded mark would.
                 GeometryReader { geo in
                     let plateW = min(geo.size.width, geo.size.height * plateAspect)
@@ -250,9 +250,13 @@ struct RemoteLogo: View {
                     RoundedRectangle(cornerRadius: plateW * BundledLogo.plateCornerFraction, style: .continuous)
                         .fill(BundledLogo.plateFill)
                         .overlay(
-                            Text(brandInitial)
-                                .font(.system(size: plateH * 0.42, weight: .heavy))
-                                .foregroundStyle(Color.black.opacity(0.55))
+                            Text(brandName)
+                                .font(.system(size: plateH * 0.20, weight: .heavy))
+                                .foregroundStyle(Color.black.opacity(0.62))
+                                .multilineTextAlignment(.center)
+                                .lineLimit(2)
+                                .minimumScaleFactor(0.6)
+                                .padding(.horizontal, plateW * 0.10)
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: plateW * BundledLogo.plateCornerFraction, style: .continuous)

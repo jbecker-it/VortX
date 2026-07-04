@@ -1909,6 +1909,32 @@ struct iOSDetailView: View {
         // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
         guard !preparing, let stream = movieBest else { return }
         preparing = true; defer { preparing = false }
+        // EXACT-SOURCE RESUME (owner requirement): if this title was last played through a specific debrid
+        // source, resume THAT source directly (reresolve a fresh link for the same file) instead of re-running
+        // source selection across every add-on (the "Tried N sources / this source didn't load" failure). Only
+        // when the stored source is genuinely gone do we fall through to the auto-pick race below. Movies only
+        // (a series episode resumes via its own path); skipped when it is a torrent while torrents are off.
+        if !fromStart,
+           let entry = LastStreamStore.entry(for: moviePlaybackMeta.libraryId, profileID: ProfileStore.shared.activeID),
+           let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
+           let hash = entry.infoHash, !hash.isEmpty,
+           !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
+            let (url, refreshed) = await CWResume.resolvedURL(for: entry)
+            if refreshed {
+                core.loadEnginePlayer(for: stream)
+                let pm = moviePlaybackMeta
+                let resumeSeconds = await resume(pm)
+                presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: entry.headers,
+                                                    resume: resumeSeconds, meta: pm,
+                                                    qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
+                                                    isTorrent: false,
+                                                    debridRef: DebridPlaybackRef(url: url, service: service,
+                                                        infoHash: hash, torrentId: entry.debridTorrentId,
+                                                        fileId: entry.debridFileId, fileIdx: entry.fileIdx),
+                                                    wasExplicitPick: true))
+                return
+            }
+        }
         // CACHED DEBRID: a raw torrent the user's debrid serves plays as a direct link (fail-soft; no-key is
         // a zero-await nil → today's path). On a debrid hit we play a remote direct URL with isTorrent:false
         // and DON'T run primePlayback (no `/create`); otherwise `prime` stays true and the path is exactly
@@ -3203,6 +3229,11 @@ struct iOSSourceList: View {
                     emptyState
                 }
             } else {
+                // PINNED Singularity: float the best few community-corroborated sources into a labeled section
+                // at the VERY top, above the quality-grouped add-on sources, so at least one Singularity source
+                // is always visible without scrolling past a popular title's thousands of add-on rows. The rest
+                // stay reachable under the normal "Singularity" add-on group / the All-sources list below.
+                singularitySection
                 if showsPrimaryControls { controlBar }
                 if loading && progress.total > 0 {
                     Text("Still finding more · \(progress.loaded)/\(progress.total) add-ons")
@@ -3323,6 +3354,46 @@ struct iOSSourceList: View {
             // Open the list in the sort the user last chose, and remember any change (per the Settings default).
             .onAppear { sortMode = SourceSort(key: SourcePreferences.shared.defaultSourceSort) }
             .onChange(of: sortMode) { newValue in SourcePreferences.shared.defaultSourceSort = newValue.key }
+        }
+    }
+
+    // MARK: Pinned Singularity section
+
+    /// The best few community-corroborated Singularity sources, sliced from the already-ranked `groups`, so
+    /// at least one Singularity-labeled source is ALWAYS visible at the top without scrolling, even on a
+    /// popular title whose add-ons return thousands of rows that would otherwise bury it. Capped at
+    /// `pinnedSectionMax`; the full set stays under the normal "Singularity" add-on group / All-sources list.
+    private var pinnedSingularity: [CoreStream] { SourceIndexClient.pinnedStreams(from: groups) }
+
+    /// A pinned, labeled "Singularity" section rendered at the very top of the list. Empty pool → nothing
+    /// renders (pure pass-through). Rows reuse `streamRow`, so they tap / pin / download exactly like any
+    /// other source and stay clearly labeled "Singularity".
+    @ViewBuilder private var singularitySection: some View {
+        let pinned = pinnedSingularity
+        if !pinned.isEmpty {
+            VStack(alignment: .leading, spacing: Theme.Space.sm) {
+                HStack(spacing: Theme.Space.sm) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text(SourceIndexClient.groupAddon.uppercased())
+                        .font(Theme.Typography.eyebrow).tracking(1.5)
+                        .foregroundStyle(Theme.Palette.accent)
+                    Text("Community")
+                        .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textTertiary)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, Theme.Space.md)
+                .padding(.vertical, Theme.Space.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Theme.Palette.accent.opacity(0.14),
+                            in: RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Singularity community sources")
+                ForEach(Array(pinned.enumerated()), id: \.offset) { _, stream in
+                    streamRow(SourceIndexClient.groupAddon, stream)
+                }
+            }
         }
     }
 

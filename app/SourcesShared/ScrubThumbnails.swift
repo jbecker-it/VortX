@@ -196,11 +196,29 @@ final class ScrubThumbnailsStore: ObservableObject {
         // real frame as black - dropping them all before sessionFrames.append, with zero trace. isBlackImage is now
         // format-guarded (only samples a safe 8-bit/32-bpp buffer; any other layout is treated as NOT black so a
         // valid frame is never discarded on a format we can't sample), and the drop is logged so it is traceable.
-        if let cgImage = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil),
-           isBlackImage(cgImage) {
-            NSLog("[trickplay] dropping frame at %.0fs: near-black (unrendered)", time)
+        //
+        // SIZE-BASED OVERRIDE (task 3): a real detailed frame JPEG-compresses to tens of KB, while a truly black /
+        // unrendered frame compresses to ~2-4 KB. So a frame whose encoded JPEG is >= nonBlackByteFloor is DEFINITELY
+        // not black no matter what the pixel sampler reads (the sampler misfires on 10-bit/HDR frames). We only drop
+        // as near-black when BOTH the sampler says black AND the encoded size is small. The probe below logs the
+        // encoded size + sampler verdict + keep decision so every frame's fate is visible in the terminal log.
+        let nonBlackByteFloor = 8000
+        var samplerBlack = false
+        if let cgImage = decoded.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            samplerBlack = isBlackImage(cgImage)
+        }
+        let bigEnoughToBeReal = data.count >= nonBlackByteFloor
+        let kept = bigEnoughToBeReal || !samplerBlack
+        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=%@ kept=%@",
+              time, data.count, samplerBlack ? "true" : "false", kept ? "true" : "false")
+        if !kept {
+            NSLog("[trickplay] dropping frame at %.0fs: near-black (unrendered) bytes=%d", time, data.count)
             return nil
         }
+        #else
+        // Non-AppKit platforms have no pixel sampler here, so nothing is dropped as near-black; still emit the probe
+        // so the log shows the size verdict for every captured frame on every platform.
+        NSLog("[tp-probe] frame at %.0fs bytes=%d samplerBlack=n/a kept=true", time, data.count)
         #endif
         return decoded
     }
@@ -228,23 +246,34 @@ final class ScrubThumbnailsStore: ObservableObject {
     }
 
     /// Upload DURING playback so trickplay is never lost to a missing teardown (movie ends -> home, sleep,
-    /// auto-advance, or jetsam all skip the teardown flush below). Pushes once we have a useful set (~5 min in)
-    /// then again as coverage roughly doubles; the worker is overwrite-wins, so the fullest capture survives.
+    /// auto-advance, or jetsam all skip the teardown flush below). Called after EACH kept capture (~every 10s),
+    /// this now pushes progressively as soon as even ONE new kept frame beats the stored set: the old
+    /// `lastUploadedCount + perMinute` batch gate meant no upload fired during a normal watch, so mid-play
+    /// contribution never happened and only a teardown (which frequently never fires) could store anything. The
+    /// worker is overwrite-wins / keep-fuller, so each small push just improves the stored set.
     private func maybeUploadProgressively() {
-        // Push every ~1 MINUTE of new coverage so a watch never loses its tail no matter where it ends. The
-        // worker is overwrite-wins, so each push just improves the stored set; capture is ~every 10s, so a
-        // minute is ~6 frames.
-        let perMinute = max(1, Int(60.0 / Self.captureInterval))
+        // Minimum NEW kept frames since the last upload before we push again. 1 == push on every fresh kept frame
+        // (capture is ~every 10s, so effectively every ~10s of new coverage). This replaces the old ~1-minute
+        // batch so trickplay contributes live, not only at teardown.
+        let minNewFrames = 1
+        // Evaluate each guard clause up front so the probe can report WHY we do or do not upload this tick.
+        let enabled = CommunityTrickplay.isEnabled
+        let hasKey = communityKey != nil
+        let beatsStored = sessionFrames.count > communityExistingFrameCount   // keep-fuller: don't clobber a fuller set
+        let hasNewCoverage = sessionFrames.count >= lastUploadedCount + minNewFrames
+        let willUpload = enabled && hasKey && beatsStored && hasNewCoverage && communityImdb != nil
+        NSLog("[tp-probe] upload-gate frames=%d existing=%d lastUploaded=%d minNew=%d enabled=%@ hasKey=%@ imdb=%@ beatsStored=%@ hasNewCoverage=%@ -> %@",
+              sessionFrames.count, communityExistingFrameCount, lastUploadedCount, minNewFrames,
+              enabled ? "true" : "false", hasKey ? "true" : "false", communityImdb ?? "nil",
+              beatsStored ? "true" : "false", hasNewCoverage ? "true" : "false",
+              willUpload ? "UPLOAD" : "skip")
         // NOTE: the old `hasRealDuration` gate here blocked EVERY upload for a debrid direct-HTTP MKV, because
         // hasRealDuration is only set by mpv's `duration` event, which those streams frequently never deliver.
         // That is exactly the content the owner watches, so trickplay uploaded nothing (build 138 regression).
         // We upload under the provisional (meta.runtime) key instead: durationBucket rounding makes it match
         // the real-duration bucket in the common case, the worker is keep-fuller (a thin set never clobbers a
         // fuller one), and a later real-duration re-key re-uploads under the corrected key. Fully fail-soft.
-        guard CommunityTrickplay.isEnabled,
-              sessionFrames.count > communityExistingFrameCount,   // keep-fuller: only upload when we beat the stored set
-              sessionFrames.count >= lastUploadedCount + perMinute,
-              let key = communityKey, let imdb = communityImdb else { return }
+        guard willUpload, let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
     }
 
@@ -255,10 +284,18 @@ final class ScrubThumbnailsStore: ObservableObject {
         // No hasRealDuration gate (see maybeUploadProgressively) so a debrid MKV that never emitted mpv's
         // `duration` event still flushes on exit. Store even a tiny capture (>=1 frame) so a short watch or a
         // quick bug-test is never lost - the owner asked that even ~5s of coverage be stored + served.
-        guard CommunityTrickplay.isEnabled,
-              let key = communityKey, let imdb = communityImdb,
-              sessionFrames.count >= 1, sessionFrames.count > lastUploadedCount,
-              sessionFrames.count > communityExistingFrameCount else { return }
+        let enabled = CommunityTrickplay.isEnabled
+        let hasKey = communityKey != nil
+        let hasFrames = sessionFrames.count >= 1
+        let grewSinceUpload = sessionFrames.count > lastUploadedCount
+        let beatsStored = sessionFrames.count > communityExistingFrameCount
+        let willFlush = enabled && hasKey && hasFrames && grewSinceUpload && beatsStored && communityImdb != nil
+        NSLog("[tp-probe] teardown-flush frames=%d existing=%d lastUploaded=%d enabled=%@ hasKey=%@ hasFrames=%@ grewSinceUpload=%@ beatsStored=%@ -> %@",
+              sessionFrames.count, communityExistingFrameCount, lastUploadedCount,
+              enabled ? "true" : "false", hasKey ? "true" : "false", hasFrames ? "true" : "false",
+              grewSinceUpload ? "true" : "false", beatsStored ? "true" : "false",
+              willFlush ? "FLUSH" : "skip")
+        guard willFlush, let key = communityKey, let imdb = communityImdb else { return }
         pushUpload(key: key, imdb: imdb)
     }
 
@@ -270,6 +307,7 @@ final class ScrubThumbnailsStore: ObservableObject {
         let frames = sessionFrames
         let season = communitySeason, episode = communityEpisode
         let bucket = communityDurationBucket, height = communitySrcHeight
+        NSLog("[tp-probe] pushUpload FIRING key=%@ imdb=%@ frames=%d", key, imdb, frames.count)
         Task.detached(priority: .utility) {
             let ok = await CommunityTrickplay.buildAndUpload(
                 key: key, imdbId: imdb, season: season, episode: episode,

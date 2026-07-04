@@ -448,6 +448,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 // Diagnostic: a player stuck at .waitingToPlayAtSpecifiedRate (2) with a buffering wait-reason
                 // is the "mounts but never plays" signature; logging the reason pinpoints it in one test.
                 DiagnosticsLog.log("avplayer", "timeControlStatus=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                // Mirror the transport state + buffering wait into the probe so the heartbeat is meaningful
+                // on the AVPlayer path (DV / HLS). waitingToPlayAtSpecifiedRate is AVPlayer's "buffering".
+                let waiting = player.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                let stateText = player.timeControlStatus == .paused ? "paused"
+                    : (waiting ? "buffering" : "playing")
+                VXProbeState.shared.setPlayer(state: stateText, engine: "avplayer", buffering: waiting)
+                VXProbe.event("player", "stall \(waiting ? "start" : "end")")
                 self?.emit(MPVProperty.pause, player.timeControlStatus == .paused)
             }
         })
@@ -459,6 +466,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
             MainActor.assumeIsolated {
                 guard let self, self.timeObserver != nil else { return }
                 self.emit(MPVProperty.timePos, time.seconds)
+                // Push the play head (and duration when known) into the probe at the observer's own ~4 Hz.
+                let dur = self.item?.duration.seconds ?? 0
+                VXProbeState.shared.setPlayer(pos: time.seconds.isFinite ? Int(time.seconds) : 0,
+                                              dur: dur.isFinite && dur > 0 ? Int(dur) : nil,
+                                              engine: "avplayer")
                 self.updateSubtitleOverlay(atClock: time.seconds)   // sync external-sub overlay to the clock
                 // YouTube-style buffered-ahead edge: the end of the loaded range that CONTAINS the playhead
                 // (AVPlayer reports one or more loaded ranges). Emitting the same key libmpv uses lets the
@@ -504,11 +516,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 player.play()
                 player.rate = requestedRate
                 DiagnosticsLog.log("avplayer", "readyToPlay -> play() rate=\(requestedRate) tcs=\(player.timeControlStatus.rawValue) waitReason=\(player.reasonForWaitingToPlay?.rawValue ?? "none")")
+                let host = (item.asset as? AVURLAsset)?.url.host ?? "?"
+                VXProbeState.shared.setPlayer(state: "playing", source: host, engine: "avplayer")
+                VXProbe.event("player", "ready \(host)")
             }
         case .failed:
             let ns = item.error as NSError?
             let underlying = (ns?.userInfo[NSUnderlyingErrorKey] as? NSError).map { "\($0.domain)#\($0.code)" } ?? "none"
             DiagnosticsLog.log("avplayer", "item FAILED: \(ns?.localizedDescription ?? "?") domain=\(ns?.domain ?? "?") code=\(ns?.code ?? 0) underlying=\(underlying)")
+            VXProbe.event("player", "failed \(ns?.localizedDescription ?? "?")")
             guard !fatalErrorEmitted else { break }
             fatalErrorEmitted = true
             emit(MPVProperty.endFileError, item.error?.localizedDescription ?? "Playback failed")
@@ -517,11 +533,15 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
     }
 
-    @objc private func didPlayToEnd() { emit(MPVProperty.endFileEof, nil) }
+    @objc private func didPlayToEnd() {
+        VXProbe.event("player", "endfile eof")
+        emit(MPVProperty.endFileEof, nil)
+    }
     @objc private func failedToEnd(_ note: Notification) {
         guard !fatalErrorEmitted else { return }
         fatalErrorEmitted = true
         let err = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+        VXProbe.event("player", "endfile error \(err?.localizedDescription ?? "?")")
         emit(MPVProperty.endFileError, err?.localizedDescription ?? "Playback failed")
     }
 

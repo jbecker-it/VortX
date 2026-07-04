@@ -71,3 +71,4 @@ app/*.entitlements
 
 # runtime poster URLCache (PosterImageLoader diskPath)
 app/vortx-images/
+vortx-images/

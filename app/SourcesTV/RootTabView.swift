@@ -167,6 +167,21 @@ struct RootTabView: View {
         }
     }
 
+    /// Human-readable name for a tab tag, used for VXProbe route/nav probes. Matches the tab tags
+    /// (Live 6, Search 4, Add-ons 3, Settings 5) so a diagnostic log names the screen the user is on.
+    static func tabName(_ tag: Int) -> String {
+        switch tag {
+        case 0: return "Home"
+        case 1: return "Discover"
+        case 2: return "Library"
+        case 3: return "Add-ons"
+        case 4: return "Search"
+        case 5: return "Settings"
+        case 6: return "Live"
+        default: return "tab\(tag)"
+        }
+    }
+
     /// Selection binding that turns a re-select of the ALREADY-active tab into a scroll-to-top signal.
     /// tvOS `TabView` calls this setter when the user activates a tab item; when the new value equals the
     /// current selection (re-tapping the active tab) we bump that tab's token instead of a no-op set, so
@@ -221,10 +236,16 @@ struct RootTabView: View {
         .onAppear {
             applyTabBarAccent()
             updates.startMonitoring()   // launch check + hourly re-check while open
+            let name = Self.tabName(selection)
+            VXProbeState.shared.setRoute(name)
+            VXProbe.event("nav", "tab \(name)")
         }
         // Reset the tab being LEFT to its root, so returning to it lands on the root page.
-        .onChange(of: selection) { old, _ in
+        .onChange(of: selection) { old, new in
             if old >= 0, old < resetTokens.count { resetTokens[old] += 1 }
+            let name = Self.tabName(new)
+            VXProbeState.shared.setRoute(name)
+            VXProbe.event("nav", "tab \(name)")
         }
         // If Live is hidden while it was the selected tab (e.g. synced from another device), fall back to Home
         // so the TabView never points at a tag that no longer exists.

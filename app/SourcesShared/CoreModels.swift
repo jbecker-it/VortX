@@ -56,8 +56,12 @@ struct CoreCWItem: Decodable, Identifiable {
     /// from a local play-to-EOF, so nothing catches the marked-watched or watched-elsewhere cases. This is
     /// the data-layer backstop CoreBridge applies before publishing the rail.
     ///
-    /// - Movie: finished when the engine flagged it watched (`flaggedWatched`/`timesWatched > 0`) OR when
-    ///   progress is at/past the engine's own 0.9 credits threshold.
+    /// - Movie: finished when it is at/past the engine's own 0.9 credits threshold, OR when the engine
+    ///   flagged it watched (`flaggedWatched`/`timesWatched > 0`) AND it is not currently being re-watched.
+    ///   A movie the user finished once and is now re-watching has its offset reset to a low/mid value, so
+    ///   it sits in the live-in-progress band (`resumeFloor`…0.9); that must KEEP it in the rail so the
+    ///   rewatch shows and resumes, even though the watched counters are non-zero. A movie parked at the
+    ///   credits, or freshly flagged-watched with no active offset, has no in-progress position and clears.
     /// - Series: `timesWatched` counts WATCHED EPISODES, so a mid-series item has it high while still
     ///   actively resumable, meaning it must NOT gate the rail. The only safe finished signal for a series
     ///   is the CURRENT episode being at/past 0.9 (the finale, or the last episode, watched to the credits).
@@ -66,6 +70,11 @@ struct CoreCWItem: Decodable, Identifiable {
     var isFinished: Bool {
         let watchedToEnd = progress >= 0.9
         if type == "series" { return watchedToEnd }
+        // A live, resumable position (progress above the resume floor but below the finished ceiling)
+        // means an active watch/rewatch: keep it even if the watched counters are set.
+        let resumeFloor = 0.0
+        let inProgress = progress > resumeFloor && progress < 0.9
+        if inProgress { return false }
         return watchedToEnd || state.flaggedWatched > 0 || state.timesWatched > 0
     }
 }
@@ -104,6 +113,51 @@ struct CoreLibState: Decodable {
         self.videoId = videoId
         self.flaggedWatched = flaggedWatched
         self.timesWatched = timesWatched
+    }
+}
+
+// MARK: Continue-Watching exact-source resume
+
+/// The URL a Continue-Watching resume should hand the player for the EXACT source this title last played,
+/// PLUS whether that URL was freshly minted for that same source. Owner requirement: resume plays THAT
+/// source (source #3 the user chose), not a re-run of source selection across all add-ons.
+///
+/// When the stored entry carries native-debrid provenance (`debridService` + `infoHash`, recorded on play
+/// in `LastStreamStore.record`), we mint a FRESH direct link for that same file through the same provider
+/// via `DebridCoordinator.reresolve` (a single `requestdl` on TorBox's stored torrentId/fileId, no full
+/// add-on re-resolve, no auto-pick. Debrid links are time-limited and expire between sessions, so replaying
+/// the stored `url` alone dead-ends on "this source didn't load" and the player then hops across every
+/// source (the "Tried N sources" failure); reresolving the SAME source avoids that entirely.
+///
+/// Fail-soft and provenance-optional: an entry with no debrid ids (a plain-direct or torrent/loopback
+/// resume) returns the stored `url` unchanged with `refreshed == false`, so those paths are byte-identical.
+/// A debrid entry whose file is genuinely gone (reresolve throws `.notCached`/`.noKey`) also falls back to
+/// the stored `url`; the caller's existing player failover is the last resort only when the SAME source is
+/// truly unavailable.
+@MainActor
+enum CWResume {
+    /// Resolve the exact stored source to a playable URL. `refreshed` is true only when a fresh debrid link
+    /// was minted for the same file (the caller can then treat the URL as authoritative and skip its
+    /// stale-link failover priming). Never throws: any failure collapses to the stored `url`.
+    static func resolvedURL(for entry: LastStreamStore.Entry) async -> (url: URL, refreshed: Bool) {
+        let stored = URL(string: entry.url)
+        // No debrid provenance (plain-direct / torrent / usenet with no reresolve id): the stored link is
+        // all we have. Return it unchanged so these paths behave exactly as before.
+        guard let serviceRaw = entry.debridService, let service = DebridService(rawValue: serviceRaw),
+              let infoHash = entry.infoHash, !infoHash.isEmpty else {
+            return (stored ?? URL(fileURLWithPath: "/"), false)
+        }
+        // Mint a FRESH link for the SAME file through the SAME provider. On TorBox this is a single requestdl
+        // off the stored torrentId+fileId (no re-add); other providers re-add from the infoHash+fileIdx, still
+        // far cheaper than a full source re-resolve, and still the SAME source.
+        if let fresh = try? await DebridCoordinator.shared.reresolve(
+            service: service, infoHash: infoHash,
+            torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx) {
+            return (fresh, true)
+        }
+        // Same source is genuinely unavailable (evicted / no key): fall back to the stored link, letting the
+        // player's existing load-failure failover take over only now.
+        return (stored ?? URL(fileURLWithPath: "/"), false)
     }
 }
 
