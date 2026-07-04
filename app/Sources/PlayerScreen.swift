@@ -2909,24 +2909,18 @@ struct PlayerScreen: View {
 
     /// P4: extract the file's own embedded TEXT subtitle tracks off-main and upload each to the pool so users
     /// on a different rip benefit. Best-effort, once per session, never blocks playback; ignores failures.
+    /// LOCAL FILES (finished downloads) ONLY: extraction demuxes the whole container, so on a streamed play it
+    /// re-downloaded the entire file next to the player - the Apple TV "remux builds up frame drops and
+    /// distorted audio" regression (same code path here on iPhone/iPad/Mac), stacking a further never-cancelled
+    /// full-file read on every restart and episode switch. The extractor hard-refuses remote inputs too;
+    /// checking here skips spawning the task.
     private func uploadEmbeddedSubtitlesIfNeeded() {
         guard !embeddedUploadDone, let contentKey = communityContentKey else { return }
         embeddedUploadDone = true
+        let inputStr = (curURL ?? url).absoluteString
+        guard SubtitleEmbeddedExtractor.isLocalFileInput(inputStr) else { return }
         refreshSubFingerprint()
         let fp = subFingerprint
-        // Gate the extract to LOCAL / loopback sources only. `extractTextSubtitles` does an
-        // `avformat_open_input` + a full `av_read_frame` demux to EOF; on a debrid/direct REMOTE URL that
-        // re-opens and streams the whole file a SECOND time just to read subs, competing with playback for the
-        // debrid connection. libav can only reach the file's own text via that re-download (libmpv exposes just
-        // track lang/title, not cue text), so for remote sources we skip the extract entirely rather than pay a
-        // double-download. Local files + the loopback streaming server (torrents) are free to re-open locally.
-        let u = curURL ?? url
-        let isLocal = u.isFileURL || u.host == "127.0.0.1" || u.host == "localhost" || u.host == "::1"
-        guard isLocal else {
-            VXProbe.log("sing", "sub embedded-extract skipped remote host=\(u.host ?? "-")")
-            return
-        }
-        let inputStr = u.absoluteString
         Task.detached(priority: .utility) {
             let tracks = SubtitleEmbeddedExtractor.extractTextSubtitles(input: inputStr)
             for track in tracks where track.cueCount > 0 {
