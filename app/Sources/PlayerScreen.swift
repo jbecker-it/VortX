@@ -323,6 +323,14 @@ struct PlayerScreen: View {
     /// Transient engine notice ("Dolby Vision fallback…"), shown as a small capsule and auto-dismissed.
     @State private var engineNotice: String?
     @State private var engineNoticeTask: Task<Void, Never>?
+    /// AVPlayer-only START watchdog (parity with tvOS). AVPlayer can mount its surface and present chrome yet
+    /// never produce a playable frame (no item .failed, no timePos tick) for an undecodable/large DV link, so
+    /// the shared 30s loadTimeout leaves the user staring at dead chrome. When AVFoundation is the active engine
+    /// and no frame has arrived after `avStartWatchdogSeconds`, demote to libmpv IN PLACE on the SAME URL. A
+    /// stream that IS producing frames cancels this in the timePos handler, so a genuine play is never demoted.
+    /// NOT armed for libmpv (torrents legitimately warm up far longer under loadTimeout / torrent warm-up).
+    @State private var avStartWatchdog: Task<Void, Never>?
+    private let avStartWatchdogSeconds: Double = 5
     #endif
     @State private var loadErrorMsg = ""
     /// CW-resume only: set once we've waited for a freshly-loaded source after the stored link failed, so the
@@ -597,7 +605,7 @@ struct PlayerScreen: View {
             stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
             refreshTask?.cancel(); sleepTask?.cancel(); trickplayCaptureTimer?.cancel()
             #if os(iOS) || os(macOS)
-            engineNoticeTask?.cancel()
+            engineNoticeTask?.cancel(); avStartWatchdog?.cancel()
             #endif
             // Community trickplay: contribute this device's captured frames as a shared sprite-sheet
             // (first-writer-wins, background, gated; no-op if the community already had a set). Never
@@ -693,6 +701,9 @@ struct PlayerScreen: View {
                     hasStartedPlaying = true
                     loadTimeout?.cancel(); autoRetryTask?.cancel()
                     recoveryDeadline?.cancel(); recoveryDeadline = nil
+                    #if os(iOS) || os(macOS)
+                    avStartWatchdog?.cancel(); avStartWatchdog = nil   // a playable frame arrived: keep AVPlayer
+                    #endif
                     reconnecting = false; loadFailed = false
                     autoRetryCount = 0; stallRecoveries = 0
                     recordLastStream()              // remember this working link for CW direct-resume (parity with tvOS)
@@ -815,27 +826,10 @@ struct PlayerScreen: View {
             // can't open) or MID-PLAY, demotes to libmpv IN PLACE: flipping avEngineFailed swaps
             // playerSurface to the mpv engine, which re-loads initialPlayback from scratch. A DV attempt
             // must never dead-end on the source-error screen (owner invariant).
+            // A pre-first-frame failure demotes SILENTLY (no notice); a genuine mid-play decode failure keeps
+            // the informative DV notice. Either way it re-loads the SAME source on libmpv, never a source hop.
             if coordinator.player is AVPlayerEngineController, !avEngineFailed {
-                avEngineFailed = true
-                avDemotedAt = Date()
-                let resume = hasStartedPlaying ? currentTime : 0
-                if StreamRanking.isDolbyVision(recordQualityText ?? "") {
-                    showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
-                }
-                // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
-                appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
-                buffering = true; loadFailed = false; loadErrorMsg = ""
-                startLoadTimeout()
-                if resume > 5 { nudgeResume(to: resume) }
-                // The fresh mpv mount auto-loads the LAUNCH url; if this session had switched sources,
-                // re-point it at the ACTIVE one once the controller exists.
-                if let cu = curURL, cu != url {
-                    Task { @MainActor in
-                        try? await Task.sleep(for: .milliseconds(400))
-                        guard avEngineFailed, !Task.isCancelled else { return }
-                        loadIntoPlayer(cu, headers: curHeaders, live: isLive)
-                    }
-                }
+                demoteAVPlayerToMPV(silent: !hasStartedPlaying)
                 return
             }
             // Stale error from the just-dismounted AVPlayer engine (a queued event can land after the swap):
@@ -1302,6 +1296,9 @@ struct PlayerScreen: View {
     private func startLoadTimeout() {
         loadTimeout?.cancel()
         startRecoveryDeadline()   // arms the overall pre-start cap once; later hops leave it running
+        #if os(iOS) || os(macOS)
+        startAVStartWatchdog()    // AVPlayer-only fast, silent, in-place demote to libmpv when it mounts but never frames
+        #endif
         lastBufferedAtWatchdog = bufferedTime   // snapshot the buffered edge so the fire path can tell if bytes moved
         loadTimeout = Task { @MainActor in
             try? await Task.sleep(for: .seconds(30))
@@ -1498,6 +1495,57 @@ struct PlayerScreen: View {
             try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }
             withAnimation { engineNotice = nil }
+        }
+    }
+
+    /// Demote the active AVFoundation engine to libmpv IN PLACE, re-loading the SAME stream URL. Flipping
+    /// `avEngineFailed` re-renders `playerSurface` to the mpv surface on the SAME view, which re-loads
+    /// `initialPlayback` from scratch. This does NOT touch `sourceHops` and never calls `hopToNextSource`, so
+    /// it is not a failover attempt and the "trying another source" overlay never appears; libmpv just
+    /// tone-maps a DV link to HDR10 (an acceptable fallback). `silent` suppresses the DV notice: the no-frame
+    /// start watchdog demotes silently, while a genuine mid-play decode failure keeps the informative notice.
+    private func demoteAVPlayerToMPV(silent: Bool) {
+        avStartWatchdog?.cancel(); avStartWatchdog = nil
+        avEngineFailed = true
+        avDemotedAt = Date()
+        let resume = hasStartedPlaying ? currentTime : 0
+        if !silent, StreamRanking.isDolbyVision(recordQualityText ?? "") {
+            showEngineNotice("Dolby Vision isn't supported for this file. Playing HDR10 instead.")
+        }
+        // Treat the mpv mount as a fresh load: full timeout window, no stale error/overlay state.
+        appliedSize = false; appliedVolume = false; hasStartedPlaying = false; isSeekable = true
+        buffering = true; loadFailed = false; loadErrorMsg = ""
+        startLoadTimeout()
+        if resume > 5 { nudgeResume(to: resume) }
+        // The fresh mpv mount auto-loads the LAUNCH url; if this session had switched sources, re-point it at
+        // the ACTIVE one once the controller exists.
+        if let cu = curURL, cu != url {
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(400))
+                guard avEngineFailed, !Task.isCancelled else { return }
+                loadIntoPlayer(cu, headers: curHeaders, live: isLive)
+            }
+        }
+    }
+
+    /// AVPlayer-only START watchdog (see `avStartWatchdogSeconds`). If AVFoundation is the active engine and no
+    /// playable frame has arrived after the deadline, demote SILENTLY and IN PLACE to libmpv on the SAME URL,
+    /// not a source hop. Cancelled the instant the first frame lands (the timePos handler) or the view goes
+    /// away. NOT armed for libmpv (torrents warm up far longer, covered by loadTimeout / torrent warm-up).
+    private func startAVStartWatchdog() {
+        avStartWatchdog?.cancel()
+        guard useAVPlayerEngine, !avEngineFailed else { return }
+        // HLS belongs on AVPlayer (native ABR quality selector; libmpv has no equivalent), and a slow-network
+        // HLS start can legitimately take more than the short watchdog to first-frame. Never demote HLS on the
+        // no-frame timer: a genuinely-dead HLS link is still recovered by AVPlayer's own .failed path. The
+        // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
+        if PlayerEngineRouter.isHLS(url) { return }
+        avStartWatchdog = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+            guard !Task.isCancelled, !hasStartedPlaying, !loadFailed else { return }
+            guard coordinator.player is AVPlayerEngineController else { return }   // already on libmpv / torn down
+            NSLog("[Player] AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame, demoting to libmpv in place")
+            demoteAVPlayerToMPV(silent: true)
         }
     }
     #endif
@@ -3250,6 +3298,9 @@ struct PlayerScreen: View {
     @MainActor private func leavePlayback() {
         hideTask?.cancel(); loadTimeout?.cancel(); autoRetryTask?.cancel()
         stallWatchdog?.cancel(); recoveryDeadline?.cancel(); skipFetchTask?.cancel()
+        #if os(iOS) || os(macOS)
+        avStartWatchdog?.cancel()
+        #endif
         if !effectivelyLive, duration > 0 {
             onProgress(currentTime, duration)
             // A manual close at/near the end must clear Continue Watching too, not only a natural EOF. The

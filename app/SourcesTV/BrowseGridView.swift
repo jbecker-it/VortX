@@ -186,7 +186,9 @@ struct TVServiceTile: View {
             } else if provider.logoURL != nil {
                 // Fallback for the long tail we don't bundle: the TMDB mark. ~46% tile width, .fit so a
                 // wordmark logo is never cropped ("properly sized mark on the brand color", not a full crop).
-                RemoteLogo(url: provider.logoURL)
+                // `brandInitial` gives RemoteLogo a plated brand-initial to show while loading / on failure,
+                // so a long-tail tile is never an empty box (parity with iOS iOSServiceTile).
+                RemoteLogo(url: provider.logoURL, brandInitial: provider.name.prefix(1))
                     .frame(width: kHubCardWidth * 0.46, height: kHubCardWidth * 0.52 - 40)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
@@ -221,22 +223,58 @@ struct TVGenreTile: View {
     }
 }
 
-/// A small cached remote logo, `.fit`-scaled. Uses the shared URLCache (returnCacheDataElseLoad); a cancel
+/// A small cached remote logo, `.fit`-scaled, composited onto the SAME warm near-white plate the bundled
+/// majors use (#95): the bare TMDB mark drawn straight onto the dark brand tile read as "very dark", and a
+/// cropped w300 raster read as "incomplete"; plating the decoded mark makes it legible and keeps it whole,
+/// pixel-consistent with the iOS/Mac tiles. Uses the shared URLCache (returnCacheDataElseLoad); a cancel
 /// (scrolled away) just retries on the next appear.
 struct RemoteLogo: View {
     let url: String?
-    @State private var image: UIImage?
+    /// The provider's brand initial, shown on the shared plate while the mark loads or on failure so a
+    /// long-tail tile is never an empty box (#95 parity with iOS iOSServiceTile). Empty hides the fallback.
+    var brandInitial: Substring = ""
+    @State private var plated: Image?
+    // The rasterized plate is 300x190 (see BundledLogo.Plate), so the SwiftUI fallback plate fits that same
+    // aspect inside the caller's frame and stays pixel-consistent with a decoded+plated mark.
+    private let plateAspect: CGFloat = 300.0 / 190.0
     var body: some View {
         Group {
-            if let image { Image(uiImage: image).resizable().aspectRatio(contentMode: .fit) }
-            else { Color.clear }
+            if let plated {
+                plated.resizable().aspectRatio(contentMode: .fit)
+            } else if !brandInitial.isEmpty {
+                // Same warm near-white plate + dark ink the iOS tile uses; the initial reads on the plate
+                // (>= 4.5:1). Fit the plate aspect inside the frame so it lands where the decoded mark would.
+                GeometryReader { geo in
+                    let plateW = min(geo.size.width, geo.size.height * plateAspect)
+                    let plateH = plateW / plateAspect
+                    RoundedRectangle(cornerRadius: plateW * BundledLogo.plateCornerFraction, style: .continuous)
+                        .fill(BundledLogo.plateFill)
+                        .overlay(
+                            Text(brandInitial)
+                                .font(.system(size: plateH * 0.42, weight: .heavy))
+                                .foregroundStyle(Color.black.opacity(0.55))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: plateW * BundledLogo.plateCornerFraction, style: .continuous)
+                                .stroke(.black.opacity(0.10), lineWidth: 1)
+                        )
+                        .frame(width: plateW, height: plateH)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+            } else {
+                Color.clear
+            }
         }
         .task(id: url) { await load() }
     }
     private func load() async {
         guard let url, let u = URL(string: url) else { return }
         var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
-        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) { image = img }
+        // Composite the decoded mark onto the shared plate so the long tail matches the bundled majors. The
+        // plate is a rounded rect a touch wider than tall, so the caller's `.fit` sees a mark already padded
+        // and centered; a wide wordmark aspect-fits inside the plate instead of shrinking to nothing.
+        if let (data, _) = try? await URLSession.shared.data(for: req),
+           let img = UIImage(data: data) { plated = BundledLogo.plated(img) }
     }
 }
 

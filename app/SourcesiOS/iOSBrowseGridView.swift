@@ -174,6 +174,12 @@ struct iOSServiceTile: View {
     /// The provider mark sits at a medium, first-party size on the brand color - never a zoomed crop (H1).
     /// ~44% of the tile width keeps a wordmark logo legible without touching the tile edges.
     private var markSize: CGFloat { width * 0.44 }
+    /// The warm near-white plate behind a REMOTE (unbundled) mark (#95). It is a touch larger than `markSize`
+    /// so, after the shared inset, the mark itself still lands at ~the medium size; corner + inset are derived
+    /// from the same fractions the rasterized bundled/remote plate uses, so both stay pixel-consistent.
+    private var plateSize: CGFloat { width * 0.52 }
+    private var plateCorner: CGFloat { plateSize * BundledLogo.plateCornerFraction }
+    private var plateInset: CGFloat { plateSize * BundledLogo.plateInsetFraction }
 
     var body: some View {
         // Clean, dedicated brand tile (H1): the provider's official TMDB mark, sized medium and centered on
@@ -196,19 +202,33 @@ struct iOSServiceTile: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(maxWidth: markSize, maxHeight: markSize)
             } else if let logo = provider.logoURL, let url = URL(string: logo) {
-                // Fallback for the long tail we don't bundle: the TMDB mark. .fit so it's shown WHOLE (never
-                // cropped); the max frame is the medium mark size, so a square icon or a wide wordmark both
-                // land at a sane, consistent scale centered on the tile.
-                AsyncImage(url: url) { img in
-                    img.resizable().aspectRatio(contentMode: .fit)
-                } placeholder: {
-                    // While the logo streams in, show the brand initial so the tile is never a blank box
-                    // (H19c: the old opaque-blur AsyncImage collapsed to an empty box on Home).
-                    Text(provider.name.prefix(1))
-                        .font(.system(size: markSize * 0.6, weight: .heavy))
-                        .foregroundStyle(.white.opacity(0.85))
-                }
-                .frame(maxWidth: markSize, maxHeight: markSize)
+                // Fallback for the long tail we don't bundle: the TMDB mark, on the SAME warm near-white plate
+                // the bundled majors use (#95: the bare mark drawn straight onto the dark brand tile read as
+                // "very dark"; a cropped w300 raster read as "incomplete"). The mark is aspect-fit and centered
+                // inside the plate, never cropped; the light plate makes even a dark square app-icon legible.
+                // The brand initial stays as the load/failure fallback so the tile is never a blank box.
+                RoundedRectangle(cornerRadius: plateCorner, style: .continuous)
+                    .fill(BundledLogo.plateFill)
+                    .frame(width: plateSize, height: plateSize)
+                    .overlay(
+                        AsyncImage(url: url) { img in
+                            img.resizable().aspectRatio(contentMode: .fit)
+                        } placeholder: {
+                            // While the logo streams in (or on failure), show the brand initial so the tile is
+                            // never a blank box (H19c: the old opaque-blur AsyncImage collapsed to an empty box).
+                            Text(provider.name.prefix(1))
+                                .font(.system(size: markSize * 0.6, weight: .heavy))
+                                // Dark ink on the warm near-white plate (>= 4.5:1). textPrimary is #F6F1E9
+                                // (near white) and drew invisible on the ~0.96 plate; a dark neutral reads.
+                                .foregroundStyle(Color.black.opacity(0.55))
+                        }
+                        .padding(plateInset)
+                    )
+                    // Hairline edge so even a light mark keeps a visible plate boundary (matches the raster plate).
+                    .overlay(
+                        RoundedRectangle(cornerRadius: plateCorner, style: .continuous)
+                            .stroke(.black.opacity(0.10), lineWidth: 1)
+                    )
             } else {
                 Text(provider.name)
                     .font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
@@ -400,7 +420,9 @@ struct iOSReorderServicesView: View {
             ForEach(model.providers) { provider in
                 HStack(spacing: Theme.Space.md) {
                     ZStack {
-                        Theme.Palette.surface2
+                        // The warm near-white plate (#95) so a dark provider mark is legible in the reorder
+                        // list too, matching the plated tiles on Home/Discover rather than a dark-on-dark chip.
+                        BundledLogo.plateFill
                         if let logo = provider.logoURL, let url = URL(string: logo) {
                             AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fit) } placeholder: { Color.clear }
                                 .padding(7)

@@ -135,10 +135,13 @@ struct TVPlayerView: View {
     // playable frame (no item error, no timePos tick). The real fix is in AVPlayerEngineController
     // (automaticallyWaitsToMinimizeStalling = false + explicit play() + the [.initial,.new] status race fix),
     // so a working stream now starts within a second or two; this watchdog is only the SAFETY NET for a
-    // genuinely stuck stream, set generously so a slow 4K / Dolby Vision start is never killed mid-buffer. It
-    // routes to the SAME libmpv fallback the .failed case uses. AVPlayer-only: libmpv torrents warm up longer.
+    // genuinely stuck stream. A working AVPlayer stream produces its first frame within a second or two, so a
+    // no-frame mount is dead weight, not slow-buffering: 5s is long enough to clear a real start yet short
+    // enough that the SILENT in-place demote to libmpv (which just tone-maps a DV link to HDR10) plays the SAME
+    // source in about 5s instead of stalling 12s on dead chrome. It routes to the SAME libmpv fallback the
+    // .failed case uses. AVPlayer-only: libmpv torrents warm up far longer under the 30s loadTimeout budget.
     @State private var avStartWatchdog: Task<Void, Never>?
-    private let avStartWatchdogSeconds: Double = 12
+    private let avStartWatchdogSeconds: Double = 5
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -1807,9 +1810,11 @@ struct TVPlayerView: View {
         guard useAVPlayerEngine, isAVPlayerActive else { return false }
         avStartWatchdog?.cancel(); avStartWatchdog = nil
         coordinator.player?.stop()
-        // AVPlayer can't demux this container (commonly DV-in-MKV, or Profile 7 dual-layer): surface why,
-        // so the demote stops being silent and the user knows to pick an MP4 source for true Dolby Vision.
-        showEngineNote("AVPlayer can't play this file (likely Dolby Vision in MKV). Using the built-in player, which tone-maps to HDR10/SDR. For true Dolby Vision, pick an MP4 source.")
+        // SILENT demote. Flipping `avEngineFailed` re-renders `playerSurface` to the mpv surface on the SAME
+        // view, which re-loads the SAME stream URL (initialPlayback.url) on libmpv. It does NOT increment
+        // `sourceHops` and never calls `hopToNextSource`, so this is not a failover attempt and the
+        // "Source failed, trying another (N/4)" banner (gated on `sourceHops > 0`) never shows. libmpv just
+        // tone-maps a DV link to HDR10, an acceptable fallback, so no toast is surfaced.
         avEngineFailed = true
         return true
     }
@@ -1917,6 +1922,11 @@ struct TVPlayerView: View {
     private func startAVStartWatchdog() {
         avStartWatchdog?.cancel()
         guard useAVPlayerEngine, !forceMPV, !avEngineFailed else { return }
+        // HLS belongs on AVPlayer (native ABR quality selector; libmpv has no equivalent), and a slow-network
+        // HLS start can legitimately take more than the short watchdog to first-frame. Never demote HLS on the
+        // no-frame timer: a genuinely-dead HLS link is still recovered by AVPlayer's own .failed path. The
+        // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
+        if PlayerEngineRouter.isHLS(url) { return }
         avStartWatchdog = Task { @MainActor in
             try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
             guard !Task.isCancelled, !hasStartedPlaying else { return }

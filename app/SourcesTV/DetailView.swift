@@ -1722,7 +1722,36 @@ struct CoreStreamList: View {
     /// skips `prepareTorrent` (no `/create`); the player keys torrent behaviour off the URL shape, so it
     /// treats this as a direct stream automatically (no warm-up, no `closeTorrent`).
     private func play(_ stream: CoreStream) {
+        // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
+        // the trailer path (isTrailer:true, meta:nil) so a dead trailer hits TVPlayerView's isTrailer guard
+        // ("Trailer unavailable") and STOPS, instead of failing over to the title's content streams and
+        // playing the actual movie. Every normal content stream still goes through `playResolving` unchanged.
+        if stream.isYouTubeTrailer {
+            Task { @MainActor in await playTrailerStream(stream) }
+            return
+        }
         Task { await playResolving(stream, explicit: true) }   // a tapped source row / quality pick: honor it in the player
+    }
+
+    /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
+    /// built-in `trailerChip` does: resolve the YouTube id device-direct first (InnerTube on the user's own
+    /// IP, adaptive 1080p+ with an audio sidecar), and only on a miss fall back to the worker `/yt/{id}` URL
+    /// WITH a `?lang=` hint so the worker returns the user's dub. Tagged `isTrailer: true` (dead link shows
+    /// "Trailer unavailable", never hops to content) with NO meta (no Continue-Watching, no auto-next).
+    @MainActor private func playTrailerStream(_ stream: CoreStream) async {
+        let name = title.isEmpty ? "Trailer" : "\(title) Trailer"
+        if let yt = stream.youTubeTrailerID,
+           let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
+            NSLog("[yt-direct] tvOS trailer row: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+            presenter.request = PlaybackRequest(url: resolved.videoURL, title: name,
+                                                isTrailer: true, audioSidecarURL: resolved.audioURL)
+            return
+        }
+        // Device-direct missed: the worker URL WITH the language hint (the plain `playableURL` appends none).
+        guard let url = stream.youTubeTrailerWorkerURL(languageCode: TMDBClient.trailerLanguageBaseCode)
+                ?? stream.playableURL else { return }
+        NSLog("[yt-direct] tvOS trailer row: fallback-worker")
+        presenter.request = PlaybackRequest(url: url, title: name, isTrailer: true)
     }
 
     /// AUTO-PICK play (the "Watch Now" button + resolution long-press): race the top few CACHED sources in
@@ -1760,7 +1789,13 @@ struct CoreStreamList: View {
     /// `explicit`: true when the user tapped this exact source row / quality (honor it in the player, no
     /// silent hop on a start-timeout); false when it is the auto Watch-Now single-resolve fallback.
     @MainActor private func playResolving(_ stream: CoreStream, explicit: Bool) async {
-        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(for: stream) {
+        // INSTANT FIRST-PLAY: cache-gate the manual resolve on the account-confirmed sets so only a genuinely
+        // cached pick runs the blocking debrid resolve (~1 round trip to the direct link); a not-confirmed pick
+        // returns nil with zero network and falls straight through to the embedded path below, which plays in a
+        // snap (its own playableURL + prepareTorrent) exactly like the pre-511c973 instant path.
+        if let direct = await DebridCoordinator.shared.resolvedPlaybackURL(
+            for: stream, confirmedCachedHashes: debridCache.cachedHashes,
+            confirmedUsenetURLs: debridCache.cachedUsenetURLs) {
             core.loadEnginePlayer(for: stream)
             presenter.request = PlaybackRequest(url: direct, title: title, meta: meta, episodes: episodes,
                                                 sourceHint: StreamRanking.signature(stream), torrent: false,

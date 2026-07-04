@@ -625,6 +625,26 @@ struct CoreStream: Decodable, Identifiable {
         return URL(string: "\(StremioServer.base)/\(hash)/\(fileIdx ?? 0)")
     }
 
+    /// The bare YouTube id of an `isYouTubeTrailer` source-list stream (a trailer add-on's `{ "ytId": "…" }`
+    /// row), or nil for any other stream. Lets the trailer-tap paths resolve such a row the SAME reliable
+    /// way as the built-in Trailer chip (device-direct InnerTube first, worker `/yt` fallback) instead of
+    /// only the plain worker URL in `playableURL`.
+    var youTubeTrailerID: String? {
+        guard isYouTubeTrailer, let ytId, !ytId.isEmpty else { return nil }
+        return ytId
+    }
+
+    /// Language-aware worker fallback URL for an `isYouTubeTrailer` stream: `trailer.vortx.tv/yt/{id}` with a
+    /// `?lang=` hint so the worker's own fallback chain (user-lang -> en -> original) returns the user's dub
+    /// (e.g. Italian). This differs from `playableURL`, which appends no language. Used only after the
+    /// device-direct resolver misses; nil for any non-trailer stream. Mirrors `TrailerRequest`'s worker shape.
+    func youTubeTrailerWorkerURL(languageCode: String?) -> URL? {
+        guard let yt = youTubeTrailerID else { return nil }
+        var c = URLComponents(string: "\(StremioServer.trailerResolverBase)/yt/\(yt)")
+        if let lang = languageCode, !lang.isEmpty { c?.queryItems = [URLQueryItem(name: "lang", value: lang)] }
+        return c?.url
+    }
+
     /// HTTP request headers the add-on declares this stream NEEDS (behaviorHints.proxyHeaders):
     /// some add-ons front CDNs that reject requests without a specific Referer or browser
     /// User-Agent. Official clients apply these; the player must too or the stream 403s.

@@ -571,8 +571,9 @@ struct UpcomingEpisodesRow: View {
     @ObservedObject private var apiKeys = ApiKeys.shared
 
     /// Match `PosterCard`'s landscape-vs-portrait width so the per-card caption lines up under the card.
+    /// Portrait cards follow the user's Poster Style width preset (#105), same mapping as `PosterCard.cardWidth`.
     private var captionWidth: CGFloat {
-        (catalogPrefs.landscapeCards && apiKeys.hasTMDB) ? kLandscapeCardWidth : kPosterWidth
+        (catalogPrefs.landscapeCards && apiKeys.hasTMDB) ? kLandscapeCardWidth : catalogPrefs.posterWidth.tvWidth
     }
 
     var body: some View {

@@ -7,12 +7,13 @@ import Foundation
 enum WhatsNew {
     static let version = "0.3.10"
     static let highlights: [String] = [
+        "Playback starts right away again. Tapping a source, or Watch Now, now begins in a second or two instead of loading for up to half a minute and flashing \"source failed\" first. When a source cannot open on the native player it falls back to the built-in player on the same source instantly, so you get the source you picked rather than a lower-quality one, and HLS and Dolby Vision still play on the native player.",
         "Posters are bigger by default. Catalog and rail cards now open at a larger, more cinematic size out of the box on iPhone, iPad, and Mac, and you can still tune the size in Settings, Appearance, Poster Style.",
         "Continue Watching now clears titles you have finished. A movie you watched to the end, marked as watched, or finished on another device no longer lingers in the row, and a series you are partway through still shows so you can pick up the next episode.",
         "The Streaming Services logos are now clearly legible. Every brand mark sits on a clean light plate, so marks like Apple TV+ and Paramount+ no longer blend into their tile.",
         "Account sync no longer silently drops a change when two devices save at the same moment, and your add-on order now stays consistent across your devices and the web dashboard.",
         "A cleaner, more cinematic look: full-bleed artwork, a bold new Play button, and a more spacious, premium layout across the app. On Mac the design now uses the full width of the window, with a larger hero and a roomier reading column instead of a stretched phone layout.",
-        "Dolby Vision now plays from Dolby Vision MKV files, with true DV passthrough (turn it on in Settings). When a file can't do true DV (unsupported profile or audio), playback now falls back to HDR10 automatically instead of erroring, and the engine never switches mid-movie.",
+        "Dolby Vision now plays from Dolby Vision MKV files, with true DV passthrough (turn it on in Settings). Dual-layer Profile 7 files, the kind most 4K Blu-ray rips use, now play as true Dolby Vision too instead of tone-mapping to HDR10. When a file genuinely can't do true DV (no Dolby Vision data or unsupported audio), playback still falls back to HDR10 automatically instead of erroring, and the engine never switches mid-movie.",
         "Community subtitles now appear in the player's subtitle panel again when you are signed in to VortX, are selectable, and load and stay in sync, plus an \"also available in\" language row on every title.",
         "Add-on subtitles reliably appear in the player's subtitle panel again, including on streams that never report a duration.",
         "Continue Watching resumes faster and more reliably, straight from your debrid account.",

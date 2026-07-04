@@ -2,8 +2,12 @@ import SwiftUI
 
 #if canImport(UIKit)
 import UIKit
+/// The decoded platform image the plate compositor operates on (UIImage on iOS / iPadOS / tvOS).
+typealias VXImage = UIImage
 #elseif canImport(AppKit)
 import AppKit
+/// The decoded platform image the plate compositor operates on (NSImage on macOS).
+typealias VXImage = NSImage
 #endif
 
 /// Bundled, first-party brand marks for the "Streaming Services" tiles, shared by every native Apple target
@@ -82,14 +86,47 @@ enum BundledLogo {
         else { return nil }
         #if canImport(UIKit)
         guard let uiImage = UIImage(contentsOfFile: url.path) else { return nil }
-        return Image(uiImage: platedLogo(uiImage))
+        return plated(uiImage)
         #elseif canImport(AppKit)
         guard let nsImage = NSImage(contentsOf: url) else { return nil }
-        return Image(nsImage: platedLogo(nsImage))
+        return plated(nsImage)
         #else
         return nil
         #endif
     }
+
+    /// Composite an ALREADY-DECODED mark (a downloaded remote logo, e.g. a TMDB/JustWatch provider raster)
+    /// onto the SAME warm near-white plate the bundled marks use, and return it as a SwiftUI Image. This is
+    /// the runtime twin of `image(named:)`: it lets the long-tail providers we don't bundle share ONE plate
+    /// look with the majors, so a dark or brand-hued regional mark is legible on its dark tile instead of
+    /// reading as invisible (#95 "icons are very dark"). Pure image compositing, so it is safe to call off
+    /// the main thread (e.g. from a background decode) as well as inline. Returns nil only on an unsupported
+    /// platform.
+    static func plated(_ logo: VXImage) -> Image? {
+        #if canImport(UIKit)
+        return Image(uiImage: platedLogo(logo))
+        #elseif canImport(AppKit)
+        return Image(nsImage: platedLogo(logo))
+        #else
+        return nil
+        #endif
+    }
+
+    // MARK: Brand plate (shared surface tokens)
+
+    /// The plate's warm off-white fill exposed as a SwiftUI Color, plus its corner radius, so the iOS/Mac
+    /// tiles that plate a REMOTE mark with a SwiftUI backing surface (rather than a rasterized composite) can
+    /// paint the exact same plate look and stay pixel-consistent with the rasterized bundled/remote marks.
+    static var plateFill: Color {
+        Color(.sRGB, red: Plate.fillR, green: Plate.fillG, blue: Plate.fillB, opacity: 1)
+    }
+    /// The plate corner radius as a fraction of the plate WIDTH, so a caller can scale it to any tile size
+    /// (the raster plate is 300 wide with a 34pt corner). Keeps the SwiftUI backing plate's rounding in step
+    /// with the rasterized plate regardless of the tile's on-screen size.
+    static var plateCornerFraction: CGFloat { Plate.corner / Plate.width }
+    /// The plate's content inset as a fraction of the plate WIDTH, so a SwiftUI backing plate pads the mark
+    /// the same generous amount the raster plate does.
+    static var plateInsetFraction: CGFloat { Plate.inset / Plate.width }
 
     // MARK: Brand plate
 

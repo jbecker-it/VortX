@@ -324,6 +324,36 @@ struct iOSDetailView: View {
         var wasExplicitPick: Bool = false
     }
 
+    /// A resolved TRAILER row ready to hand to PlayerScreen with `isTrailer: true` (Identifiable so the
+    /// cover can drive it). Carries no PlaybackMeta so a trailer never lands in Continue Watching; the
+    /// `audioSidecar` is set when a video-only adaptive yt pick rides mpv's --audio-file sidecar. Shared by
+    /// the movie source list (via the `Presentation.trailerPlayer` case) and `iOSEpisodeStreams` (#95).
+    struct TrailerLaunch: Identifiable {
+        let id = UUID()
+        let url: URL
+        let title: String
+        var audioSidecar: URL? = nil
+    }
+
+    /// #95: resolve a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) into a `TrailerLaunch`
+    /// the SAME reliable way the built-in Trailer button does: the YouTube id device-direct first (InnerTube
+    /// on the user's own IP, adaptive 1080p+ with an audio sidecar), and only on a miss the worker `/yt/{id}`
+    /// URL WITH a `?lang=` hint so the worker returns the user's dub. Shared by the movie source list and
+    /// `iOSEpisodeStreams` so the resolve logic lives in ONE place; each caller assigns the result to its own
+    /// trailer state. Returns nil only when there is no playable trailer URL at all.
+    static func resolveTrailerLaunch(for stream: CoreStream, title: String) async -> TrailerLaunch? {
+        if let yt = stream.youTubeTrailerID,
+           let resolved = await YouTubeDirectResolver.resolve(videoID: yt, maxHeight: 1080) {
+            NSLog("[yt-direct] trailer row: %@ h=%d", resolved.isMuxed ? "direct-muxed" : "direct-pair", resolved.height)
+            return TrailerLaunch(url: resolved.videoURL, title: title, audioSidecar: resolved.audioURL)
+        }
+        // Device-direct missed: the worker URL WITH the language hint (the plain `playableURL` appends none).
+        guard let url = stream.youTubeTrailerWorkerURL(languageCode: TMDBClient.trailerLanguageBaseCode)
+                ?? stream.playableURL else { return nil }
+        NSLog("[yt-direct] trailer row: fallback-worker")
+        return TrailerLaunch(url: url, title: title, audioSidecar: nil)
+    }
+
     /// The LIVE page's fixed artwork band (the VOD hero scales with the viewport via `heroBandHeight`).
     private var backdropHeight: CGFloat {
         #if os(macOS)
@@ -1905,7 +1935,12 @@ struct iOSDetailView: View {
                                                 isTorrent: false, debridRef: win.ref))
             return
         }
-        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
+        // INSTANT FIRST-PLAY: the parallel-cached race above already tried every confirmed-cached candidate, so
+        // this single-resolve fallback on the ranked best cache-gates too: a not-confirmed best returns a nil
+        // ref with zero network and primes+plays the embedded torrent instantly instead of blocking.
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+            for: stream, confirmedCachedHashes: debridCache.cachedHashes,
+            confirmedUsenetURLs: debridCache.cachedUsenetURLs)
         guard let url = ref?.url ?? stream.playableURL else { return }
         let prime = ref == nil
         if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
@@ -1920,15 +1955,37 @@ struct iOSDetailView: View {
                                             isTorrent: !prime && stream.isTorrent, debridRef: ref))
     }
 
+    /// #95: play a source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable way the
+    /// built-in Trailer button (`playTrailer`) does. The resolve logic is shared with `iOSEpisodeStreams` via
+    /// `resolveTrailerLaunch`; here it is presented through `.trailerPlayer` (isTrailer:true, meta:nil) so a
+    /// dead trailer shows "Trailer unavailable" and never hops to content.
+    private func playTrailerStream(_ stream: CoreStream) async {
+        let name = "\(moviePlaybackMeta.name) Trailer"
+        guard let launch = await iOSDetailView.resolveTrailerLaunch(for: stream, title: name) else { return }
+        presentation = .trailerPlayer(url: launch.url, title: launch.title, audioSidecar: launch.audioSidecar)
+    }
+
     /// Play an arbitrary chosen movie source (a tapped source-list row). `url` is the source's
     /// `playableURL`; a cached-debrid raw torrent overrides it with the direct link (fail-soft, no-key
     /// byte-identical — see `DebridCoordinator.resolvedPlaybackURL`).
     private func playStream(_ stream: CoreStream, url: URL) async {
+        // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) is NOT a content stream. Route it to
+        // the trailer player (isTrailer:true, no meta) so a dead trailer shows "Trailer unavailable" and STOPS
+        // instead of failing over to content and playing the actual movie. Content streams fall through below.
+        if stream.isYouTubeTrailer {
+            await playTrailerStream(stream)
+            return
+        }
         // A4b: no longer gated on `meta != nil` — a hub-opened title with nil meta still plays a tapped source
         // row off its seed identity (the source list itself renders without meta, so its rows must be playable).
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
-        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream)
+        // INSTANT FIRST-PLAY: cache-gate the manual resolve on the account-confirmed sets, so only a genuinely
+        // cached tap runs the blocking resolve; a not-confirmed tap returns a nil ref with zero network and
+        // primes+plays the embedded torrent instantly, exactly the pre-511c973 tap-to-play snap.
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+            for: stream, confirmedCachedHashes: debridCache.cachedHashes,
+            confirmedUsenetURLs: debridCache.cachedUsenetURLs)
         let prime = ref == nil
         if prime { primePlayback(stream) } else { core.loadEnginePlayer(for: stream) }
         let pm = moviePlaybackMeta
@@ -2451,7 +2508,25 @@ struct iOSEpisodeStreams: View {
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var theme: ThemeManager
 
-    @State private var player: iOSDetailView.PlayerLaunch?
+    /// The episode's full-screen cover content: a resolved content stream (`player`) or a #95 trailer row
+    /// (`trailer`, isTrailer:true / no meta). Driven from ONE `@State` so only one cover is ever attached
+    /// (see the note on `presentation`); reuses the movie view's `PlayerLaunch` / `TrailerLaunch` payloads.
+    enum Presentation: Identifiable {
+        case player(iOSDetailView.PlayerLaunch)
+        case trailer(iOSDetailView.TrailerLaunch)
+        var id: String {
+            switch self {
+            case .player(let l): "player-\(l.id)"
+            case .trailer(let t): "trailer-\(t.id)"
+            }
+        }
+    }
+
+    // A SINGLE presentation slot drives the episode's full-screen cover (player OR trailer), mirroring
+    // iOSDetailView.presentation: on macOS `platformFullScreenPlayerCover(item:)` becomes `.sheet(item:)`,
+    // and two sheets attached to the same view shadow each other, so a #95 trailer cover added ALONGSIDE the
+    // player cover could stop Watch from presenting. One enum-typed slot guarantees exactly one cover.
+    @State private var presentation: Presentation?
     @State private var preparing = false
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
@@ -2551,19 +2626,29 @@ struct iOSEpisodeStreams: View {
         }
         // TorBox search-as-a-source for the show (gated on a TorBox key; de-duped by imdb id inside refresh).
         .onAppear { torboxSearch.refresh(imdbId: showImdbID); refreshSourceIndex() }
-        .platformFullScreenPlayerCover(item: $player) { launch in
-            PlayerScreen(
-                url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
-                recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
-                startedFromExplicitPick: launch.wasExplicitPick,
-                episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
-                loadEpisode: { await loadEpisodeStream($0) },
-                warmNextEpisode: { await warmEpisodeStream($0) },
-                onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                onClose: { player = nil }
-            )
-            .ignoresSafeArea()
+        .platformFullScreenPlayerCover(item: $presentation) { item in
+            switch item {
+            case .player(let launch):
+                PlayerScreen(
+                    url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
+                    recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
+                    startedFromExplicitPick: launch.wasExplicitPick,
+                    episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
+                    loadEpisode: { await loadEpisodeStream($0) },
+                    warmNextEpisode: { await warmEpisodeStream($0) },
+                    onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
+                    onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
+                    onClose: { presentation = nil }
+                )
+                .ignoresSafeArea()
+            case .trailer(let launch):
+                // #95: a tapped trailer row plays in the SAME native player as a stream but with isTrailer:true
+                // and no recordMeta, so a dead trailer shows "Trailer unavailable" and never hops to content.
+                PlayerScreen(url: launch.url, title: launch.title, headers: nil, resumeSeconds: 0,
+                             recordMeta: nil, isTrailer: true, audioSidecarURL: launch.audioSidecar,
+                             onClose: { presentation = nil })
+                    .ignoresSafeArea()
+            }
         }
     }
 
@@ -2655,6 +2740,17 @@ struct iOSEpisodeStreams: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// #95: play an episode source-list TRAILER row (an `isYouTubeTrailer` `ytId` stream) the SAME reliable
+    /// way the movie source list and the Trailer button do. The resolve logic is shared via
+    /// `iOSDetailView.resolveTrailerLaunch`; here it is presented via `.trailer` (isTrailer:true, meta:nil) so
+    /// a dead trailer shows "Trailer unavailable" and never hops to the episode content. Presents nothing on a
+    /// nil resolve (no playable trailer URL) rather than falling through to content.
+    private func playTrailerStream(_ stream: CoreStream) async {
+        let name = "\(meta.name) Trailer"
+        guard let launch = await iOSDetailView.resolveTrailerLaunch(for: stream, title: name) else { return }
+        presentation = .trailer(launch)
+    }
+
     /// Play the tapped source: prime the engine + torrent (same path as the movie list), then present
     /// the native player carrying the stream's proxy headers.
     ///
@@ -2666,6 +2762,14 @@ struct iOSEpisodeStreams: View {
     /// silent hop on a start-timeout); false when it is an auto fallback (the ranked-best Watch path /
     /// the parallel-cached race's single-resolve fallback), which may hop normally.
     private func play(_ stream: CoreStream, url: URL, explicit: Bool = true) async {
+        // #95: a tapped TRAILER row (a Streailer/YouTube `ytId` source) inside an episode source list is NOT a
+        // content stream. Route it to the trailer player (isTrailer:true, no meta) so a dead trailer shows
+        // "Trailer unavailable" and STOPS instead of failing over to and playing the actual episode. This is
+        // the FIRST check, before any content resolution/prime; content streams fall through unchanged below.
+        if stream.isYouTubeTrailer {
+            await playTrailerStream(stream)
+            return
+        }
         guard !preparing else { return }
         preparing = true; defer { preparing = false }
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
@@ -2681,10 +2785,10 @@ struct iOSEpisodeStreams: View {
         let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                               name: meta.name, poster: video.thumbnail ?? meta.poster,
                               season: video.season, episode: video.episode)
-        player = iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
+        presentation = .player(iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
-                                            isTorrent: isTorrent, debridRef: ref, wasExplicitPick: explicit)
+                                            isTorrent: isTorrent, debridRef: ref, wasExplicitPick: explicit))
     }
 
     /// AUTO-PICK play for the episode "Watch in <quality>" button: race the top few CACHED candidates
@@ -2711,10 +2815,10 @@ struct iOSEpisodeStreams: View {
             let pm = PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
                                   name: meta.name, poster: video.thumbnail ?? meta.poster,
                                   season: video.season, episode: video.episode)
-            player = iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
+            presentation = .player(iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
                                                 resume: await resume(pm), meta: pm,
                                                 qualityText: StreamRanking.signature(win.stream),
-                                                isTorrent: false, debridRef: win.ref)
+                                                isTorrent: false, debridRef: win.ref))
             return
         }
         preparing = false   // release before the fallback, which re-guards on `preparing` inside `play`
@@ -2735,7 +2839,9 @@ struct iOSEpisodeStreams: View {
     /// `PlaybackMeta`, so play-from-local records progress against the right episode. Device-local only.
     private func downloadStream(_ stream: CoreStream, url: URL) async {
         let ep = video.season.flatMap { s in video.episode.map { DebridEpisode(season: s, episode: $0) } }
-        let (ref, isTorrent) = await playbackRef(for: stream, episode: ep)
+        // A download is not a tap: keep the unconditional (non-cache-gated) resolve so it still resolves a
+        // debrid direct link for an uncached-but-servable pick, exactly as before this play-path change.
+        let (ref, isTorrent) = await playbackRef(for: stream, episode: ep, cacheGated: false)
         // A raw torrent downloads through the loopback server, which must be told to /create the torrent
         // first; the play path primes it, the download path didn't, so the row's download died (#21).
         if isTorrent {
@@ -2756,10 +2862,18 @@ struct iOSEpisodeStreams: View {
     /// for a raw torrent. Mirrors the movie view's helper; returns `(ref, false)` when debrid served it
     /// (the ref carries the URL + reresolve provenance), else `(nil, stream.isTorrent)` so the caller uses
     /// `stream.playableURL`. Fail-soft and no-key byte-identical.
-    private func playbackRef(for stream: CoreStream, episode: DebridEpisode?) async -> (ref: DebridPlaybackRef?, isTorrent: Bool) {
-        if let ref = await DebridCoordinator.shared.resolvedPlaybackRef(for: stream, episode: episode) {
-            return (ref, false)
-        }
+    ///
+    /// INSTANT FIRST-PLAY: by default (`cacheGated`) the resolve is cache-gated on the account-confirmed sets,
+    /// so a manual tap / auto fallback only blocks on a genuinely cached pick and otherwise falls straight
+    /// through to the embedded torrent path (pre-511c973 snap). The DOWNLOAD path passes `cacheGated: false`
+    /// to keep its unconditional resolve (a download isn't a tap and can afford the add-then-poll).
+    private func playbackRef(for stream: CoreStream, episode: DebridEpisode?,
+                             cacheGated: Bool = true) async -> (ref: DebridPlaybackRef?, isTorrent: Bool) {
+        let ref = await DebridCoordinator.shared.resolvedPlaybackRef(
+            for: stream, episode: episode,
+            confirmedCachedHashes: cacheGated ? debridCache.cachedHashes : nil,
+            confirmedUsenetURLs: cacheGated ? debridCache.cachedUsenetURLs : nil)
+        if let ref { return (ref, false) }
         return (nil, stream.isTorrent)
     }
 

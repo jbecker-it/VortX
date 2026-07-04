@@ -273,20 +273,30 @@ actor TorBoxResolver: DebridResolving {
         return env.data
     }
 
-    /// Poll the library by infohash until the torrent is ready (cached should be ~1 poll). Streaming
-    /// timeout ~30s; uncached downloads surface as `.notReady` for the caller to fall back to the engine.
+    /// Poll the library by infohash until the torrent is ready (a CONFIRMED-cached torrent should be ready on
+    /// the first poll or two). Fast-fails an uncached add as `.notReady` for the caller to fall back to the
+    /// engine, mirroring the RealDebrid active-download early-out: a genuinely-cached torrent reports ready
+    /// almost immediately, so if THIS hash surfaces in the list but is NOT ready after one grace poll it is
+    /// actively downloading (was not cached) and will never finish inside the play-time budget: bail now
+    /// instead of looping ~30s. A hash that never surfaces still gets the full poll window (it may be settling
+    /// into the list).
     private func pollByHash(_ hash: String, into torrentId: inout Int?) async throws -> [DebridFile] {
         for attempt in 0..<10 {
-            try Task.checkCancellation()   // a losing leg of the parallel cached-race (or the 15s bound) cancels the group: stop polling promptly, don't keep hitting the provider
+            try Task.checkCancellation()   // a losing leg of the parallel cached-race (or the resolve bound) cancels the group: stop polling promptly, don't keep hitting the provider
             if attempt > 0 { try? await Task.sleep(nanoseconds: 3_000_000_000) }   // 3s between polls
             guard let url = URL(string: "\(Self.base)/mylist?bypass_cache=true") else { break }
             let env: Envelope<[Item]> = try await get(url)
             // Match the torrent for THIS hash (newly added or promoted from the queue); ready when cached/
             // completed with files present.
-            if let mine = (env.data ?? []).first(where: { $0.hash?.lowercased() == hash && $0.ready && !($0.files ?? []).isEmpty }) {
+            let mineForHash = (env.data ?? []).first(where: { $0.hash?.lowercased() == hash })
+            if let mine = mineForHash, mine.ready, !(mine.files ?? []).isEmpty {
                 torrentId = mine.id
                 return (mine.files ?? []).map(file(from:))
             }
+            // NOT-CACHED FAST-FAIL: the hash is in the account but not ready after one grace poll = an active,
+            // uncached download. Stop here so a false-cached tap reaches a truly-cached source in ~1s instead
+            // of hanging the poll loop.
+            if attempt >= 1, mineForHash != nil { throw DebridError.notReady }
         }
         throw DebridError.notReady
     }
@@ -912,11 +922,13 @@ extension CoreStream {
 }
 
 extension DebridCoordinator {
-    /// Streaming-settle ceiling for an in-line resolve, matched to the source-list settle window: a CACHED
-    /// torrent resolves in ~1 round trip, so 15s comfortably covers it while bounding a stall (an uncached
-    /// add-then-poll, a flaky provider, a hung network) so the play action never hangs the UI. On timeout the
-    /// resolve Task is cancelled and the caller falls soft to the local engine.
-    private static let resolveTimeout: Duration = .seconds(15)
+    /// Streaming-settle ceiling for an in-line resolve. A CONFIRMED-cached torrent resolves in ~1 round trip,
+    /// so 5s comfortably covers it while bounding a stall (a flaky provider, a hung network) so the play action
+    /// never hangs the UI. On timeout the resolve Task is cancelled and the caller falls soft to the local
+    /// engine. Kept tight (was 15s) because the manual play path now only resolves CONFIRMED-cached picks (a
+    /// not-confirmed pick returns nil with zero network and falls straight through), so nothing here should ever
+    /// need an add-then-poll window; a resolve that has not produced a link in 5s is a stall, not a slow cache.
+    private static let resolveTimeout: Duration = .seconds(5)
 
     /// The single bridge from a tapped/auto-picked RAW TORRENT to a debrid DIRECT link for playback.
     ///
@@ -934,21 +946,37 @@ extension DebridCoordinator {
     /// - Parameters:
     ///   - stream: the stream the user is about to play.
     ///   - episode: the SxEy target for a series, so a season-pack resolves the right file. `nil` for movies.
-    func resolvedPlaybackURL(for stream: CoreStream, episode: DebridEpisode? = nil) async -> URL? {
-        await resolvedPlaybackRef(for: stream, episode: episode)?.url
+    ///   - confirmedCachedHashes: when non-nil, a raw torrent only resolves if its infoHash is in this set (an
+    ///     account-confirmed `DebridCacheAwareness.cachedHashes`); a not-confirmed pick returns nil with ZERO
+    ///     network so the caller falls through to the instant embedded path. Pass this on the MANUAL/single
+    ///     play paths to keep a tap instant. nil (the default) keeps the pre-gate behaviour for callers that
+    ///     already pre-filter to cached candidates (`resolveFirstPlayable`) or want an unconditional resolve.
+    ///   - confirmedUsenetURLs: the usenet parallel of `confirmedCachedHashes` (account-confirmed nzb links).
+    func resolvedPlaybackURL(for stream: CoreStream, episode: DebridEpisode? = nil,
+                             confirmedCachedHashes: Set<String>? = nil,
+                             confirmedUsenetURLs: Set<String>? = nil) async -> URL? {
+        await resolvedPlaybackRef(for: stream, episode: episode,
+                                  confirmedCachedHashes: confirmedCachedHashes,
+                                  confirmedUsenetURLs: confirmedUsenetURLs)?.url
     }
 
     /// The same bounded, fail-soft resolve as `resolvedPlaybackURL`, but returning the full
     /// `DebridPlaybackRef` (URL + provider + reresolve ids) so the play-record can persist enough to
     /// later refresh an expired link. `resolvedPlaybackURL` is a thin `?.url` wrapper over this, so every
     /// guarantee (raw-torrent-only, no-key zero-await nil, timeout → nil) is identical.
-    func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil) async -> DebridPlaybackRef? {
+    func resolvedPlaybackRef(for stream: CoreStream, episode: DebridEpisode? = nil,
+                             confirmedCachedHashes: Set<String>? = nil,
+                             confirmedUsenetURLs: Set<String>? = nil) async -> DebridPlaybackRef? {
         // USENET first: a stream with an `.nzb` link (and no direct `url`) resolves through the TorBox
         // usenet backend, gated on a TorBox key. With no TorBox key `hasUsenetResolver` is false, so this
         // returns nil on the first line (zero await) — a usenet row then behaves exactly as today (no
         // playable link). NOT a torrent: the minted URL is a plain direct stream (no infoHash carried).
         if stream.url == nil, let nzb = stream.nzbUrl, !nzb.isEmpty {
             guard hasUsenetResolver else { return nil }
+            // CACHE-GATE (instant first-play): when the caller passed a confirmed-cached set, a not-confirmed
+            // usenet row returns nil here with ZERO network (no add-then-poll), so a tap falls straight through
+            // to today's embedded path instead of burning the resolve budget. nil set = pre-gate behaviour.
+            if let confirmed = confirmedUsenetURLs, !confirmed.contains(nzb) { return nil }
             let mustInclude = stream.fileMustInclude
             let fileIdx = stream.fileIdx
             let knownHash = stream.usenetKnownHash
@@ -975,6 +1003,13 @@ extension DebridCoordinator {
         guard stream.url == nil, let hash = stream.infoHash?.lowercased(), !hash.isEmpty else { return nil }
         // No-key fast path: zero await, zero behaviour change. This is the byte-identical guarantee.
         guard hasAnyResolver else { return nil }
+        // CACHE-GATE (instant first-play, restores pre-511c973 snap): when the caller passed a confirmed-cached
+        // set, only a pick whose infoHash is account-confirmed cached runs the blocking resolve (~1 round trip
+        // to the instant direct link). A NOT-confirmed pick returns nil here with ZERO network, no createtorrent,
+        // no pollByHash, no timeout burn, so the caller falls straight through to the pre-regression embedded
+        // path (the row's own playableURL + prepareTorrent) and plays in a snap. nil set (the default) keeps the
+        // pre-gate behaviour for `resolveFirstPlayable`'s already-cached-filtered legs and any unconditional caller.
+        if let confirmed = confirmedCachedHashes, !confirmed.contains(hash) { return nil }
 
         // Build the magnet from the infohash (+ the add-on's `sources`, which carry trackers some providers
         // use to add the magnet); fileIdx biases the season-pack pick when present, the episode SxEy refines it.

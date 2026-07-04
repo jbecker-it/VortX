@@ -37,6 +37,13 @@ enum PosterWidthPreset: String, CaseIterable, Identifiable {
         }
     }
 
+    /// The card/track width in points on tvOS. The `regularWidth` ladder is tuned for iPad/Mac (`.balanced`
+    /// = 224); tvOS posters sit on the `kPosterWidth` = 200 baseline, so each preset scales `regularWidth` by
+    /// 200/224. This keeps the SAME relative ladder while landing the 10-foot grid at its shipping proportions.
+    var tvWidth: CGFloat {
+        (regularWidth * 200.0 / 224.0).rounded()
+    }
+
     /// The card/track width in points on a COMPACT width class (iPhone portrait). `.balanced` equals today's
     /// `iOSPillMetrics.gridPosterWidthCompact` (116) so the default phone grid is byte-for-byte unchanged.
     var compactWidth: CGFloat {
@@ -134,7 +141,10 @@ enum CatalogPrefsStore {
     /// Poster width preset (default `.balanced` = today's look). Read as a plain static so card/grid views
     /// can size off the main actor.
     static func widthPreset() -> PosterWidthPreset {
-        (UserDefaults.standard.string(forKey: widthKey)).flatMap(PosterWidthPreset.init(rawValue:)) ?? .large
+        // No stored key => `.balanced`, the shipping default the doc comments + iOS describe. This is the ONE
+        // shared source for both iOS and tvOS, so the fallback fixes both defaults at once. `.balanced.tvWidth`
+        // == 200 == kPosterWidth (the historical tvOS proportion); the old `.large` fell back to 286pt/320pt.
+        (UserDefaults.standard.string(forKey: widthKey)).flatMap(PosterWidthPreset.init(rawValue:)) ?? .balanced
     }
     static func setWidthPreset(_ p: PosterWidthPreset) { UserDefaults.standard.set(p.rawValue, forKey: widthKey) }
 

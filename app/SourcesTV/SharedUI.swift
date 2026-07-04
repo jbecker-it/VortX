@@ -11,12 +11,6 @@ let kPosterWidth: CGFloat = 200
 /// the 300pt poster height, so each rail reads as a cinematic stripe while shrinking vertically).
 let kLandscapeCardWidth: CGFloat = 390
 
-/// In-memory poster cache, on top of the shared URLCache (disk). Decoded images, evicted under memory
-/// pressure. Keyed by URL so a poster shown in several rails decodes once.
-private let posterMemoryCache: NSCache<NSURL, UIImage> = {
-    let c = NSCache<NSURL, UIImage>(); c.countLimit = 400; return c
-}()
-
 /// Poster artwork with a warm placeholder and the system card radius. Not focusable on its own;
 /// `PosterCard` wraps it in the focusable button.
 ///
@@ -27,9 +21,14 @@ private let posterMemoryCache: NSCache<NSURL, UIImage> = {
 struct PosterArt: View {
     let poster: String?
     var width: CGFloat = kPosterWidth
+    /// Poster corner radius, defaulting to the system card radius. `PosterCard` passes the user's
+    /// `posterRadius` preset so the Poster Style corner-radius control is honored on tvOS (#105).
+    var radius: CGFloat = Theme.Radius.card
     @State private var image: UIImage?
     @State private var failed = false
-    init(_ poster: String?, width: CGFloat = kPosterWidth) { self.poster = poster; self.width = width }
+    init(_ poster: String?, width: CGFloat = kPosterWidth, radius: CGFloat = Theme.Radius.card) {
+        self.poster = poster; self.width = width; self.radius = radius
+    }
 
     /// Paint instantly (no task hop, no blank frame) when the decoded image is already in memory, mirroring the
     /// iOS `CachedPosterImage`. The `.task` still runs to load a cold poster; on a warm one it returns at once.
@@ -51,7 +50,7 @@ struct PosterArt: View {
             }
         }
         .frame(width: width, height: width * 1.5)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
         .task(id: poster) { await load() }
     }
 
@@ -441,14 +440,9 @@ struct BrowseHeroBackdrop: View {
     }
 
     private func fetchHeroImage(_ raw: String) async -> UIImage? {
-        guard !raw.isEmpty, let url = URL(string: raw) else { return nil }
-        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
-        var req = URLRequest(url: url)
-        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
-        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
-              let img = UIImage(data: data) else { return nil }
-        posterMemoryCache.setObject(img, forKey: url as NSURL)
-        return img
+        // Shared loader: dedicated large URLCache, bounded concurrency, off-main ImageIO decode, retry. The
+        // living-hero backdrop is a wide 16:9 image, so allow a larger downsample ceiling to keep it crisp.
+        await PosterImageLoader.load(raw, maxPixel: 1280)
     }
 }
 
@@ -464,6 +458,9 @@ struct LandscapeArt: View {
     let title: String
     let poster: String?
     var width: CGFloat = kLandscapeCardWidth
+    /// Poster corner radius, defaulting to the system card radius. `PosterCard` passes the user's
+    /// `posterRadius` preset so the Poster Style corner-radius control is honored on tvOS (#105).
+    var radius: CGFloat = Theme.Radius.card
     @State private var image: UIImage?
     @State private var logo: UIImage?
     @State private var usedBackdrop = false
@@ -492,7 +489,7 @@ struct LandscapeArt: View {
             }
         }
         .frame(width: width, height: height)
-        .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: radius, style: .continuous))
         .task(id: id ?? poster ?? "") { await load() }
     }
 
@@ -529,14 +526,11 @@ struct LandscapeArt: View {
     }
 
     private func fetch(_ raw: String?) async -> UIImage? {
-        guard let raw, !raw.isEmpty, let url = URL(string: raw) else { return nil }
-        if let cached = posterMemoryCache.object(forKey: url as NSURL) { return cached }
-        var req = URLRequest(url: url)
-        req.cachePolicy = .returnCacheDataElseLoad   // art is immutable: prefer the shared disk cache
-        guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled,
-              let img = UIImage(data: data) else { return nil }
-        posterMemoryCache.setObject(img, forKey: url as NSURL)
-        return img
+        guard let raw, !raw.isEmpty else { return nil }
+        // Shared loader: dedicated large URLCache, bounded concurrency, off-main ImageIO decode, retry. 16:9
+        // backdrops are wider than portrait posters, so allow a larger downsample ceiling to keep the art crisp.
+        // Returns nil (without latching a failure) on a scroll-away cancel so the card retries on the next appear.
+        return await PosterImageLoader.load(raw, maxPixel: 1280)
     }
 }
 
@@ -553,7 +547,11 @@ struct PosterCard: View {
     /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
     /// every non-CW card, so their tiles are unchanged.
     var resumeSeconds: Double? = nil
-    var width: CGFloat = kPosterWidth
+    /// Explicit PORTRAIT card width, for callers that lay cards into FIXED grid cells (TVCategoryBrowse's
+    /// 4-across grid) and need the card to EXACTLY fill its cell. nil = the self-sizing rails/surfaces, which
+    /// honor the user's Poster Style width preset (#105). A fixed-cell caller MUST pass its cell width or the
+    /// preset (134-286pt) overflows the fixed cell and cards overlap their neighbours (#28/#104).
+    var width: CGFloat? = nil
     /// Explicit LANDSCAPE card width, for callers that lay cards into FIXED grid cells (TVCategoryBrowse's
     /// 4-across grid). Landscape mode ignores `width` (all rails share one cinematic width), so without
     /// this a fixed-cell grid rendered full-size landscape cards inside narrower cells and neighbouring
@@ -576,9 +574,13 @@ struct PosterCard: View {
     /// a TMDB key: without one every backdrop falls back to the blurred-poster composite, so keyless
     /// users keep the clean portrait grid until they add a key (Settings > API keys).
     private var landscape: Bool { catalogPrefs.landscapeCards && apiKeys.hasTMDB }
-    /// Landscape cards use one cinematic width (or the caller's explicit grid-cell width); portrait
-    /// cards honor the caller's `width`.
-    private var cardWidth: CGFloat { landscape ? (landscapeWidth ?? kLandscapeCardWidth) : width }
+    /// Landscape cards use one cinematic width (or the caller's explicit grid-cell width); portrait cards
+    /// honor an EXPLICIT caller width (a fixed grid cell) when given, else the user's Poster Style width
+    /// preset (#105). Self-sizing rails/surfaces pass nothing (`width == nil`), so the preset drives their
+    /// portrait size everywhere; only a fixed-cell grid passes its cell width so the card fills the cell.
+    private var cardWidth: CGFloat {
+        landscape ? (landscapeWidth ?? kLandscapeCardWidth) : (width ?? catalogPrefs.posterWidth.tvWidth)
+    }
 
     var body: some View {
         if menu == .none {
@@ -607,9 +609,9 @@ struct PosterCard: View {
             VStack(alignment: .leading, spacing: Theme.Space.sm) {
                 Group {
                     if landscape {
-                        LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth)
+                        LandscapeArt(id: id, type: type, title: displayTitle, poster: PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     } else {
-                        PosterArt(PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth)
+                        PosterArt(PosterArtwork.poster(id: id, fallback: displayPoster), width: cardWidth, radius: catalogPrefs.posterRadius.radius)
                     }
                 }
                     .overlay(alignment: .bottom) {
@@ -628,12 +630,14 @@ struct PosterCard: View {
                                 .accessibilityLabel("Resumes at \(timecode)")
                         }
                     }
-                Text(displayTitle)
-                    .font(.system(size: 18, weight: .medium))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .foregroundStyle(Theme.Palette.textSecondary)
-                    .frame(width: cardWidth, alignment: .leading)
+                if !catalogPrefs.hidePosterLabels {
+                    Text(displayTitle)
+                        .font(.system(size: 18, weight: .medium))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .frame(width: cardWidth, alignment: .leading)
+                }
             }
             // Read the card as one element so VoiceOver says the title and the resume
             // timecode together, not a stray "1:03" after the title.
