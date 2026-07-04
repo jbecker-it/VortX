@@ -7,6 +7,7 @@ struct HomeView: View {
     @EnvironmentObject private var theme: ThemeManager
     @EnvironmentObject private var account: StremioAccount
     @EnvironmentObject private var profiles: ProfileStore
+    @EnvironmentObject private var presenter: PlayerPresenter   // gates the ambient hero trailer off while the player is up
     @StateObject private var focusModel = FocusedItemModel()
     @StateObject private var topPicks = TopPicksModel()   // local recommendations from this profile's history
     @StateObject private var releaseCalendar = ReleaseCalendarModel()   // "Upcoming Episodes" from the series library (next 45 days)
@@ -48,8 +49,13 @@ struct HomeView: View {
                     // `false` force-disables ambient hero trailers fleet-wide (e.g. if the trailer worker
                     // is degraded). Baked default true => absent/null remote is identical to shipping; the
                     // user's "Auto-play trailers" setting still governs.
+                    // `presenter.request == nil` (PR #106): the player presents OVER this shell, which stays
+                    // mounted (opacity-hidden), so without this gate the hero clip's libmpv instance kept
+                    // decoding its looping 1080p trailer under the whole movie (micro stutter + audio crackle
+                    // on every stream). Unmounting tears it down the moment the player presents; it remounts
+                    // fresh on close.
                     if autoplayTrailers, RemoteConfig.snapshot.isFeatureOn("trailers", default: true),
-                       !reduceMotion, let url = heroTrailer.url {
+                       !reduceMotion, presenter.request == nil, let url = heroTrailer.url {
                         TVInHeroTrailerView(url: url)
                             .ignoresSafeArea()
                             .allowsHitTesting(false)
