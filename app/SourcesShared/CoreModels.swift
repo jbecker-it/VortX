@@ -136,9 +136,16 @@ struct CoreLibState: Decodable {
 /// truly unavailable.
 @MainActor
 enum CWResume {
-    /// Resolve the exact stored source to a playable URL. `refreshed` is true only when a fresh debrid link
-    /// was minted for the same file (the caller can then treat the URL as authoritative and skip its
-    /// stale-link failover priming). Never throws: any failure collapses to the stored `url`.
+    /// How recently the stored debrid link must have been minted for a resume to replay it INSTANTLY without
+    /// a reresolve round-trip. Debrid direct links live for hours, so a link minted within this window is
+    /// almost certainly still valid; a conservative 20 minutes keeps the "quick pause then resume" case
+    /// instant while anything older takes the reliable reresolve path.
+    private static let freshLinkWindow: TimeInterval = 20 * 60
+
+    /// Resolve the exact stored source to a playable URL. `refreshed` is true when the URL is AUTHORITATIVE
+    /// and should be played directly (a freshly minted debrid link, OR a stored link still inside the fresh
+    /// window); false only when we fell back to a possibly-stale stored link because the source could not be
+    /// reresolved, so the caller keeps its stale-link failover priming. Never throws.
     static func resolvedURL(for entry: LastStreamStore.Entry) async -> (url: URL, refreshed: Bool) {
         let stored = URL(string: entry.url)
         // No debrid provenance (plain-direct / torrent / usenet with no reresolve id): the stored link is
@@ -147,9 +154,20 @@ enum CWResume {
               let infoHash = entry.infoHash, !infoHash.isEmpty else {
             return (stored ?? URL(fileURLWithPath: "/"), false)
         }
-        // Mint a FRESH link for the SAME file through the SAME provider. On TorBox this is a single requestdl
-        // off the stored torrentId+fileId (no re-add); other providers re-add from the infoHash+fileIdx, still
-        // far cheaper than a full source re-resolve, and still the SAME source.
+        // INSTANT RESUME (Step 4): the previous behaviour reresolved a fresh link on EVERY resume, a blocking
+        // network round-trip before the player appeared (the "CW resume is slow" regression). But a debrid
+        // link minted moments ago is still valid, so when the stored link is inside the fresh window hand it
+        // straight back with refreshed:true. The caller plays it immediately and attaches the debridRef, whose
+        // ids let the player's own load-failure failover mint a fresh link ONLY if this fresh link somehow
+        // dead-ends (strictly safer than today's fallback, which already plays a possibly-STALE stored link).
+        if let stored, let savedAt = entry.linkSavedAt {
+            let age = Date().timeIntervalSince(savedAt)
+            if age >= 0, age < Self.freshLinkWindow { return (stored, true) }
+        }
+        // Older than the window (or no mint timestamp): mint a FRESH link for the SAME file through the SAME
+        // provider. On TorBox this is a single requestdl off the stored torrentId+fileId (no re-add); other
+        // providers re-add from the infoHash+fileIdx, still far cheaper than a full source re-resolve, and
+        // still the SAME source.
         if let fresh = try? await DebridCoordinator.shared.reresolve(
             service: service, infoHash: infoHash,
             torrentId: entry.debridTorrentId, fileId: entry.debridFileId, fileIdx: entry.fileIdx) {
