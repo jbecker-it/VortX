@@ -1959,21 +1959,25 @@ struct iOSDetailView: View {
         return String(localized: "No sources found")
     }
 
-    /// D10: `fromStart` plays the SAME best stream from 0:00, ignoring the saved resume position WITHOUT
-    /// clearing it (the stored resume point is untouched; playback just starts at 0). Default false keeps the
-    /// primary Play/Resume behaviour (seek to the saved position).
+    /// D10: `fromStart` replays the SAME source the title was last played through, from 0:00, ignoring the
+    /// saved resume position WITHOUT clearing it (the stored resume point is untouched; playback just starts
+    /// at 0). Default false keeps the primary Play/Resume behaviour (same exact source, seek to the saved
+    /// position). Play-from-start must NOT re-pick the source: it only changes WHERE playback begins, never
+    /// WHICH source plays (owner: "it auto changed the source when I tried to play from start").
     private func playMovie(fromStart: Bool = false) async {
         // A4b: no longer gated on `meta != nil` — a hub-opened title with nil/mismatched Cinemeta meta still
         // has a resolved best stream (off the same groups the list renders) and plays off its seed identity.
         guard !preparing, let stream = movieBest else { return }
         preparing = true; defer { preparing = false }
         // EXACT-SOURCE RESUME (owner requirement): if this title was last played through a specific debrid
-        // source, resume THAT source directly (reresolve a fresh link for the same file) instead of re-running
-        // source selection across every add-on (the "Tried N sources / this source didn't load" failure). Only
-        // when the stored source is genuinely gone do we fall through to the auto-pick race below. Movies only
-        // (a series episode resumes via its own path); skipped when it is a torrent while torrents are off.
-        if !fromStart,
-           let entry = LastStreamStore.entry(for: moviePlaybackMeta.libraryId, profileID: ProfileStore.shared.activeID),
+        // source, play THAT source directly (reresolve a fresh link for the same file) instead of re-running
+        // source selection across every add-on (the "Tried N sources / this source didn't load" failure). This
+        // covers BOTH resume (seek to saved position) AND play-from-start (seek to 0): the source is the same,
+        // only the start position differs, so fromStart must not fall through to the auto-pick race below and
+        // swap the source. Only when the stored source is genuinely gone do we fall through to that race.
+        // Movies only (a series episode resumes via its own path); skipped when it is a torrent while torrents
+        // are off.
+        if let entry = LastStreamStore.entry(for: moviePlaybackMeta.libraryId, profileID: ProfileStore.shared.activeID),
            let service = entry.debridService.flatMap(DebridService.init(rawValue:)),
            let hash = entry.infoHash, !hash.isEmpty,
            !(PlaybackSettings.torrentsDisabled && entry.torrent == true) {
@@ -1981,7 +1985,7 @@ struct iOSDetailView: View {
             if refreshed {
                 core.loadEnginePlayer(for: stream)
                 let pm = moviePlaybackMeta
-                let resumeSeconds = await resume(pm)
+                let resumeSeconds = fromStart ? 0 : await resume(pm)
                 presentation = .player(PlayerLaunch(url: url, title: pm.name, headers: entry.headers,
                                                     resume: resumeSeconds, meta: pm,
                                                     qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
