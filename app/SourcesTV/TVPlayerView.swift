@@ -147,7 +147,13 @@ struct TVPlayerView: View {
     // source in about 5s instead of stalling 12s on dead chrome. It routes to the SAME libmpv fallback the
     // .failed case uses. AVPlayer-only: libmpv torrents warm up far longer under the 30s loadTimeout budget.
     @State private var avStartWatchdog: Task<Void, Never>?
-    private let avStartWatchdogSeconds: Double = 5
+    // 20s (was 5s), matching the iOS/Mac PlayerScreen watchdog. A cold-debrid Dolby Vision remux needs ~8-15s
+    // to open the mount + run find_stream_info + write its first fragment before AVPlayer shows a frame; the
+    // 5s watchdog fired mid-open and CANCELLED the remux before the Profile-7 -> 8.1 RPU converter ever ran
+    // (Apple TV device log: mount at 06.851s, classify at 15.129s, converted=0 bytes=0), so every DV file on
+    // Apple TV fell back to HDR10. 20s covers the remux startup while the 30s loadTimeout + AVPlayer .failed
+    // path stay as backstops for a genuinely dead mount.
+    private let avStartWatchdogSeconds: Double = 20
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -1724,7 +1730,7 @@ struct TVPlayerView: View {
     /// (-1 = subtitles off). refreshTracksSoon reconciles from mpv's real track-list right after.
     private func optimisticSelect(type: String, id: Int) {
         func remap(_ tracks: [MPVTrack]) -> [MPVTrack] {
-            tracks.map { MPVTrack(id: $0.id, type: $0.type, title: $0.title, lang: $0.lang, selected: $0.id == id) }
+            tracks.map { MPVTrack(id: $0.id, type: $0.type, title: $0.title, lang: $0.lang, selected: $0.id == id, forced: $0.forced) }
         }
         if type == "audio" { audioTracks = remap(audioTracks) } else { subtitleTracks = remap(subtitleTracks) }
         if showOptions { panelRows = optionRows }

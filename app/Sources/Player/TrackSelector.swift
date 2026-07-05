@@ -31,6 +31,20 @@ enum TrackSelector {
         case .always:
             return firstMatch(subs, languages: p.subtitleLanguages, reject: p.rejectTerms)?.id ?? -1
         case .forced:
+            // Match by the container's FORCED disposition flag FIRST: real forced tracks are flagged
+            // (AV_DISPOSITION_FORCED / mpv track-list forced), not labelled "forced" in the title, so the old
+            // title-only match never fired for them and forced subtitles never turned on. Prefer a forced track
+            // in a preferred subtitle language, then ANY forced track (forced subs are meant to show regardless
+            // of language), then fall back to the legacy title-contains-"forced" heuristic for the rare
+            // container that only labels forced in its title. Off if nothing qualifies.
+            for lang in p.subtitleLanguages {
+                if let t = subs.first(where: { $0.forced && matches($0.lang, lang) && !isRejected($0, p.rejectTerms) }) {
+                    return t.id
+                }
+            }
+            if let t = subs.first(where: { $0.forced && !isRejected($0, p.rejectTerms) }) {
+                return t.id
+            }
             for lang in p.subtitleLanguages {
                 if let t = subs.first(where: { matches($0.lang, lang) && $0.title.lowercased().contains("forced") && !isRejected($0, p.rejectTerms) }) {
                     return t.id

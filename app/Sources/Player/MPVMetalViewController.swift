@@ -1124,7 +1124,8 @@ final class MPVMetalViewController: PlatformViewController {
                 type: type,
                 title: getString("track-list/\(i)/title") ?? "",
                 lang: getString("track-list/\(i)/lang") ?? "",
-                selected: getFlag("track-list/\(i)/selected")
+                selected: getFlag("track-list/\(i)/selected"),
+                forced: getFlag("track-list/\(i)/forced")   // AV_DISPOSITION_FORCED, for forced-subtitle auto-select
             ))
         }
         return result

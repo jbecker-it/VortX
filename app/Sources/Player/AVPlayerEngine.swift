@@ -607,7 +607,8 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         let selected = item.currentMediaSelection.selectedMediaOption(in: group)
         return group.options.enumerated().map { idx, opt in
             MPVTrack(id: idx, type: type, title: opt.displayName,
-                     lang: opt.extendedLanguageTag ?? "", selected: opt == selected)
+                     lang: opt.extendedLanguageTag ?? "", selected: opt == selected,
+                     forced: opt.hasMediaCharacteristic(.containsOnlyForcedSubtitles))
         }
     }
 
