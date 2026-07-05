@@ -415,13 +415,27 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // demotion. A mid-stream error now fails the buffer so the loader errors the request and the chrome
         // can re-open the link on libmpv.
         let AVERROR_EOF_CONST: Int32 = -541478725
+        var readRetries = 0
+        let maxReadRetries = 4
         while !isCancelled {
             let rf = av_read_frame(inCtx, pkt)
             if rf < 0 {
                 if rf == AVERROR_EOF_CONST { break }   // genuine EOF: write the trailer + finish() below
-                if !isCancelled { buffer.fail("source read failed mid-stream (rc=\(rf))"); return }
-                break
+                if isCancelled { break }
+                // A debrid CDN stall/drop mid-stream (rw_timeout rc=-60, or EIO) returns a non-EOF error. The
+                // reconnect flags re-establish the connection, so RETRY the read a few times before giving up,
+                // rather than failing on the first stall - libmpv tolerates the same chunked/slow debrid delivery
+                // and plays these links fine, which is why DV that classified + wrote its header still stopped
+                // early (8 MB, or 0 bytes). A genuinely dead link errors every retry and then demotes to libmpv.
+                readRetries += 1
+                if readRetries <= maxReadRetries {
+                    VXProbe.log("dv", "mid-stream read rc=\(rf), retry \(readRetries)/\(maxReadRetries)")
+                    continue
+                }
+                buffer.fail("source read failed mid-stream (rc=\(rf)) after \(maxReadRetries) retries")
+                return
             }
+            readRetries = 0   // a successful read resets the streak
             let inIdx = Int(pkt.pointee.stream_index)
             guard inIdx >= 0, inIdx < nb, streamMap[inIdx] >= 0,
                   let inStream = inCtx.pointee.streams[inIdx],
