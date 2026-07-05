@@ -426,6 +426,7 @@ struct AddonsView: View {
 struct AddonReorderView: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager   // observe textScale so Theme.Typography repaints live
+    @ObservedObject private var orderObserver = AddonOrderObserver.shared   // re-seed on a remote reorder
     @State private var ordered: [CoreDescriptor] = []
 
     var body: some View {
@@ -460,7 +461,8 @@ struct AddonReorderView: View {
         #endif
         .macBackAffordance()
         .onAppear { reload() }
-        .onChange(of: core.addons.count) { _ in reload() }   // an install/remove elsewhere re-seeds the list
+        .onChange(of: core.addons.count) { _ in reload() }        // an install/remove elsewhere re-seeds the list
+        .onChange(of: orderObserver.revision) { _ in reload() }   // a remote reorder (or our own) re-seeds; idempotent for a local drag
     }
 
     /// Re-seed from the live add-on set in the currently-applied order. Preserves the user's order and folds
