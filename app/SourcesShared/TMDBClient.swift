@@ -533,12 +533,45 @@ enum TMDBClient {
         73: 17,               // Tubi
         300: 18,              // Pluto TV
         11: 19,               // MUBI
+        // Full streaming-service set (owner: show EVERY service from the shared list,
+        // github.com/rleroi/Stremio-Streaming-Catalogs-Addon). A rank here only ORDERS a provider TMDB already
+        // lists in-region; an id that matches no real in-region provider is just an unused entry (harmless), so
+        // this list is intentionally generous. The `limit` below is raised to fit them.
+        151: 20,              // BritBox
+        87: 21,               // Acorn TV
+        99: 22,               // Shudder
+        258: 23,              // Criterion Channel
+        190: 24,              // Curiosity Stream
+        41: 25,               // ITVX
+        103: 26,              // Channel 4
+        1773: 27,             // SkyShowtime
+        39: 28,               // Now
+        29: 29,               // Sky Go
+        223: 30,              // Hayu
+        381: 31,              // Canal+
+        74: 32,               // Videoland
+        155: 33,              // NLZIET
+        232: 34,              // Zee5
+        237: 35,              // SonyLIV
+        970: 36,              // JioCinema
+        195: 37,              // Shahid VIP
+        330: 38,              // iQIYI
+        307: 39,              // Globoplay
+        167: 40,              // Clarovideo
+        149: 41,              // Movistar+
+        188: 42, 192: 42,     // YouTube (Premium)
+        175: 43,              // Netflix Kids
+        34: 44,               // MGM+
+        207: 45,              // The Roku Channel
+        21: 46,               // Stan
+        385: 47,              // Binge
+        230: 48,              // Crave
     ]
 
     /// The streaming-service tiles for the region: every provider TMDB lists in-region, the majors boosted
     /// to the front by `featuredProviderRank`, the rest by TMDB's region display_priority, capped. Merges
     /// the movie + TV provider lists (some services are TV-only or movie-only). [] with no TMDB key.
-    static func regionProviders(region: String = deviceRegion, limit: Int = 36) async -> [ProviderTile] {
+    static func regionProviders(region: String = deviceRegion, limit: Int = 50) async -> [ProviderTile] {
         // No user-key guard: the keyless edge serves providers too, so the hub populates for everyone.
         async let movieList = providerPage(media: "movie", region: region)
         async let tvList = providerPage(media: "tv", region: region)
