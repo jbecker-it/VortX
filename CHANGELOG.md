@@ -4,6 +4,12 @@ All notable changes to VortX, newest first. VortX is Apple TV first, with an iPh
 
 What is planned next is in [ROADMAP.md](ROADMAP.md). To request a feature or report a bug, start a [GitHub Discussion](https://github.com/VortXTV/VortX/discussions) or [open an issue](https://github.com/VortXTV/VortX/issues).
 
+## 0.3.11 - unreleased (on beta, folds into the next build)
+
+### Added
+
+- **A back-to-top button on Home and Discover.** Once you scroll past the hero, a small circular button appears in the bottom-trailing corner (clear of the tab bar); tapping it scrolls smoothly back to the top and the button fades away. It reuses the same scroll-to-top path as re-tapping the active tab, so both do exactly the same thing. Reduced-motion is respected. Device-verified on macOS. iPhone, iPad, and Mac (tvOS uses focus/Menu to return to the top, so it is not needed there).
+
 ## 0.3.11 - build 155 (pre-release)
 
 A stability and playback pre-release over build 153 that ends the Mac source-list freeze that could force you to quit the app, stops a related Mac crash when opening a title while its sources load, makes Continue Watching and Play from start start on the exact source you expect, lights true Dolby Vision on Apple TV, and fixes iPhone/iPad downloads that failed with a storage or file-creation error. In testing; becomes the 0.3.12 release once verified. In-place update, nothing resets.
