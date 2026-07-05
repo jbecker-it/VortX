@@ -162,6 +162,25 @@ final class SourcePreferences: ObservableObject {
                          : (!excludeTerms.isEmpty || !includeTerms.isEmpty)
     }
 
+    /// A compact fingerprint of every preference that changes stream FILTERING or RANKING order. The detail
+    /// source list memoizes its expensive ranked-groups computation and folds this into the cache key, so a
+    /// settings change (a new keyword filter, a different sort, add-on order on or off) invalidates that cache
+    /// even when the stream set itself is unchanged. Keep in sync with what `applyUserFilters` / `rankedGroups`
+    /// / `best` actually read.
+    var rankingSignature: String {
+        [typeOrder.map(\.rawValue).joined(separator: ","),
+         useAddonOrder ? "1" : "0",
+         defaultSourceSort,
+         excludeKeywords, includeKeywords, keywordsAreRegex ? "1" : "0",
+         safetyMode,
+         hideDeadTorrents ? "1" : "0",
+         instantOnly ? "1" : "0",
+         String(maxResolution),
+         String(maxFileSizeGB),
+         hdrOnly ? "1" : "0",
+         excludeAV1 ? "1" : "0"].joined(separator: "|")
+    }
+
     /// Parsed, lowercased, non-empty exclude / include terms (substring mode).
     var excludeTerms: [String] { Self.terms(excludeKeywords) }
     var includeTerms: [String] { Self.terms(includeKeywords) }

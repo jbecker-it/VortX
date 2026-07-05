@@ -1426,6 +1426,10 @@ struct CoreStreamList: View {
         return secs >= 1 ? secs : nil
     }
 
+    /// Caches the expensive rankedGroups + best computation across body re-evaluations (see DetailRankMemo).
+    /// @State (not @StateObject) on purpose: the cache must NOT publish or it would re-render on every hit.
+    @State private var rankMemo = DetailRankMemo()
+
     var body: some View {
         // While the player is up the tvOS shell stays MOUNTED behind it (RootView renders the player over an
         // opacity(0).disabled() RootTabView, it does not unmount the shell), so this body re-evaluates on every
@@ -1437,18 +1441,29 @@ struct CoreStreamList: View {
         if presenter.request != nil {
             return AnyView(Color.clear.frame(minHeight: 1))
         }
-        let groups = StreamRanking.rankedGroups(displayGroups(core.streamGroups()), pin: sourcePin,
-                                                debridCachedHashes: debridCache.cachedHashes)   // best source first within each add-on
-        let streamCount = groups.reduce(0) { $0 + $1.streams.count }
-        let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
-        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
-        let loadingAddons = addons.total == 0 || addons.loaded < addons.total
         // Per-series quality memory: bias Watch Now toward the quality signature of
         // whatever this title played last (per profile), so a series you watch in a
         // specific quality keeps opening in it. Cached/instant still outranks it.
         let remembered = meta.flatMap { LastStreamStore.entry(for: $0.libraryId, profileID: ProfileStore.shared.activeID)?.qualityText }
-        let best = StreamRanking.best(groups, continuity: remembered, pin: sourcePin,
-                                      debridCachedHashes: debridCache.cachedHashes)
+        // Memoize the expensive rank + best over the raw stream set. This body re-evaluates on EVERY CoreBridge
+        // @Published bump while the source list is open (progress ticks, the settle timer, debrid cache-check
+        // results), and re-sorting a 1000+ stream list each time starved the tvOS main thread (the source-list
+        // jank owner + @jbecker-it hit). The signature is O(groups), not O(streams), and invalidates on the only
+        // inputs that change the order: the stream set, the pin, the debrid cached-hash set, the ranking
+        // preferences, and the Kids content guard. displayGroups is a cheap merge/filter, kept outside the memo.
+        let raw = displayGroups(core.streamGroups())
+        let rankSig = raw.map { "\($0.id)#\($0.streams.count)" }.joined(separator: ",")
+            + "|pin:\(String(describing: sourcePin))|cache:\(debridCache.cachedHashes.count)"
+            + "|kids:\(ProfileStore.activeIsKids() ? 1 : 0)|prefs:\(SourcePreferences.shared.rankingSignature)"
+            + "|remember:\(remembered ?? "-")"
+        let ranked = rankMemo.ranked(raw, signature: rankSig, pin: sourcePin,
+                                     cached: debridCache.cachedHashes, continuity: remembered)
+        let groups = ranked.groups                                   // best source first within each add-on
+        let best = ranked.best
+        let streamCount = groups.reduce(0) { $0 + $1.streams.count }
+        let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+        let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
+        let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
         // Watch-Now stays greyed until (nearly) every add-on has answered, so one press plays the
         // best of ALL sources, not the best of whoever answered first. A hung add-on can't hold the
@@ -2094,5 +2109,28 @@ private struct CastMemberCard: View {
         .frame(width: 140, height: 140)
         .clipShape(Circle())
         .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(focused ? 0.3 : 0.08), lineWidth: focused ? 3 : 1))
+    }
+}
+
+/// Memoizes DetailView's ranked-groups + best across body re-evaluations. The detail body re-evaluates on
+/// every CoreBridge @Published bump while the source list is open, and re-ranking a 1000+ stream list each
+/// time starved the tvOS main thread. This recomputes only when the caller's signature (a cheap O(groups)
+/// fingerprint of the stream set + pin + debrid cache + ranking prefs) changes; otherwise it returns the last
+/// result untouched. Held by DetailView as @State so mutating these fields never goes through the @State setter
+/// (no "modifying state during view update") and fires no objectWillChange (no re-render loop). Main-actor
+/// because it is only ever touched from `body`.
+@MainActor final class DetailRankMemo {
+    private var signature = ""
+    private var cachedGroups: [CoreStreamSourceGroup] = []
+    private var cachedBest: CoreStream?
+
+    func ranked(_ raw: [CoreStreamSourceGroup], signature sig: String, pin: ResolvedPin?,
+                cached: Set<String>, continuity: String?) -> (groups: [CoreStreamSourceGroup], best: CoreStream?) {
+        if sig != signature {
+            signature = sig
+            cachedGroups = StreamRanking.rankedGroups(raw, pin: pin, debridCachedHashes: cached)
+            cachedBest = StreamRanking.best(cachedGroups, continuity: continuity, pin: pin, debridCachedHashes: cached)
+        }
+        return (cachedGroups, cachedBest)
     }
 }
