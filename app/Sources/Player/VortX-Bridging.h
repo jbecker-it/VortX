@@ -1,5 +1,12 @@
 #import <AVFoundation/AVFoundation.h>
 
+// macOS 26 (Tahoe) SwiftUI toolbar-crash guard. Swallows the NSException thrown by
+// NSToolbar's private -_insertNewItemWithItemIdentifier:... under SwiftUI's
+// ToolbarBridge on a hidden, unused window toolbar, which AppKit otherwise turns
+// into a fatal SIGTRAP. Implemented in SourcesShared/VortXToolbarCrashGuard.m;
+// a no-op on non-macOS. Call once at launch from the macOS app delegate.
+void VortXInstallToolbarCrashGuard(void);
+
 // AVDisplayCriteria's integer initializer is private SPI, but it is what the
 // field-proven tvOS players ship for HDR display-mode switching: the public
 // initWithRefreshRate:formatDescription: has been observed building criteria
