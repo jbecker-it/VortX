@@ -33,7 +33,17 @@ final class DownloadManager: NSObject, ObservableObject {
     /// Maps a live URLSession task to the record it's filling, both ways, so a delegate callback (which
     /// arrives with only a task) resolves to a record id, and a pause/cancel(id:) resolves to its task.
     private var taskForRecord: [UUID: URLSessionDownloadTask] = [:]
-    private var recordForTask: [Int: UUID] = [:]
+    private var recordForTask: [String: UUID] = [:]
+
+    /// A session-namespaced task key. The foreground (torrent) and background (debrid) byte sessions both start
+    /// taskIdentifiers at 1, so a bare-Int `recordForTask` / `destinations` collided: a CONCURRENT torrent +
+    /// debrid download with equal identifiers mis-routed progress ticks AND moved a finished temp file into the
+    /// wrong record's destination (silent download corruption; both sessions start at 1, so it was easy to hit).
+    /// The config identifier ("tv.vortx.downloads.background" vs nil for the default foreground session) is
+    /// stable and readable off the delegate's `session` with no main-actor hop, so it namespaces the key.
+    private nonisolated static func taskKey(_ session: URLSession, _ taskIdentifier: Int) -> String {
+        "\(session.configuration.identifier ?? "fg"):\(taskIdentifier)"
+    }
     /// Resume data captured on pause / recoverable failure, so resume() can continue instead of restart.
     private var resumeData: [UUID: Data] = [:]
 
@@ -235,13 +245,13 @@ final class DownloadManager: NSObject, ObservableObject {
             store.update(id: id) { $0.state = .failed; $0.errorText = "Invalid source URL" }
             return
         }
-        bind(task: task, to: id)
+        bind(task: task, to: id, on: session)
         // Persist the destination filename ON the task: a background URLSession serializes `taskDescription`,
         // so it survives the app-suspend/relaunch that wipes the in-memory `destinations` + `recordForTask`
         // maps. The relaunched delegate reads it back to recover where to move the finished temp file (the
         // "cannot create file" root cause: the in-memory map was empty in the relaunched process).
         task.taskDescription = record.localFilename
-        destinations.set(store.fileURL(for: record), for: task.taskIdentifier)
+        destinations.set(store.fileURL(for: record), for: Self.taskKey(session, task.taskIdentifier))
         beginForegroundAssertionIfNeeded(for: record)
         task.resume()
     }
@@ -283,12 +293,12 @@ final class DownloadManager: NSObject, ObservableObject {
         }
         let session = record.isTorrent ? foregroundSession : backgroundSession
         let task = makeTask(on: session, url: url, headers: record.headers)
-        bind(task: task, to: record.id)
+        bind(task: task, to: record.id, on: session)
         // Persist the destination filename on the task (survives relaunch via the background session). See
         // the matching note in resume(): this is how the off-main delegate recovers the destination after a
         // relaunch empties the in-memory maps.
         task.taskDescription = record.localFilename
-        destinations.set(store.fileURL(for: record), for: task.taskIdentifier)
+        destinations.set(store.fileURL(for: record), for: Self.taskKey(session, task.taskIdentifier))
         beginForegroundAssertionIfNeeded(for: record)
         task.resume()
     }
@@ -369,9 +379,9 @@ final class DownloadManager: NSObject, ObservableObject {
         return session.downloadTask(with: request)
     }
 
-    private func bind(task: URLSessionDownloadTask, to id: UUID) {
+    private func bind(task: URLSessionDownloadTask, to id: UUID, on session: URLSession) {
         taskForRecord[id] = task
-        recordForTask[task.taskIdentifier] = id
+        recordForTask[Self.taskKey(session, task.taskIdentifier)] = id
         // Persist the task identifier so a relaunch can map this still-running background task back to its
         // record and re-wire pause/cancel. A cosmetic-only field, so a bare progress write is fine (do not
         // force an index rewrite here beyond the store's default).
@@ -380,8 +390,12 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func clearTask(id: UUID) {
         if let task = taskForRecord[id] {
-            recordForTask[task.taskIdentifier] = nil
-            destinations.remove(task.taskIdentifier)
+            let tid = task.taskIdentifier
+            // The task lives in exactly ONE of the two byte sessions; clear both possible keys (only one exists).
+            for s in [foregroundSession, backgroundSession] {
+                recordForTask[Self.taskKey(s, tid)] = nil
+                destinations.remove(Self.taskKey(s, tid))
+            }
         }
         taskForRecord[id] = nil
         lastProgressPush[id] = nil   // do not leak the throttle entry across a terminal transition
@@ -417,7 +431,7 @@ final class DownloadManager: NSObject, ObservableObject {
         startTask(for: next, url: url)
     }
 
-    private func recordID(for task: URLSessionTask) -> UUID? { recordForTask[task.taskIdentifier] }
+    private func recordID(for task: URLSessionTask, on session: URLSession) -> UUID? { recordForTask[Self.taskKey(session, task.taskIdentifier)] }
 
     /// Adopt the iOS background-relaunch completion handler. Touching `backgroundSession` here forces the
     /// lazy session to materialize so its delegate is attached and the queued finished-download events
@@ -492,9 +506,11 @@ final class DownloadManager: NSObject, ObservableObject {
             // startTask() would have. Do NOT call bind() (it re-persists taskIdentifier via a store write we
             // already have); wire the maps directly.
             taskForRecord[id] = task
-            recordForTask[task.taskIdentifier] = id
+            // Reconciled byte tasks come only from backgroundSession.getAllTasks (the default foreground/torrent
+            // session does not survive a relaunch), so they are always background-session tasks.
+            recordForTask[Self.taskKey(backgroundSession, task.taskIdentifier)] = id
             if let record = store.record(id: id) {
-                destinations.set(store.fileURL(for: record), for: task.taskIdentifier)
+                destinations.set(store.fileURL(for: record), for: Self.taskKey(backgroundSession, task.taskIdentifier))
                 store.update(id: id) { $0.taskIdentifier = task.taskIdentifier }
                 beginForegroundAssertionIfNeeded(for: record)
             }
@@ -575,8 +591,8 @@ final class DownloadManager: NSObject, ObservableObject {
     /// is empty in the relaunched process, so fall back to matching the filename we persisted on the task
     /// (`taskDescription`) against the stored records' `localFilename`. Without this, a download that
     /// completed while the app was suspended saved its file but its row stayed stuck on "Downloading".
-    private func recoverRecordID(for task: URLSessionTask, filename: String?) -> UUID? {
-        if let id = recordForTask[task.taskIdentifier] { return id }
+    private func recoverRecordID(for task: URLSessionTask, on session: URLSession, filename: String?) -> UUID? {
+        if let id = recordForTask[Self.taskKey(session, task.taskIdentifier)] { return id }
         guard let filename else { return nil }
         return store.records.first { $0.localFilename == filename }?.id
     }
@@ -657,7 +673,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
                                 didWriteData bytesWritten: Int64, totalBytesWritten: Int64,
                                 totalBytesExpectedToWrite: Int64) {
         Task { @MainActor [weak self] in
-            guard let self, let id = self.recordID(for: downloadTask) else { return }
+            guard let self, let id = self.recordID(for: downloadTask, on: session) else { return }
             let now = ProcessInfo.processInfo.systemUptime
             if let last = self.lastProgressPush[id],
                totalBytesWritten - last.bytes < 8_000_000, now - last.at < 0.5 {
@@ -683,7 +699,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // EMPTY in the new process, so recover the destination from the filename we persisted on the task
         // (`taskDescription`, which the background session serializes). This is the iOS "cannot create file"
         // fix: a ~2 GB file guarantees a suspend mid-download, and the old code then had `dest == nil`.
-        let dest = destinations.url(for: downloadTask.taskIdentifier)
+        let dest = destinations.url(for: Self.taskKey(session, downloadTask.taskIdentifier))
             ?? downloadTask.taskDescription.map { DownloadStore.fileURL(forFilename: $0) }
         // The source size BEFORE any move (the temp is gone after a successful move). 0 bytes here means the
         // SOURCE returned nothing - usually a torrent with no running server / no debrid, or a dead link - not
@@ -723,7 +739,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // (where `recordForTask` is empty), by matching it against the stored `localFilename`.
         let taskFilename = downloadTask.taskDescription
         Task { @MainActor [weak self] in
-            guard let self, let id = self.recoverRecordID(for: downloadTask, filename: taskFilename) else { return }
+            guard let self, let id = self.recoverRecordID(for: downloadTask, on: session, filename: taskFilename) else { return }
             self.store.update(id: id) {
                 if failed {
                     $0.state = .failed
@@ -753,7 +769,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         let resume = (error as NSError).userInfo[NSURLSessionDownloadTaskResumeData] as? Data
         let taskFilename = task.taskDescription
         Task { @MainActor [weak self] in
-            guard let self, let id = self.recoverRecordID(for: task, filename: taskFilename) else { return }
+            guard let self, let id = self.recoverRecordID(for: task, on: session, filename: taskFilename) else { return }
             // A deliberate pause cancels the task; pause() already recorded `.paused` + resume data.
             if (error as NSError).code == NSURLErrorCancelled { return }
             if let resume { self.resumeData[id] = resume }
@@ -800,7 +816,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         if let ns = error as NSError?, ns.code == NSURLErrorCancelled {
             // Clear BOTH maps even for a system-initiated cancel (one that did not go through cancelAssetTask):
             // clearing only recordForAssetTask would leak the AVAssetDownloadTask held in assetTaskForRecord.
-            self.hlsFinishedLocations.remove(taskId)
+            self.hlsFinishedLocations.remove("hls:\(taskId)")
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
@@ -812,7 +828,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         // Capture the finished location SYNCHRONOUSLY here (this callback is serialized after
         // didFinishDownloadingTo on the same background delegate queue), so success is decided on a value that
         // is guaranteed present rather than on record.hlsRelativePath written by a separate, possibly-later Task.
-        let finishedRelPath = self.hlsFinishedLocations.url(for: taskId)?.relativePath
+        let finishedRelPath = self.hlsFinishedLocations.url(for: "hls:\(taskId)")?.relativePath
         let failureText = error.map { "\(String(localized: "Couldn't save this download:")) \(Self.downloadFailureDetail($0))" }
         Task { @MainActor [weak self] in
             guard let self else { return }
@@ -833,7 +849,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             self.recordForAssetTask[taskId] = nil
             self.assetTaskForRecord[id] = nil
             self.lastProgressPush[id] = nil
-            self.hlsFinishedLocations.remove(taskId)
+            self.hlsFinishedLocations.remove("hls:\(taskId)")
         }
     }
     #endif
@@ -912,7 +928,7 @@ extension DownloadManager: AVAssetDownloadDelegate {
         let taskDesc = assetDownloadTask.taskDescription
         // Record the finished location SYNCHRONOUSLY on the delegate queue so handleAssetTaskCompletion (which
         // runs next on the same serial queue) sees it without depending on the @MainActor persistence below.
-        self.hlsFinishedLocations.set(location, for: taskId)
+        self.hlsFinishedLocations.set(location, for: "hls:\(taskId)")
         Task { @MainActor [weak self] in
             guard let self else { return }
             let id = self.recordForAssetTask[taskId] ?? taskDesc.flatMap { UUID(uuidString: $0) }
@@ -929,21 +945,21 @@ extension DownloadManager: AVAssetDownloadDelegate {
 /// it) can resolve the destination without hopping to the main actor. `@unchecked Sendable` is sound here
 /// because every access goes through the lock.
 final class DownloadDestinationMap: @unchecked Sendable {
-    private var map: [Int: URL] = [:]
+    private var map: [String: URL] = [:]   // session-namespaced key (see DownloadManager.taskKey) so two sessions' equal taskIdentifiers never collide
     private let lock = NSLock()
 
-    func set(_ url: URL, for taskIdentifier: Int) {
+    func set(_ url: URL, for key: String) {
         lock.lock(); defer { lock.unlock() }
-        map[taskIdentifier] = url
+        map[key] = url
     }
 
-    func url(for taskIdentifier: Int) -> URL? {
+    func url(for key: String) -> URL? {
         lock.lock(); defer { lock.unlock() }
-        return map[taskIdentifier]
+        return map[key]
     }
 
-    func remove(_ taskIdentifier: Int) {
+    func remove(_ key: String) {
         lock.lock(); defer { lock.unlock() }
-        map[taskIdentifier] = nil
+        map[key] = nil
     }
 }
