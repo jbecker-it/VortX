@@ -375,7 +375,7 @@ final class MacAppDelegate: NSObject, NSApplicationDelegate {
     // NSException inserting into the shared window toolbar when an off-main model
     // republishes under a pushed detail screen, and AppKit turns that into a fatal
     // SIGTRAP. The window toolbar is hidden and unused here, so the guard swallowing
-    // a failed insert has no visible effect. See VortXToolbarCrashGuard.m.
+    // a failed insert has no visible effect. See VortXToolbarCrashGuard.mm.
     func applicationWillFinishLaunching(_ notification: Notification) {
         VortXInstallToolbarCrashGuard()
     }

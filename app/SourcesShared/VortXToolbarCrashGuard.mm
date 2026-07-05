@@ -18,11 +18,16 @@
 //  `#if os(iOS)`-gated, so this is not app toolbar content: it is SwiftUI's own
 //  NavigationStack chrome being reconciled into the (hidden) shared window toolbar.
 //
-//  The window's toolbar is hidden and unused — StremioXiOSApp sets
-//  `.windowStyle(.hiddenTitleBar)` + `.toolbar(.hidden, for: .windowToolbar)`, and
-//  the traffic lights are restored WITHOUT attaching a toolbar (MacWindowChrome).
-//  So a skipped insert has no visible effect: the invisible item is simply not
-//  added, and SwiftUI reconciles again on the next pass.
+//  SCOPE — `method_setImplementation` swizzles NSToolbar at the CLASS level, so this
+//  guards EVERY NSToolbar instance in the process, on every thread, silently absorbing
+//  any NSToolbar insert exception (not only the one hidden shared-window toolbar). That
+//  is acceptable ONLY because this app ships no functional/visible toolbars at all: the
+//  one window toolbar is hidden and unused — StremioXiOSApp sets
+//  `.windowStyle(.hiddenTitleBar)` + `.toolbar(.hidden, for: .windowToolbar)`, and the
+//  traffic lights are restored WITHOUT attaching a toolbar (MacWindowChrome). So a
+//  skipped insert has no visible effect anywhere: the invisible item is simply not added
+//  and SwiftUI reconciles again on the next pass. If a real, user-facing NSToolbar is
+//  ever added to this app, revisit this guard so it does not mask genuine toolbar bugs.
 //
 //  WHICH METHODS — the crash report symbolicated the throwing IMP to the nearest
 //  EXPORTED symbol (`-[NSToolbar _insertNewItemWithItemIdentifier:atIndex:
@@ -83,10 +88,19 @@ static std::atomic<long> vortx_swallow_count{0};
 // counter is SHARED across all three wrappers so any nesting between them is safe.
 static thread_local int vortx_guard_depth = 0;
 
-static void vortx_log_swallow(id identifier) {
+// RAII balance for the depth counter: increment on construction, decrement on scope
+// exit (normal OR unwinding). The decrement is correct even though our own catch(...)
+// already consumes the throw; RAII keeps it balanced if a future edit adds code after
+// the try/catch that itself throws.
+struct VXDepthGuard {
+    VXDepthGuard() { ++vortx_guard_depth; }
+    ~VXDepthGuard() { --vortx_guard_depth; }
+};
+
+static void vortx_log_swallow(id detail) {
     long n = vortx_swallow_count.fetch_add(1) + 1;
     if (n <= 5 || (n % 100) == 0) {
-        NSLog(@"[VortX] guarded NSToolbar insert throw #%ld (item=%@)", n, identifier);
+        NSLog(@"[VortX] guarded NSToolbar insert throw #%ld (%@)", n, detail);
     }
 }
 
@@ -98,13 +112,12 @@ static void vortx_insert_guarded(id self, SEL _cmd, id identifier, NSInteger ind
         if (orig) orig(self, _cmd, identifier, index);
         return;
     }
-    vortx_guard_depth++;
+    VXDepthGuard depth;
     try {
         if (orig) orig(self, _cmd, identifier, index);
     } catch (...) {
         vortx_log_swallow(identifier);
     }
-    vortx_guard_depth--;
 }
 
 // Wrapper for the private core insert. Catches a throw only when it is the outermost
@@ -117,20 +130,24 @@ static void vortx_core_insert_guarded(id self, SEL _cmd, id item, NSInteger inde
             vortx_orig_insert_core(self, _cmd, item, index, notifyDelegate, notifyView, notifyFamily);
         return;
     }
-    vortx_guard_depth++;
+    VXDepthGuard depth;
     try {
         if (vortx_orig_insert_core)
             vortx_orig_insert_core(self, _cmd, item, index, notifyDelegate, notifyView, notifyFamily);
     } catch (...) {
         vortx_log_swallow(item);
     }
-    vortx_guard_depth--;
 }
 
 static bool vortx_install(SEL sel, IMP replacement, void *origSlot) {
     Method m = class_getInstanceMethod([NSToolbar class], sel);
     if (m == nullptr) return false;
-    *(IMP *)origSlot = method_getImplementation(m);
+    IMP original = method_getImplementation(m);
+    // Guard against a future OS aliasing two of our target selectors to the SAME Method:
+    // installing twice would then store our own replacement as the "original", and a call
+    // would recurse into the guard forever (stack overflow). If it is already our IMP, skip.
+    if (original == replacement) return false;
+    *(IMP *)origSlot = original;
     method_setImplementation(m, replacement);
     return true;
 }
