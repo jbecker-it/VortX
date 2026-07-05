@@ -6,13 +6,15 @@ import UIKit   // all UIKit/UIWindow usage below is inside #if os(tvOS); macOS j
 #endif
 import os
 
-/// The dynamic range mpv reports for the playing file, reduced to the modes the
-/// Apple TV display pipeline can be asked to match. Dolby Vision content renders
-/// through mpv's PQ path, so it requests the HDR10 display mode.
+/// The dynamic range the playing file carries, reduced to the modes the Apple TV display pipeline can be
+/// asked to match. When content plays through the libmpv/PQ lane (which tone-maps Dolby Vision) it requests
+/// the `hdr10` mode; when true Dolby Vision plays through the AVPlayer remux lane, it requests `dolbyVision`
+/// so the TV lights its Dolby Vision mode instead of HDR10.
 enum ContentDynamicRange: String {
     case sdr
     case hdr10
     case hlg
+    case dolbyVision
 }
 
 /// Drives the Apple TV's HDMI display-mode switch so HDR content lights the TV's
@@ -98,10 +100,20 @@ enum HDRDisplayMode {
     private static func makeCriteria(range: ContentDynamicRange, rate: Float, width: Int, height: Int) -> AVDisplayCriteria? {
         let sel = NSSelectorFromString("initWithRefreshRate:videoDynamicRange:")
         if AVDisplayCriteria.instancesRespond(to: sel) {
-            let dynamicRange: Int32 = range == .hlg ? 3 : 2   // 2 = HDR10/PQ, 3 = HLG
+            // Apple's private videoDynamicRange integers, as shipped by field-proven tvOS players:
+            // 2 = HDR10/PQ, 3 = HLG, 4 = Dolby Vision. It is SPI, so it can only be confirmed on real
+            // Apple TV hardware; the +2.5s switch-in-progress log below is the confirmation signal.
+            let dynamicRange: Int32
+            switch range {
+            case .hlg:         dynamicRange = 3
+            case .dolbyVision: dynamicRange = 4
+            default:           dynamicRange = 2   // hdr10 / PQ (sdr never reaches here, it resets above)
+            }
             note("criteria via SPI int initializer, videoDynamicRange=\(dynamicRange)")
             return AVDisplayCriteria(refreshRate: rate, videoDynamicRange: dynamicRange)
         }
+        // Public fallback (SPI gone): no DV transfer-function CFString exists, so DV maps to the PQ/HDR10
+        // format description here. This path only runs if the private initializer ever disappears.
         let transfer: CFString = range == .hlg
             ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
             : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ

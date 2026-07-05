@@ -197,6 +197,11 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     func stop() {
         teardownObservers()
         teardownRemux()
+        #if os(tvOS)
+        // Return the TV from any Dolby Vision display mode this session requested (idempotent no-op when it
+        // was not DV; only this lane sets DV criteria, and one engine is live at a time).
+        HDRDisplayMode.reset(in: nil)
+        #endif
         disableExternalSubtitle()
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -552,6 +557,19 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
                 let host = (item.asset as? AVURLAsset)?.url.host ?? "?"
                 VXProbeState.shared.setPlayer(state: "playing", source: host, engine: "avplayer")
                 VXProbe.event("player", "ready \(host)")
+                #if os(tvOS)
+                // TRUE DOLBY VISION lights the TV's DV mode. This AVPlayer remux lane carries the genuine
+                // Profile-8.1 stream, but (unlike the libmpv lane) it never asked tvOS to switch the display,
+                // so DV showed as HDR10. Gate on the remux session (it only mounts for DV); window:nil uses
+                // HDRDisplayMode's fallback window. reset() on stop() returns the TV to its default mode.
+                if remuxLoader != nil {
+                    let size = item.presentationSize
+                    let fps = item.tracks.first { $0.assetTrack?.mediaType == .video }?.assetTrack?.nominalFrameRate ?? 0
+                    HDRDisplayMode.request(.dolbyVision, fps: Double(fps),
+                                           width: Int(size.width), height: Int(size.height), in: nil)
+                    VXProbe.log("dv", "AVPlayer remux ready -> requested Dolby Vision display mode fps=\(fps) \(Int(size.width))x\(Int(size.height))")
+                }
+                #endif
             }
         case .failed:
             let ns = item.error as NSError?

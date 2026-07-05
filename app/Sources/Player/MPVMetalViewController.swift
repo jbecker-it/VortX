@@ -1041,6 +1041,10 @@ final class MPVMetalViewController: PlatformViewController {
         case .hdr10: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
         case .hlg:   metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_HLG)
         case .sdr:   metalLayer.colorspace = nil
+        // The libmpv lane tone-maps Dolby Vision through its PQ path and reports .hdr10 for it, so it never
+        // actually produces .dolbyVision here; map it to the PQ colorspace defensively (true DV plays on the
+        // AVPlayer remux lane, which owns the .dolbyVision display-mode request).
+        case .dolbyVision: metalLayer.colorspace = CGColorSpace(name: CGColorSpace.itur_2100_PQ)
         }
         DiagnosticsLog.logSync("mpv", "layer colorspace tagged")
         mpvLog.log("output range → \(range.rawValue, privacy: .public) (gamma=\(gamma, privacy: .public) sigPeak=\(sigPeak, privacy: .public))")
