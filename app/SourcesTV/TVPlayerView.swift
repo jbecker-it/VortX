@@ -24,6 +24,9 @@ struct TVPlayerView: View {
     /// start-timeout: retry the SAME source in place with a longer first-buffer grace rather than silently
     /// hopping to a different, often lower-quality, source. Only the auto path may auto-hop.
     var startedFromExplicitPick: Bool = false
+    /// True when this launch is a Continue-Watching resume: play the exact stored source first, but hop to a
+    /// fresh source on a HARD load failure (a stale debrid link) instead of dead-ending like a manual pick.
+    var startedFromResume: Bool = false
     var onClose: () -> Void = {}           // dismiss the dedicated player window
 
     /// The pinned source for this title (#15), so in-player failover, auto-next, and preload keep using the
@@ -160,6 +163,9 @@ struct TVPlayerView: View {
     // `startedFromExplicitPick`, updated on every in-player source/quality pick and auto-hop). An explicit
     // pick is retried in place on a start-timeout instead of hopping to a different, lower-quality source.
     @State private var currentPickWasExplicit = false
+    /// True while the INITIAL source is a Continue-Watching resume (see startedFromResume). Cleared once the
+    /// player switches to any other source, so only the first stored-link attempt gets resume-hop treatment.
+    @State private var currentPlaybackIsResume = false
     // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
     // still arriving (the demuxer-cache edge advanced since the watchdog armed) extends the wait rather
     // than declaring the source dead. Bounded by the extension count and the overall recovery deadline.
@@ -299,6 +305,7 @@ struct TVPlayerView: View {
                 curURL = url; curTitle = title; curMeta = meta
                 curIsTorrent = torrent; curHeaders = headers; curIsLive = initialLiveMode
                 currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
+                currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
                 maybeRouteToDefaultExternalPlayer()
             }
             scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
@@ -1443,6 +1450,7 @@ struct TVPlayerView: View {
         // A manual pick makes THIS source explicit (honor it on a start-timeout); an automatic hop makes
         // the new source non-explicit so it can hop onward normally.
         currentPickWasExplicit = userInitiated
+        currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         sourceHops = 0; exhaustedURLs = []   // a deliberate pick resets the failover budget (failover restores it)
         recoveryDeadline?.cancel(); recoveryDeadline = nil   // fresh attempt re-arms the overall recovery cap
@@ -2123,8 +2131,10 @@ struct TVPlayerView: View {
             reconnecting = false
             // Honor an explicit user pick: a hard failure after the in-place retries surfaces a clear
             // "choose another source" error instead of silently hopping to a different (often lower-quality)
-            // source. Only the auto path (Watch Now / resume) falls through to the failover hop below.
-            if currentPickWasExplicit {
+            // source. Only the auto path (Watch Now) dead-ends this way. A Continue-Watching RESUME is NOT a
+            // manual pick: its stored debrid link expires, so a hard failure must fall through to the failover
+            // hop + fresh-sources wait below (get the viewer watching) rather than dead-ending on the overlay.
+            if currentPickWasExplicit && !currentPlaybackIsResume {
                 if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
                 withAnimation { loadFailed = true }
                 return

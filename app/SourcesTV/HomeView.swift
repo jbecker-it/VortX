@@ -482,7 +482,7 @@ struct CoreContinueWatchingRow: View {
                         debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
                                                      torrentId: entry.debridTorrentId, fileId: entry.debridFileId,
                                                      fileIdx: entry.fileIdx),
-                        wasExplicitPick: true)
+                        wasExplicitPick: true, wasResume: true)
                     return
                 }
                 // No fresh link (non-debrid entry, or the source is genuinely gone): replay the stored url as
@@ -498,7 +498,7 @@ struct CoreContinueWatchingRow: View {
                 presenter.request = PlaybackRequest(
                     url: resolvedURL, title: entry.title, meta: meta,
                     episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
-                    headers: entry.headers)
+                    headers: entry.headers, wasResume: true)
             }
         }
     }

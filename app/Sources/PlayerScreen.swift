@@ -53,6 +53,10 @@ struct PlayerScreen: View {
     /// silently hopping to a different, often lower-quality, source (the "picked 4K, got 480p" report).
     /// Only the auto path may auto-hop. Threaded from the presenter's PlayerLaunch; defaults to auto.
     var startedFromExplicitPick: Bool = false
+    /// True when this launch is a Continue-Watching resume: play the exact stored source first (retry-in-place
+    /// on a slow start like an explicit pick), but hop to a fresh source on a HARD load failure (a stale debrid
+    /// link) instead of dead-ending like a manual pick. Threaded from iOSPlayerLaunch.wasResume.
+    var startedFromResume: Bool = false
     /// yt-direct adaptive pair (trailers): the separate AUDIO stream mpv mounts alongside the video-only
     /// `url` (`--audio-files`). Forces the libmpv engine (AVPlayer can't merge a second remote file).
     var audioSidecarURL: URL? = nil
@@ -373,6 +377,9 @@ struct PlayerScreen: View {
     // `startedFromExplicitPick`, updated on every in-player source/quality pick and auto-hop). An
     // explicit pick is retried in place on a start-timeout instead of hopping to a different source.
     @State private var currentPickWasExplicit = false
+    /// True while the INITIAL source is a Continue-Watching resume (see startedFromResume). Cleared once the
+    /// player switches to any other source, so only the first stored-link attempt gets resume-hop treatment.
+    @State private var currentPlaybackIsResume = false
     // First-buffer grace for a big 4K remux on slow debrid: a start-timeout that fires while bytes are
     // still arriving (the demuxer-cache edge advanced since the last watchdog arm) extends the wait
     // rather than declaring the source dead. Bounded by the number of extensions and the overall
@@ -616,6 +623,7 @@ struct PlayerScreen: View {
             #endif
             curURL = url; curHeaders = headers; curIsTorrent = recordIsTorrent
             currentPickWasExplicit = startedFromExplicitPick   // honor an explicit launch pick on the first start-timeout
+            currentPlaybackIsResume = startedFromResume        // a resume plays exact first but hops on a HARD failure
             #if os(iOS) || os(macOS)
             if engineLatch == nil { engineLatch = routedToAVPlayer }   // engine picked ONCE per playback
             #endif
@@ -1313,7 +1321,9 @@ struct PlayerScreen: View {
             // Honor an explicit user pick: a hard failure after the in-place retries surfaces a clear
             // "choose another source" error instead of silently hopping to a different (often lower-quality)
             // source. Only the auto path (Watch Now / resume) falls through to the failover hop below.
-            if currentPickWasExplicit {
+            // A Continue-Watching RESUME is not a manual pick: its stored debrid link expires, so a hard failure
+            // must fall through to the failover hop + fresh-sources wait below rather than dead-ending here.
+            if currentPickWasExplicit && !currentPlaybackIsResume {
                 if loadErrorMsg.isEmpty { loadErrorMsg = "This source didn't load. Choose another source." }
                 srcProbe("OVERLAY SET: explicit pick failed after \(maxAutoRetries) retries -> loadFailed msg=\(loadErrorMsg)")
                 withAnimation { loadFailed = true }
@@ -1796,6 +1806,7 @@ struct PlayerScreen: View {
         // the same source on a start-timeout; an auto-advanced episode or an auto-hop stays non-explicit so it
         // still fails over automatically (an unattended binge must not dead-end on one slow/dead auto-picked source).
         currentPickWasExplicit = explicitPick
+        currentPlaybackIsResume = false   // any switch is past the initial resume; the new source hops normally
         bufferGraceUsed = 0; lastBufferedAtWatchdog = -1   // fresh source: its own first-buffer grace budget
         bufferedTime = 0   // fresh source: clear the buffered-ahead band so the buffer-grace watchdog re-baselines against the new fill, not the previous source's edge
         if userInitiated {

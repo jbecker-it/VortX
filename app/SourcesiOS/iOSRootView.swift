@@ -1789,6 +1789,9 @@ struct iOSPlayerLaunch: Identifiable {
     /// file), so PlayerScreen HONORS it on a start-timeout (retries in place) instead of silently hopping to a
     /// different, lower-quality source. False for a stale-url replay / paste-a-link (which may hop normally).
     var wasExplicitPick: Bool = false
+    /// True when this launch is a Continue-Watching RESUME (directResume). Plays the exact stored source first
+    /// but hops to a fresh source on a HARD load failure (a stale debrid link) instead of dead-ending.
+    var wasResume: Bool = false
     /// Series only: the season's ordered episodes + a resolver, so a Continue-Watching resume gets the
     /// same in-player Next / Prev / episode-list as the detail page. Empty/nil for movies + paste-a-link.
     var episodes: [PlayerEpisodeRef] = []
@@ -1813,6 +1816,7 @@ extension View {
                 // the next resume), not a stale replay that hops across every source. Defaults keep other
                 // launch paths (paste-a-link, downloads) unchanged.
                 recordDebridRef: item.debridRef, startedFromExplicitPick: item.wasExplicitPick,
+                startedFromResume: item.wasResume,
                 audioSidecarURL: item.audioSidecarURL,
                 episodes: item.episodes, loadEpisode: item.loadEpisode,
                 // Feed the engine Player so Continue Watching updates live + watched time is tracked (the
@@ -1960,7 +1964,7 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
                            resume: resume, meta: meta,
                            qualityText: entry.qualityText, bingeGroup: entry.bingeGroup,
                            isTorrent: refreshed ? false : (entry.torrent ?? false),
-                           debridRef: explicitDebridRef, wasExplicitPick: wasExplicitPick,
+                           debridRef: explicitDebridRef, wasExplicitPick: wasExplicitPick, wasResume: true,
                            episodes: episodes, loadEpisode: loadEpisode)
 }
 
