@@ -479,8 +479,17 @@ final class SourceIndexServeSource: ObservableObject {
         var seen: Set<String> = []
         var own: [CoreStream] = []
         for s in extra {
-            guard let h = s.infoHash?.lowercased() else { continue }
-            if seen.insert(h).inserted { own.append(s) }
+            // Key each pooled source by its REPLAYABLE identity so all three kinds survive de-dup, not just
+            // torrents (the old infohash-only key silently dropped every usenet + direct pooled row): a torrent
+            // by infohash, a usenet source by its nzb link, a direct source by its url. A stream with none of
+            // those is unplayable and skipped. The kind prefix keeps the three key spaces from colliding.
+            let key: String?
+            if let h = s.infoHash?.lowercased(), !h.isEmpty { key = "t:" + h }
+            else if let nzb = s.nzbUrl, !nzb.isEmpty { key = "u:" + nzb }
+            else if let u = s.url, !u.isEmpty { key = "d:" + u }
+            else { key = nil }
+            guard let key else { continue }
+            if seen.insert(key).inserted { own.append(s) }
         }
         // NOTE: `own` is deduped ONLY within Singularity's own list (by infoHash); it is deliberately NOT
         // deduped against the user's add-on groups, so a release your add-ons already return still appears

@@ -539,10 +539,18 @@ struct iOSDetailView: View {
             // the native cache-check needs, so filtering here would starve the check. Cache awareness is
             // orthogonal to the playback filter.
             if effectiveType != "series" {
-                debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups()))
+                debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
                 refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
             }
             refreshLanguageChips()   // recompute the "Also available in" chips as more sources answer
+        }
+        // The Singularity pool answers asynchronously, so re-run the debrid cache check when its streams
+        // arrive: a pooled torrent's infoHash gets checked against the user's own debrid (and a pooled nzb
+        // against their TorBox), so pooled sources RESOLVE per-user, not just render.
+        .onChange(of: sourceIndex.streams.count) { _ in
+            if effectiveType != "series" {
+                debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
+            }
         }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources once the meta's imdb id is
         // known (gated on a TorBox key inside `refresh`; de-duped by imdb id). Series episodes fetch in
@@ -2728,9 +2736,15 @@ struct iOSEpisodeStreams: View {
         // by hash set in refresh). Includes the TorBox search sources so those rows badge too. No-op with
         // no debrid key.
         .onChange(of: core.streamLoadProgress(forStreamId: video.id).loaded) { _ in
-            // Unfiltered: cache awareness needs the raw torrents the Direct-links-only filter would drop.
-            debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id)))
+            // Unfiltered: cache awareness needs the raw torrents the Direct-links-only filter would drop, plus
+            // the Singularity pool sources, so a pooled source RESOLVES through the user's own debrid / TorBox.
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))))
             refreshSourceIndex()   // SERVE + HOARD the community source index as this episode's sources answer
+        }
+        // The Singularity pool answers asynchronously, so re-run the cache check when its streams arrive, so
+        // pooled sources for this episode resolve per-user rather than only rendering.
+        .onChange(of: sourceIndex.streams.count) { _ in
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))))
         }
         // TorBox search-as-a-source for the show (gated on a TorBox key; de-duped by imdb id inside refresh).
         .onAppear { torboxSearch.refresh(imdbId: showImdbID); refreshSourceIndex() }

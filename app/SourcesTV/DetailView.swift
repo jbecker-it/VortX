@@ -1660,9 +1660,16 @@ struct CoreStreamList: View {
         // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
         .onChange(of: core.streamLoadProgress().loaded) { _ in
             // Unfiltered: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
-            // would drop, plus the TorBox search sources, so those rows badge too. Orthogonal to the filter.
-            debridCache.refresh(from: torboxSearch.merged(into: core.streamGroups()))
+            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
+            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
             refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
+        }
+        // The Singularity pool answers asynchronously (a network fetch), so re-run the debrid cache check when
+        // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
+        // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
+        .onChange(of: sourceIndex.streams.count) { _ in
+            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
         }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
         // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
