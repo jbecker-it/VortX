@@ -297,6 +297,14 @@ final class MPVMetalViewController: PlatformViewController {
             if #available(iOS 15.0, tvOS 15.0, *) {
                 try? session.setSupportsMultichannelContent(routeIsMultichannelCapable)
             }
+            // Ask the session to OPEN the route's real channel count. Without this the session can sit at 2
+            // output channels on a >2ch HDMI route and the AO/renderer silently downmixes multichannel PCM to
+            // stereo (the reference players set this; we never did). Gated exactly like
+            // setSupportsMultichannelContent above so the #78 stereo-route protections are untouched.
+            if routeIsMultichannelCapable, intrinsicMaxChannels > 2 {
+                try? session.setPreferredOutputNumberOfChannels(min(intrinsicMaxChannels, 8))
+            }
+            NSLog("[#78 audio] realized outputChannels=\(session.outputNumberOfChannels) (multichannelCapable=\(routeIsMultichannelCapable) intrinsicMax=\(intrinsicMaxChannels))")
             outputChannels = max(session.maximumOutputNumberOfChannels, 2)
             outputSampleRate = session.sampleRate
         } catch {
@@ -1639,6 +1647,17 @@ final class MPVMetalViewController: PlatformViewController {
                         ?? self.playUrl?.host ?? "?"
                     VXProbeState.shared.setPlayer(state: "playing", source: loadedHost, engine: "mpv")
                     VXProbe.event("player", "loaded \(loadedHost)")
+                    // One-shot audio-negotiation diagnostic: what mpv DECODED vs what the AO actually OPENED
+                    // (the negotiated output layout, e.g. 5.1 vs a silent stereo downmix). Delayed so the AO
+                    // has opened; libmpv property reads are thread-safe and the handle is guarded on main.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                        guard let self, self.mpv != nil else { return }
+                        let dec = "\(self.getString("audio-params/hr-channels") ?? self.getString("audio-params/channel-count") ?? "?")@\(self.getString("audio-params/samplerate") ?? "?")"
+                        let out = "\(self.getString("audio-out-params/hr-channels") ?? self.getString("audio-out-params/channel-count") ?? "?")@\(self.getString("audio-out-params/samplerate") ?? "?")"
+                        let ao = self.getString("current-ao") ?? "?"
+                        NSLog("[#78 audio] negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                        VXProbe.log("player", "audio negotiated decode=\(dec) out=\(out) ao=\(ao)")
+                    }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // The video output was (re)configured for the now-current file/params. This EVENT is
                     // not value-coalesced like the sig-peak property observer, so it fires reliably on

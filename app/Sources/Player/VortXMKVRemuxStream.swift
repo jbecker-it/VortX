@@ -24,9 +24,11 @@ import Libdovi
 ///     a Profile-8 `dvvC` box and AVPlayer engages true DV. A stream whose DV label lied (no DOVI config) still
 ///     FAILS FAST (before any video mounts) so the chrome demotes to libmpv's HDR10 tone-map; a Profile-7
 ///     conversion that errors at runtime also fails soft to that same demotion, never a crash or a hang.
-///   - Audio: only AVPlayer-decodable codecs (AAC/AC3/EAC3/ALAC/MP3/FLAC) are mapped. TrueHD and DTS are
-///     DROPPED, AVPlayer cannot decode them, and muxed in they either kill the muxer or play silent. A
-///     source whose ONLY audio is TrueHD/DTS fails fast for the same libmpv demotion (mpv decodes them all).
+///   - Audio: AVPlayer-decodable codecs (AAC/AC3/EAC3/ALAC/MP3/FLAC) stream-copy through, always preferred.
+///     When a source's ONLY audio is a codec AVPlayer cannot decode (TrueHD, DTS/DTS-HD MA, MLP, Opus,
+///     Vorbis, PCM variants), that ONE track is TRANSCODED in-flight by `VortXAudioTranscoder` (EAC3-first,
+///     else AAC with today's bundled FFmpeg) so the DV lane no longer bails to libmpv's HDR10 tone-map over
+///     audio alone. A source with no decodable AND no transcodable audio still fails fast to libmpv.
 ///   - Subtitles: never mapped. The mp4 muxer cannot stream-copy Matroska text/PGS subtitle codecs
 ///     (avformat_write_header fails and kills the whole session); the player's add-on/community subtitle
 ///     panel covers subtitles on the AVPlayer path.
@@ -218,6 +220,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         var mappable = Set<Int>()
         var audioSeen: [String] = []
         var hasDecodableAudio = false
+        // The first audio track AVPlayer canNOT decode but the bundled FFmpeg CAN (TrueHD/MLP/DTS/Opus/Vorbis/
+        // PCM..., a generic decoder check, no allowlist). Used ONLY when the scan finds no stream-copyable
+        // track: stream-copy always beats a transcode.
+        var transcodeAudioIn = -1
         // The base-layer (primary) video track. For DUAL-TRACK Profile 7 (separate BL + EL video streams), the
         // FIRST video stream is the base layer we keep; any later video stream is the enhancement layer, which
         // AVPlayer can't decode and which we DROP (never mapped). Single-track sources have exactly one video
@@ -246,15 +252,29 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 if !hasDecodableAudio, Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue) {
                     hasDecodableAudio = true
                     mappable.insert(i)
+                } else if transcodeAudioIn < 0,
+                          !Self.avPlayerDecodableAudio.contains(par.pointee.codec_id.rawValue),
+                          avcodec_find_decoder(par.pointee.codec_id) != nil {
+                    // Remember the first FFmpeg-decodable track as the transcode candidate; only mapped
+                    // below if the whole scan finds NO stream-copyable audio.
+                    transcodeAudioIn = i
                 }
             default:
                 break   // subtitles/data/attachments are never mapped (see the header note)
             }
         }
+        // Insert the transcode candidate into the map ONLY when nothing stream-copyable exists (stream-copy is
+        // always preferred over a transcode). `transcodeActive` is the single switch the setup + mux loops key on.
+        let transcodeActive = !hasDecodableAudio && transcodeAudioIn >= 0
+        if transcodeActive { mappable.insert(transcodeAudioIn) }
+        var transcodeAudioName = "none"
+        if transcodeActive, let s = inCtx.pointee.streams[transcodeAudioIn], let p = s.pointee.codecpar {
+            transcodeAudioName = Self.codecName(p.pointee.codec_id)
+        }
         // [dv] classify probe: one greppable line of what the source actually carries (DV profile, dims, and
         // the audio codecs seen / whether any is AVPlayer-decodable). This is the line that explains WHY a DV
         // source did or did not stay on the true-DV AVPlayer lane. Gated, so free in shipping builds.
-        VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio)")
+        VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio) transcodeAudio=\(transcodeAudioName)")
 
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
@@ -305,24 +325,44 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             buffer.fail("Dolby Vision profile 7 source has no base-layer video track")
             return
         }
-        // AVPlayer cannot decode TrueHD/DTS. With no decodable track the session would mount then fail (or
-        // play silent); libmpv decodes every codec here, so fail fast and let the chrome demote.
-        guard hasDecodableAudio else {
-            // [dv] the DOMINANT real-world reason a premium 4K DV remux tone-maps to HDR10: its only audio is
-            // TrueHD/Atmos or DTS, which AVPlayer cannot decode and this build cannot transcode (the bundled
-            // FFmpeg has no ac3/eac3 encoder). Keeping the safe libmpv HDR10 path here is correct, not a
-            // regression; a true DV-with-lossless fix needs a server-side EAC3 remux or an FFmpeg rebuild.
-            VXProbe.log("dv", "HDR10 FALLBACK: no AVPlayer-decodable audio, source=[\(audioSeen.joined(separator: ","))] (TrueHD/DTS need transcode, unavailable in this build)")
+        // AVPlayer cannot decode TrueHD/DTS, but a TrueHD/DTS-only source no longer fails here: its one audio
+        // track is transcoded in-flight (see `transcodeActive`), which was the DOMINANT real-world reason a
+        // premium 4K DV remux tone-mapped to HDR10. Only a source with NO decodable and NO transcodable audio
+        // (or none at all) still fails fast so the chrome demotes to libmpv, which decodes everything.
+        guard hasDecodableAudio || transcodeActive else {
+            VXProbe.log("dv", "HDR10 FALLBACK: no AVPlayer-decodable or transcodable audio, source=[\(audioSeen.joined(separator: ","))]")
             buffer.fail("no AVPlayer-decodable audio track (source audio: \(audioSeen.joined(separator: ",")))")
             return
         }
         var streamMap = [Int](repeating: -1, count: nb)
         var outIndex: Int32 = 0
         var baseVideoOut = -1        // output index of the base-layer video track (packets to convert)
+        // The one-track audio transcoder (TrueHD/DTS/... -> EAC3-or-AAC), created in the setup loop below when
+        // `transcodeActive`. Owns its decoder/encoder/resampler; its deinit cleans up on every exit path.
+        var transcoder: VortXAudioTranscoder? = nil
         for i in 0..<nb where mappable.contains(i) {
             guard let inStream = inCtx.pointee.streams[i] else { continue }
             let par = inStream.pointee.codecpar
             guard let outStream = avformat_new_stream(outCtx, nil) else { VXProbe.log("dv", "HDR10 FALLBACK: avformat_new_stream returned nil (inStream=\(i))"); buffer.fail("avformat_new_stream returned nil"); return }
+            if transcodeActive, i == transcodeAudioIn {
+                // Transcode track: the transcoder stamps outStream.codecpar (incl. a real frame_size, so the
+                // frame_size fixup below is bypassed) INSTEAD of avcodec_parameters_copy. Fail-soft: a source
+                // whose decoder/encoder cannot open demotes to libmpv exactly like the old no-audio bail.
+                guard let par,
+                      let t = VortXAudioTranscoder(sourcePar: par, outStream: outStream,
+                                                   sourceTimeBase: inStream.pointee.time_base,
+                                                   globalHeader: true) else {
+                    VXProbe.log("dv", "HDR10 FALLBACK: audio transcode init failed (inStream=\(i), codec=\(transcodeAudioName))")
+                    buffer.fail("audio transcode init failed (source audio: \(audioSeen.joined(separator: ",")))")
+                    return
+                }
+                transcoder = t
+                VXProbe.log("dv", "audio transcode armed: \(transcodeAudioName) -> \(t.encoderName) (inStream=\(i))")
+                streamMap[i] = Int(outIndex)
+                outIndex += 1
+                info.mappedStreams += 1
+                continue
+            }
             let cp = avcodec_parameters_copy(outStream.pointee.codecpar, par)
             if cp < 0 { VXProbe.log("dv", "HDR10 FALLBACK: avcodec_parameters_copy rc=\(cp) (inStream=\(i))"); buffer.fail("avcodec_parameters_copy failed (\(cp))"); return }
             outStream.pointee.codecpar.pointee.codec_tag = 0
@@ -456,6 +496,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                   let inStream = inCtx.pointee.streams[inIdx],
                   let outStream = outCtx.pointee.streams[streamMap[inIdx]] else { continue }
             let outIdx = streamMap[inIdx]
+            // Transcode-track packets go through the transcoder (which decodes, re-encodes, and stamps
+            // stream_index + timestamps itself), NEVER the stream-copy rescale below.
+            if let transcoder, inIdx == transcodeAudioIn {
+                guard transcoder.feed(p, write: { av_interleaved_write_frame(outCtx, $0) }) else {
+                    if isCancelled { break }
+                    buffer.fail("audio transcode failed mid-stream [prebuffered drain]")
+                    return
+                }
+                continue
+            }
             if convertP7, outIdx == baseVideoOut {
                 Self.convertPacketRPUToProfile81(p, nalLengthSize: nalLengthSize, stats: &rpuStats)
             }
@@ -499,6 +549,19 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 av_packet_unref(pkt); continue
             }
             let outIdx = streamMap[inIdx]
+            // Transcode-track packets go through the transcoder (which stamps stream_index + timestamps
+            // itself), never the stream-copy rescale. Fail-soft: a mid-stream decode/encode/write error fails
+            // the buffer for the same AVPlayer -> libmpv demotion as a stream-copy write failure.
+            if let transcoder, inIdx == transcodeAudioIn {
+                let fed = transcoder.feed(pkt, write: { av_interleaved_write_frame(outCtx, $0) })
+                av_packet_unref(pkt)
+                if !fed {
+                    if isCancelled { break }
+                    buffer.fail("audio transcode failed mid-stream")
+                    return
+                }
+                continue
+            }
             // Profile 7 -> 8.1: rewrite the DV RPU NAL (and drop any in-band EL sublayer NAL) in the base-layer
             // video packets before muxing. Only the base video track is touched; audio and every other packet
             // pass through byte-for-byte. Conversion is fail-SOFT: on any error the packet's bytes are left
@@ -525,6 +588,11 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             return
         }
 
+        // EOF: drain the transcoder's decoder/FIFO/encoder tail into the muxer BEFORE the trailer so the last
+        // second of audio is not lost. Best-effort (the file already reached EOF; the trailer is still written).
+        if let transcoder {
+            _ = transcoder.flush(write: { av_interleaved_write_frame(outCtx, $0) })
+        }
         // Flush the muxer trailer (writes the final fragment metadata), then mark the buffer complete.
         av_write_trailer(outCtx)
         buffer.finish()
@@ -533,9 +601,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     // MARK: - Source diagnostics (mirrors MKVRemuxSession)
 
-    /// Audio codecs AVPlayer can decode out of an fMP4 (compared by rawValue). Everything else (chiefly
-    /// TrueHD, DTS, Opus, Vorbis, raw PCM variants) is dropped from the map; a source with none of these
-    /// fails fast to the libmpv path.
+    /// Audio codecs AVPlayer can decode out of an fMP4 (compared by rawValue), always stream-copied when
+    /// present. Everything else (chiefly TrueHD, DTS, Opus, Vorbis, raw PCM variants) is dropped from the map,
+    /// UNLESS the source has none of these at all, in which case ONE such track is transcoded in-flight by
+    /// `VortXAudioTranscoder`; only a source with no decodable and no transcodable audio fails to libmpv.
     private static let avPlayerDecodableAudio: [AVCodecID.RawValue] = [
         AV_CODEC_ID_AAC.rawValue, AV_CODEC_ID_AC3.rawValue, AV_CODEC_ID_EAC3.rawValue,
         AV_CODEC_ID_ALAC.rawValue, AV_CODEC_ID_MP3.rawValue, AV_CODEC_ID_FLAC.rawValue
