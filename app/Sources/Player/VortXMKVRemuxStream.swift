@@ -341,6 +341,26 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // source did or did not stay on the true-DV AVPlayer lane. Gated, so free in shipping builds.
         VXProbe.log("dv", "remux classify \(info.width)x\(info.height) dvProfile=\(info.dvProfile) blCompat=\(info.dvBLCompatId) audio=[\(audioSeen.joined(separator: ","))] decodableAudio=\(hasDecodableAudio) mappedAudio=\(mappedAudioName) transcodeAudio=\(transcodeAudioName)")
 
+        // The forced 'hvc1' sample entry (below) requires the HEVC parameter sets (VPS/SPS/PPS) OUT-OF-BAND
+        // in the sample entry's hvcC box. Validate the base track's extradata NOW, before the packet pre-scan,
+        // so a deficient record (WEB-DL-derived MKVs whose CodecPrivate carries EMPTY parameter-set arrays, or
+        // no usable record at all, with the parameter sets riding in-band instead) can be repaired from the
+        // first access unit's in-band parameter sets. Without this, movenc's mov_write_hvcc_tag IGNORES
+        // ff_isom_write_hvcc's AVERROR_INVALIDDATA and writes an EMPTY hvcC into an otherwise-valid moov
+        // (verified against the shipped libavformat 62); AVPlayer then cannot build a video format description
+        // ('hvc1' forbids the in-band parameter-set fallback 'hev1' allows) and fails the mounted item with
+        // "Cannot Open", the SLOW demotion. This is why one DV P8 MKV failed post-mount while others played.
+        var hvc1Check = Hvc1ExtradataCheck()
+        hvc1Check.eligible = true   // non-HEVC / no-video default: the guards below act only on a real HEVC failure
+        if baseVideoIn >= 0, let bpar = inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar,
+           bpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+            hvc1Check = Self.checkHvc1Extradata(bpar)
+        }
+        // In-band VPS/SPS/PPS harvested from the first base-video access unit (Annex-B form), used to rebuild
+        // the output extradata when the source's CodecPrivate cannot produce a valid hvcC. nil = not needed,
+        // or nothing usable was found (the stream setup then fails fast, BEFORE write_header).
+        var hvc1Harvest: (bytes: [UInt8], vps: Int, sps: Int, pps: Int)? = nil
+
         // Profile 5 / 8.x are single-layer and stream-copy straight through (pure re-wrap, RPU untouched).
         // Profile 7 (BL+EL, ~every UHD-BluRay DV rip) has no VideoToolbox dual-layer decode, so we CONVERT its
         // RPU to Profile 8.1 and drop the EL (see the mux loop). A stream with no DOVI config (the filename
@@ -354,7 +374,12 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         // a function-scope defer frees any packet the mux loop never got to (early return / non-DV fall-through).
         var prebuffered: [UnsafeMutablePointer<AVPacket>] = []
         defer { for p in prebuffered { var pp: UnsafeMutablePointer<AVPacket>? = p; av_packet_free(&pp) } }
-        if info.dvProfile < 0, baseVideoIn >= 0 {
+        // The pre-scan also runs when the base track's extradata cannot yield a valid hvcC (not only when the
+        // DV profile is unknown): the SAME first access unit that would carry an in-band RPU also carries the
+        // in-band VPS/SPS/PPS a parameter-sets-in-band stream repeats ahead of its IDR slice, so one bounded,
+        // seek-free read serves both needs. Files whose extradata is already hvc1-ready skip this exactly as
+        // before, so nothing that opens today reads a single extra packet.
+        if baseVideoIn >= 0, info.dvProfile < 0 || !hvc1Check.eligible {
             let scanNalLen = Self.hevcNalLengthSize(inCtx.pointee.streams[baseVideoIn]?.pointee.codecpar)
             let maxScan = 240   // well within probesize; caps memory + reads if the base-video packet is late/absent
             var scanned = 0
@@ -364,10 +389,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 scanned += 1
                 prebuffered.append(p)
                 if Int(p.pointee.stream_index) == baseVideoIn {
-                    let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
-                    if prof >= 0 {
-                        info.dvProfile = prof
-                        VXProbe.log("dv", "in-band RPU detected dvProfile=\(prof) (no container DOVI config)")
+                    if info.dvProfile < 0 {
+                        let prof = Self.inBandDoViProfile(p, nalLengthSize: scanNalLen)
+                        if prof >= 0 {
+                            info.dvProfile = prof
+                            VXProbe.log("dv", "in-band RPU detected dvProfile=\(prof) (no container DOVI config)")
+                        }
+                    }
+                    // Extradata repair harvest: collect the access unit's VPS/SPS/PPS in Annex-B form so the
+                    // stream setup below can rebuild the output extradata (libavformat's hevc.c builds a
+                    // complete hvcC with array_completeness=1 from Annex-B extradata, valid for 'hvc1' and
+                    // for AVPlayer). A failed walk just leaves the harvest nil; the setup loop then fails
+                    // fast BEFORE write_header rather than mux a moov AVPlayer cannot open.
+                    if !hvc1Check.eligible {
+                        hvc1Harvest = Self.harvestParameterSetsAnnexB(p, nalLengthSize: scanNalLen)
                     }
                     break   // decided on the first base-video packet either way
                 }
@@ -441,12 +476,42 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 outStream.pointee.codecpar.pointee.codec_tag =
                     UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
                     | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24
+                // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
+                // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
+                // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
+                // source extradata cannot produce a valid hvcC (validated in the classify step), install the
+                // in-band parameter sets harvested from the first access unit as Annex-B extradata, which
+                // hevc.c turns into a complete hvcC; the file then plays as true DV instead of failing. If no
+                // harvest exists either, fail fast BEFORE write_header, the same fail-soft shape as the
+                // no-audio bail above: the chrome demotes to libmpv within the probe window, quickly and
+                // cleanly, instead of after a mounted-then-rejected AVPlayer item.
+                if !hvc1Check.eligible {
+                    if let h = hvc1Harvest, Self.installExtradata(outStream.pointee.codecpar, h.bytes) {
+                        DiagnosticsLog.log("dv", "hvc1 extradata repaired from in-band parameter sets: vps=\(h.vps) sps=\(h.sps) pps=\(h.pps) annexB=\(h.bytes.count)B (source extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps))")
+                    } else {
+                        DiagnosticsLog.log("dv", "remux output rejected pre-mux: hvc1 needs out-of-band VPS/SPS/PPS and the source has none usable (extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps); in-band harvest empty) -> demoting to libmpv HDR10")
+                        VXProbe.log("dv", "HDR10 FALLBACK: hvc1 parameter sets unavailable (extradata \(hvc1Check.form)/\(hvc1Check.size)B vps=\(hvc1Check.vps) sps=\(hvc1Check.sps) pps=\(hvc1Check.pps))")
+                        buffer.fail("HEVC parameter sets unavailable for the hvc1 sample entry")
+                        return
+                    }
+                }
                 // For a Profile 7 conversion, re-label the OUTPUT DOVI configuration record as Profile 8.1 so
                 // FFmpeg's mov muxer writes a Profile-8 `dvvC` box (dv_profile>7 selects dvvC) and AVPlayer
                 // engages true DV. The RPU itself is converted per-packet in the mux loop; this makes the
                 // container box agree with the converted bitstream. The EL-present flag is cleared in the relabel.
                 if convertP7 {
-                    Self.relabelOutputDoViProfile81(outStream.pointee.codecpar)
+                    Self.sanitizeOutputDoVi(outStream.pointee.codecpar, relabelProfile81: true)
+                } else {
+                    // P5 / P8 stream-copy lane: sanitize only the structural fields (version, level, el/rpu/bl
+                    // present), WITHOUT relabeling the profile/compatibility id and WITHOUT touching
+                    // md_compression. The source record used to ride through verbatim here, so a hybrid
+                    // dovi_tool-injected rip carrying el_present=1 or dv_level=0 produced a dvvC AVPlayer's
+                    // strict open-time parser can refuse; those structural forces are proven no-ops on a
+                    // conformant source and corrective on a malformed one. md_compression is left at the source
+                    // value because this lane copies the RPU byte-for-byte (rewriting the box to NONE would
+                    // desync it from a metadata-compressed bitstream); the common rip is already NONE, so the
+                    // box stays byte-identical to today for it.
+                    Self.sanitizeOutputDoVi(outStream.pointee.codecpar, relabelProfile81: false)
                 }
             }
             // fMP4 requires each AUDIO track to carry a frame_size; a matroska stream-copy usually leaves it 0,
@@ -498,20 +563,25 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         av_dict_set(&opts, "strict", "experimental", 0)
         defer { av_dict_free(&opts) }
 
-        // [dv] one-line dump of exactly what the muxer is about to validate: the base-video sample-entry fourcc
-        // (must be hvc1 for a DV config box, NOT hev1) + the DOVI record fields. Disambiguates a codec_tag
-        // problem from a record-field problem in a single live run, whether write_header then succeeds or fails.
-        if convertP7, baseVideoOut >= 0, let vpar = outCtx.pointee.streams[baseVideoOut]?.pointee.codecpar {
+        // [dv] one-line dump of exactly what the muxer is about to validate, for EVERY DV lane (it was
+        // convertP7-gated once, which left a failing P8 stream-copy with zero visibility into precisely the
+        // fields that matter): the base-video sample-entry fourcc (must be hvc1 for a DV config box, NOT
+        // hev1), the output dimensions, the DOVI record fields, and the hvcC parameter-set counts from the
+        // OUTPUT extradata (post-repair). Disambiguates a codec_tag problem from a record-field problem from
+        // an empty-hvcC problem in a single device log export, whether write_header then succeeds or fails.
+        // DiagnosticsLog (not the gated probe) so an owner export always carries it.
+        if baseVideoOut >= 0, let vpar = outCtx.pointee.streams[baseVideoOut]?.pointee.codecpar {
             let tag = vpar.pointee.codec_tag
             let fourcc = String(bytes: [UInt8(tag & 0xFF), UInt8((tag >> 8) & 0xFF),
                                         UInt8((tag >> 16) & 0xFF), UInt8((tag >> 24) & 0xFF)],
                                 encoding: .ascii) ?? "?"
-            var maj = -1, lvl = -1, comp = -1, blc = -1, elp = -1
+            var prof = -1, maj = -1, lvl = -1, comp = -1, blc = -1, elp = -1
             let n = Int(vpar.pointee.nb_coded_side_data)
             if n > 0, let arr = vpar.pointee.coded_side_data {
                 for i in 0..<n where arr[i].type == AV_PKT_DATA_DOVI_CONF {
                     if let d = arr[i].data {
                         d.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { r in
+                            prof = Int(r.pointee.dv_profile)
                             maj = Int(r.pointee.dv_version_major); lvl = Int(r.pointee.dv_level)
                             comp = Int(r.pointee.dv_md_compression)
                             blc = Int(r.pointee.dv_bl_signal_compatibility_id); elp = Int(r.pointee.el_present_flag)
@@ -519,7 +589,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                     }
                 }
             }
-            VXProbe.log("dv", "pre-write_header video tag=\(fourcc) dvMaj=\(maj) dvLevel=\(lvl) blCompat=\(blc) el=\(elp) mdComp=\(comp)")
+            let ex = Self.checkHvc1Extradata(vpar)
+            DiagnosticsLog.log("dv", "pre-write_header video tag=\(fourcc) \(vpar.pointee.width)x\(vpar.pointee.height) dvProfile=\(prof) dvMaj=\(maj) dvLevel=\(lvl) blCompat=\(blc) el=\(elp) mdComp=\(comp) extradata=\(ex.form)/\(ex.size)B vps=\(ex.vps) sps=\(ex.sps) pps=\(ex.pps) hvc1Ready=\(ex.eligible)")
         }
 
         let wh = avformat_write_header(outCtx, &opts)
@@ -841,13 +912,147 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return (size == 1 || size == 2 || size == 4) ? size : 4
     }
 
-    /// Rewrite the OUTPUT stream's DOVI configuration side-data record to advertise Profile 8.1 (BL-compatible)
-    /// so FFmpeg's mov muxer emits a Profile-8 `dvvC` box and AVPlayer engages true DV for the converted
-    /// bitstream. Mutates the existing `AV_PKT_DATA_DOVI_CONF` record that `avcodec_parameters_copy` already
-    /// duplicated onto the output codecpar (the buffer is output-owned, so an in-place edit is safe). No-op if
-    /// the source carried no DOVI side data (the per-packet RPU conversion still runs and the muxer derives a
-    /// box from the converted bitstream).
-    private static func relabelOutputDoViProfile81(_ par: UnsafeMutablePointer<AVCodecParameters>?) {
+    // MARK: - hvc1 extradata validation + repair (the "Cannot Open" empty-hvcC guard)
+
+    /// What `checkHvc1Extradata` learned about a base-video extradata buffer. `eligible` means the shipped
+    /// libavformat 62's ff_isom_write_hvcc (with ps_array_completeness=1, which movenc passes for the 'hvc1'
+    /// tag) can build a VALID hvcC box from it; the counts and form feed the diagnostics lines either way.
+    struct Hvc1ExtradataCheck {
+        var eligible = false
+        var form = "absent"      // "absent" | "hvcC" | "annexB" | "unknown"
+        var size = 0
+        var vps = 0
+        var sps = 0
+        var pps = 0
+    }
+
+    /// Mirror EXACTLY what libavformat 62's hevc.c enforces before it will write a non-empty hvcC for an
+    /// 'hvc1' sample entry: extradata present and >= 6 bytes; either Annex-B form (a raw 00 00 01 /
+    /// 00 00 00 01 start code, from which hevc.c builds a complete hvcC itself) or hvcC form
+    /// (configurationVersion 1, >= 23 bytes) whose parameter-set arrays carry AT LEAST one VPS (NAL type 32),
+    /// one SPS (33), and one PPS (34); with array-completeness required, hevc.c rejects a record missing any
+    /// of the three, and movenc then swallows that error and writes an 8-byte EMPTY hvcC AVPlayer cannot
+    /// open. Every read is bounds-checked; a malformed walk simply reports ineligible (fail-soft, never a
+    /// crash).
+    private static func checkHvc1Extradata(_ par: UnsafeMutablePointer<AVCodecParameters>?) -> Hvc1ExtradataCheck {
+        var c = Hvc1ExtradataCheck()
+        guard let par, let ex = par.pointee.extradata else { return c }
+        let n = Int(par.pointee.extradata_size)
+        c.size = n
+        guard n >= 6 else { return c }   // hevc.c: size < 6 is AVERROR_INVALIDDATA outright
+        if (ex[0] == 0 && ex[1] == 0 && ex[2] == 1)
+            || (ex[0] == 0 && ex[1] == 0 && ex[2] == 0 && ex[3] == 1) {
+            c.form = "annexB"
+            c.eligible = true   // hevc.c parses the raw NALs and builds the complete hvcC itself
+            return c
+        }
+        guard ex[0] == 1 else { c.form = "unknown"; return c }
+        c.form = "hvcC"
+        guard n >= 23 else { return c }
+        // Walk the parameter-set arrays: byte 22 = numOfArrays; each array = 1 byte (completeness bit + NAL
+        // type in the low 6 bits), a 2-byte NALU count, then per-NALU a 2-byte length + payload.
+        let numArrays = Int(ex[22])
+        var pos = 23
+        for _ in 0..<numArrays {
+            guard pos + 3 <= n else { return c }
+            let nalType = ex[pos] & 0x3F
+            let numNalus = (Int(ex[pos + 1]) << 8) | Int(ex[pos + 2])
+            pos += 3
+            for _ in 0..<numNalus {
+                guard pos + 2 <= n else { return c }
+                let len = (Int(ex[pos]) << 8) | Int(ex[pos + 1])
+                pos += 2
+                guard len > 0, pos + len <= n else { return c }
+                switch nalType {
+                case 32: c.vps += 1
+                case 33: c.sps += 1
+                case 34: c.pps += 1
+                default: break
+                }
+                pos += len
+            }
+        }
+        c.eligible = c.vps > 0 && c.sps > 0 && c.pps > 0
+        return c
+    }
+
+    /// Harvest the VPS/SPS/PPS NALs out of ONE length-prefixed base-video access unit into Annex-B
+    /// (00 00 00 01 start-code) extradata bytes. A parameter-sets-in-band stream repeats all three ahead of
+    /// its IDR slice in the very first access unit, which the DV pre-scan already prebuffers seek-free.
+    /// Returns nil unless the walk parses cleanly end-to-end AND finds at least one of each parameter set,
+    /// so a misaligned or Annex-B-framed packet can never smuggle garbage into the output extradata
+    /// (fail-soft: the caller then demotes to libmpv instead).
+    private static func harvestParameterSetsAnnexB(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int)
+        -> (bytes: [UInt8], vps: Int, sps: Int, pps: Int)? {
+        guard let src = pkt.pointee.data else { return nil }
+        let total = Int(pkt.pointee.size)
+        guard total > nalLengthSize, nalLengthSize >= 1, nalLengthSize <= 4 else { return nil }
+        var out = [UInt8]()
+        var vps = 0, sps = 0, pps = 0
+        var pos = 0
+        while pos + nalLengthSize <= total {
+            var nalLen = 0
+            for k in 0..<nalLengthSize { nalLen = (nalLen << 8) | Int(src[pos + k]) }
+            let nalStart = pos + nalLengthSize
+            guard nalLen > 0, nalStart + nalLen <= total else { return nil }   // malformed walk: no harvest
+            let nalType = (src[nalStart] >> 1) & 0x3F
+            if nalType == 32 || nalType == 33 || nalType == 34 {
+                out.append(contentsOf: [0, 0, 0, 1])
+                out.append(contentsOf: UnsafeBufferPointer(start: src + nalStart, count: nalLen))
+                switch nalType {
+                case 32: vps += 1
+                case 33: sps += 1
+                default: pps += 1
+                }
+            }
+            pos = nalStart + nalLen
+        }
+        guard pos == total, vps > 0, sps > 0, pps > 0 else { return nil }
+        return (out, vps, sps, pps)
+    }
+
+    /// Replace the output codecpar's extradata with `bytes` (an av_malloc'd copy, zero-padded by
+    /// AV_INPUT_BUFFER_PADDING_SIZE as libav readers over-read the tail). The old buffer, which
+    /// avcodec_parameters_copy av_malloc'd, is freed; the new one is owned by the codecpar and freed with the
+    /// output context. Returns false (leaving the codecpar untouched) only on allocation failure.
+    private static func installExtradata(_ par: UnsafeMutablePointer<AVCodecParameters>?, _ bytes: [UInt8]) -> Bool {
+        guard let par, !bytes.isEmpty else { return false }
+        let size = bytes.count
+        guard let dst = av_malloc(size + AV_INPUT_BUFFER_PADDING_SIZE_CONST)?
+            .assumingMemoryBound(to: UInt8.self) else { return false }
+        bytes.withUnsafeBufferPointer { buf in
+            if let b = buf.baseAddress { memcpy(dst, b, size) }
+        }
+        memset(dst + size, 0, AV_INPUT_BUFFER_PADDING_SIZE_CONST)
+        if let old = par.pointee.extradata { av_free(old) }
+        par.pointee.extradata = dst
+        par.pointee.extradata_size = Int32(size)
+        return true
+    }
+
+    /// Sanitize the OUTPUT stream's DOVI configuration side-data record so FFmpeg's mov muxer writes a `dvvC`
+    /// box AVPlayer's strict open-time parser accepts. Forces only the structural fields that every file which
+    /// opens today already carries and that can only repair a malformed box, never break a conformant one:
+    /// movenc's DoVi validation wants a complete, internally-consistent record (dv_version_major must be 1 and
+    /// dv_level non-zero or mov_init can EINVAL), and a single-layer P5/P8 (or converted P7) source has no
+    /// enhancement layer (so el_present must be 0; hybrid dovi_tool injects sometimes leave it set on a Profile
+    /// 8 source, which this clears). These are proven no-ops on a conformant source and corrective on a
+    /// malformed one.
+    ///
+    /// `dv_md_compression` is deliberately NOT forced on the stream-copy lane. It is only zeroed under
+    /// `relabelProfile81` (the Profile 7 -> 8.1 conversion), where the per-packet RPU is actually rewritten to
+    /// an uncompressed Profile 8.1 bitstream, so a NONE box is the correct, consistent label. On the P5/P8
+    /// stream-copy lane the RPU rides through byte-for-byte, so we keep the source md_compression: the common
+    /// rip already reads NONE (byte-identical to before), and a rare metadata-compressed source keeps a box
+    /// that agrees with its untouched bitstream instead of a NONE box that would lie about it. `relabelProfile81`
+    /// additionally relabels the record Profile 8 / BL-compatible so the box agrees with the converted
+    /// bitstream; the P5/P8 stream-copy lanes keep their source profile + compatibility id.
+    ///
+    /// Mutates the existing `AV_PKT_DATA_DOVI_CONF` record that `avcodec_parameters_copy` already duplicated
+    /// onto the output codecpar (the buffer is output-owned, so an in-place edit is safe). No-op if the source
+    /// carried no DOVI side data (the per-packet RPU conversion still runs and the muxer derives a box from the
+    /// converted bitstream).
+    private static func sanitizeOutputDoVi(_ par: UnsafeMutablePointer<AVCodecParameters>?, relabelProfile81: Bool) {
         guard let par else { return }
         let n = Int(par.pointee.nb_coded_side_data)
         guard n > 0, let arr = par.pointee.coded_side_data else { return }
@@ -855,19 +1060,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             guard let data = arr[i].data,
                   Int(arr[i].size) >= MemoryLayout<AVDOVIDecoderConfigurationRecord>.size else { return }
             data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { rec in
-                // Fully populate the record (not a partial relabel): movenc's DoVi validation wants a complete,
-                // internally-consistent Profile 8.1 config. dv_version_major must be 1 and dv_level must be
-                // non-zero or mov_init can EINVAL; a P7 source's md_compression may be non-zero, invalid for the
-                // fragmented-output DoVi box, so force NONE.
                 rec.pointee.dv_version_major = 1
                 rec.pointee.dv_version_minor = 0
-                rec.pointee.dv_profile = 8
                 rec.pointee.dv_level = max(rec.pointee.dv_level, 1)   // keep the source level, never 0
-                rec.pointee.dv_bl_signal_compatibility_id = 1   // BL-compatible (HDR10 base)
-                rec.pointee.el_present_flag = 0                 // the enhancement layer is dropped
+                rec.pointee.el_present_flag = 0                 // no lane maps or keeps an enhancement layer
                 rec.pointee.rpu_present_flag = 1
                 rec.pointee.bl_present_flag = 1
-                rec.pointee.dv_md_compression = UInt8(AV_DOVI_COMPRESSION_NONE.rawValue)
+                if relabelProfile81 {
+                    // convertP7 ONLY: the RPU is rewritten to uncompressed Profile 8.1, so the box must read
+                    // NONE to match. The stream-copy lane deliberately preserves the source md_compression
+                    // (see the doc comment) so a metadata-compressed RPU is never mislabeled NONE.
+                    rec.pointee.dv_md_compression = UInt8(AV_DOVI_COMPRESSION_NONE.rawValue)
+                    rec.pointee.dv_profile = 8
+                    rec.pointee.dv_bl_signal_compatibility_id = 1   // BL-compatible (HDR10 base)
+                }
             }
             return
         }
