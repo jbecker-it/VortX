@@ -137,6 +137,13 @@ struct TVPlayerView: View {
     // Flipping this re-renders `playerSurface` from AVPlayer to the mpv surface on the SAME TVPlayerView,
     // so the heavyweight forceMPV window rebuild is no longer needed for the common AVPlayer load failure.
     @State private var avEngineFailed = false
+    /// The engine routing decision, LATCHED once per playback (seeded in onAppear), mirroring
+    /// PlayerScreen.engineLatch. `useAVPlayerEngine` is read by `playerSurface` on every SwiftUI body pass
+    /// (4-9x/sec during playback), and re-running the full route each render (regex + UserDefaults +
+    /// RemoteConfig reads + two log lines) flooded the exported diagnostic log with hundreds of identical
+    /// [dv] route lines and cost main-thread time under 4K memory pressure (#76 b163 stutter). Every new
+    /// stream mints a new PlaybackRequest that rebuilds this view via `.id(req.id)`, resetting the latch.
+    @State private var engineLatch: Bool?
     // A brief, transient note explaining WHY the engine fell back (e.g. AVPlayer cannot demux DV-in-MKV),
     // so the silent demote the owner reported becomes an actionable explanation. Auto-clears after a few s.
     @State private var engineNote: String?
@@ -327,6 +334,11 @@ struct TVPlayerView: View {
             startTrickplayCaptureTimer()   // wall-clock capture backstop (fires on both engines)
             if curHint == nil { curHint = sourceHint }
             if curBinge == nil { curBinge = bingeGroup }
+            // Engine picked ONCE per playback (mirrors PlayerScreen.engineLatch). The seed writes the same
+            // Bool the nil-latch renders just computed, so `playerSurface` does not remount; a new stream
+            // rebuilds the whole view via `.id(req.id)` and reseeds. In-place switchStream deliberately
+            // keeps the launch route, and the demote lane (avEngineFailed) stays outside the latch.
+            if engineLatch == nil { engineLatch = routedToAVPlayer }
             // Guardrail (message-only): an "Always libmpv" engine override short-circuits the router BEFORE
             // the DV rules, silently disabling the true-DV remux lane; a DV title then tone-maps to HDR10
             // with no clue why. Say so once, in the log AND on screen, so the setting is discoverable.
@@ -399,13 +411,22 @@ struct TVPlayerView: View {
 
     // MARK: - Video surface (engine-routed under the same chrome)
 
-    /// Whether to mount the AVFoundation engine instead of libmpv for this stream (#76). Routes on the RAW
-    /// (un-proxied) launch URL: torrents and loopback URLs always stay on libmpv (the router enforces this),
-    /// and Dolby Vision in an AVPlayer-playable container / remote HLS auto-routes to AVPlayer for true DV
-    /// passthrough, AirPlay, and Picture in Picture. On an AVPlayer load failure we fall back to libmpv for
-    /// this stream (`avEngineFailed`). The DV flag comes from the launching stream's quality text (`sourceHint`).
+    /// Whether to mount the AVFoundation engine instead of libmpv for this stream (#76). The decision comes
+    /// from `engineLatch` (seeded ONCE in onAppear); the 1-2 pre-onAppear renders fall through the nil latch
+    /// to the same computed value, so the seed cannot swap the mounted surface. The demote lane
+    /// (`avEngineFailed`) stays OUTSIDE the latch so an AVPlayer failure still falls back to libmpv in place.
     private var useAVPlayerEngine: Bool {
         if forceMPV || avEngineFailed { return false }   // escape hatch / an AVPlayer load failure fell back to libmpv
+        return engineLatch ?? routedToAVPlayer
+    }
+
+    /// The raw routing computation, mirroring PlayerScreen.routedToAVPlayer. Consulted only for the pre-onAppear
+    /// renders and once to seed `engineLatch`; never re-consulted mid-playback, so a Settings / RemoteConfig
+    /// refresh cannot flip the engine live. Routes on the RAW (un-proxied) launch URL: torrents and loopback
+    /// URLs always stay on libmpv (the router enforces this), and Dolby Vision in an AVPlayer-playable
+    /// container / remote HLS auto-routes to AVPlayer for true DV passthrough, AirPlay, and Picture in
+    /// Picture. The DV flag comes from the launching stream's quality text (`sourceHint`).
+    private var routedToAVPlayer: Bool {
         // A yt-direct adaptive pair NEEDS libmpv (the audio sidecar rides mpv --audio-files; AVPlayer
         // would play the video-only stream silent), so it bypasses AVPlayer routing entirely.
         if audioSidecarURL != nil { return false }
@@ -416,13 +437,13 @@ struct TVPlayerView: View {
         let chosen = PlayerEngineRouter.engine(for: url, isTorrent: torrent || loopback, isDolbyVision: isDV,
                                                dvDisplayCapable: DVDisplaySupport.isCapable)
         // [dv] routing probe: first line of the DV trail (route -> mount -> classify -> fallback -> demote).
-        // Gated, so free in shipping builds. AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv
-        // here means the DV source tone-maps to HDR10.
+        // With the engineLatch this fires only on the pre-onAppear renders plus the single seed, so the
+        // exported log gets the route trail once per stream instead of once per body pass (#76 b163 flood).
+        // AVPlayer on a DV source is the true-DV lane (VideoToolbox); mpv here means HDR10 tone-map.
         let routeLine = "route file=\(url.lastPathComponent) isDV=\(isDV) dvDisplayCapable=\(DVDisplaySupport.isCapable) candidate=\(PlayerEngineRouter.isDVRemuxCandidate(url)) container=\(PlayerEngineRouter.isAVPlayerContainer(url)) -> engine=\(chosen.rawValue)"
         VXProbe.log("dv", routeLine)
-        // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag in an exportable
-        // diagnostics log (the VXProbe line above is gated off in shipping builds, which is why user DV
-        // reports arrived with no route trail). Deduped, because this computed property runs per render.
+        // ALWAYS-ON breadcrumb: user builds must record the engine choice + DV flag even with probe
+        // logging off. Deduped, so the handful of pre-latch evaluations write one line.
         DVRouteBreadcrumb.log(routeLine)
         return chosen == .avfoundation
     }
@@ -2055,6 +2076,8 @@ struct TVPlayerView: View {
     /// fallback the .failed case uses. NOT armed for libmpv (torrents legitimately warm up far longer, which
     /// is what the 30s loadTimeout / torrent warm-up budget cover). Cancelled the moment playback starts
     /// (the timePos handler cancels loadTimeout/recoveryDeadline and clears this) or the view goes away.
+    /// When the DV remux is mounted AND its produced-byte count is still growing at a fire, the deadline
+    /// extends bounded rounds (see the loop below) so a slow-but-alive remux is not demoted to HDR10.
     private func startAVStartWatchdog() {
         avStartWatchdog?.cancel()
         guard useAVPlayerEngine, !forceMPV, !avEngineFailed else { return }
@@ -2064,17 +2087,42 @@ struct TVPlayerView: View {
         // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
         if PlayerEngineRouter.isHLS(url) { return }
         avStartWatchdog = Task { @MainActor in
-            try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
-            guard !Task.isCancelled, !hasStartedPlaying else { return }
-            guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
-            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
-            if remuxMounted {
-                // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
-                // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
-                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s -> libmpv HDR10")
+            // Remux-aware bounded extension (#76 b163/b164): a cold-debrid DV remux can keep producing bytes
+            // well past 20s before AVPlayer reaches readyToPlay, and the fixed deadline silently demoted every
+            // such session to libmpv HDR10 (mount -> classify -> loaded on mpv ~20-22s later in both user logs).
+            // If the remux is mounted and its produced-byte count measurably GREW since the previous check,
+            // extend one more round (cap 2 extensions, 60s total) instead of demoting. Any abnormal read (no
+            // remux, produced 0, accessor -1, no growth) demotes exactly as before, and the .failed instant
+            // demote path is untouched, so a genuinely dead mount still falls back on today's schedule.
+            var lastProducedBytes = 0
+            var extensionsUsed = 0
+            let maxExtensions = 2
+            while true {
+                try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+                guard !Task.isCancelled, !hasStartedPlaying else { return }
+                guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
+                let engine = coordinator.player as? AVPlayerEngineController
+                let remuxMounted = engine?.isRemuxMounted == true
+                let producedBytes = engine?.remuxProducedBytes ?? -1
+                if remuxMounted, extensionsUsed < maxExtensions, producedBytes > 0, producedBytes > lastProducedBytes {
+                    extensionsUsed += 1
+                    lastProducedBytes = producedBytes
+                    // The 30s loadTimeout cannot see remux progress (bufferedTime stays 0 pre-ready) and would
+                    // hop away mid-extension; hold it off for this bounded window. demoteAVPlayerToMPV re-arms
+                    // it via startLoadTimeout, so the mpv reload keeps its full watchdog coverage either way.
+                    loadTimeout?.cancel()
+                    DiagnosticsLog.log("dv", "start watchdog: remux still producing (bytes=\(producedBytes)), extending \(Int(avStartWatchdogSeconds))s (\(extensionsUsed)/\(maxExtensions))")
+                    continue
+                }
+                DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted), extensions used=\(extensionsUsed)), falling back to libmpv")
+                if remuxMounted {
+                    // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
+                    // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
+                    DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s (+\(extensionsUsed) extensions) -> libmpv HDR10")
+                }
+                demoteAVPlayerToMPV()
+                return
             }
-            demoteAVPlayerToMPV()
         }
     }
 
@@ -3395,11 +3443,11 @@ struct TVPlayerView: View {
 
 // MARK: - Always-on DV route breadcrumb
 
-/// Deduplicated DiagnosticsLog for the engine-route line: `useAVPlayerEngine` is a computed property that
-/// runs on every SwiftUI render pass, so an unconditional DiagnosticsLog there would flood the exportable
-/// log. This records the line only when it CHANGES (a new title / route decision), giving user builds an
-/// always-on route -> mount -> demote trail without the VXProbe gate. Plain static state, not SwiftUI state,
-/// so writing it during a render pass is safe (it is not observed).
+/// Deduplicated DiagnosticsLog for the engine-route line: `routedToAVPlayer` runs on the few pre-latch
+/// render passes (engineLatch caps it, #76 b163), so an unconditional DiagnosticsLog there would still
+/// write a handful of identical lines. This records the line only when it CHANGES (a new title / route
+/// decision), giving user builds an always-on route -> mount -> demote trail without the VXProbe gate.
+/// Plain static state, not SwiftUI state, so writing it during a render pass is safe (it is not observed).
 @MainActor
 private enum DVRouteBreadcrumb {
     private static var last = ""

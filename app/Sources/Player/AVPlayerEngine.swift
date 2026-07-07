@@ -91,6 +91,10 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// bytes linearly, so a pre-start seek lands in bytes that do not exist yet, no frame ever arrives, and
     /// the start watchdog demotes the whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil }
+    /// Bytes the mounted DV remux has produced so far; -1 when no remux is mounted. The chrome's start
+    /// watchdog reads this to tell a still-muxing remux (bytes growing, extend the deadline) from a dead
+    /// mount (no growth, demote to libmpv exactly as before).
+    var remuxProducedBytes: Int { remuxLoader?.producedBytes ?? -1 }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
