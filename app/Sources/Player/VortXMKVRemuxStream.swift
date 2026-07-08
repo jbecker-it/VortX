@@ -10,10 +10,11 @@ import Libdovi
 
 /// DV-for-MKV STREAMING remux (Phase 1). Opens an MKV from a debrid HTTP(S) URL and stream-copies it into a
 /// fragmented MP4, writing the muxed bytes to an in-memory `VortXRemuxBuffer` via a CUSTOM AVIO write callback
-/// (no file, no disk). `VortXRemuxResourceLoader` serves that buffer to AVPlayer as `vortxremux://` byte
-/// ranges, so AVPlayer plays TRUE Dolby Vision (Profile 5 / 8.1 / 8.4) out of an MKV that AVFoundation cannot
-/// demux directly. Stream-copy re-wraps the exact HEVC access units, so the DV RPU (SEI NALs) + the DOVI
-/// config box survive; only the container changes.
+/// (no file, no disk). `VortXRemuxHLSServer` serves that buffer to AVPlayer as local HLS (the b166 default
+/// delivery; the legacy `VortXRemuxResourceLoader` progressive path stays compiled for rollback), so AVPlayer
+/// plays TRUE Dolby Vision (Profile 5 / 8.1 / 8.4) out of an MKV that AVFoundation cannot demux directly.
+/// Stream-copy re-wraps the exact HEVC access units, so the DV RPU (SEI NALs) + the DOVI config box survive;
+/// only the container changes.
 ///
 /// What the output CARRIES is constrained by what AVPlayer can actually play:
 ///   - Video: single-layer DV Profile 5 / 8.x plays as a pure stream-copy. Dual-layer Profile 7 (BL+EL, i.e.
@@ -50,10 +51,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private var thread: Thread?
     private let cancelledFlag = ManagedAtomicFlag()
 
-    /// AVIO write scratch: libav wants an aligned malloc'd buffer it owns for the AVIO context. We keep the
-    /// opaque (a retained reference to `self`) alive for the whole session so the C callback never touches a
-    /// freed object.
-    private static let avioBufferSize = 1 << 16   // 64 KiB muxer write chunk
+    /// AVIO write scratch: libav wants an aligned malloc'd buffer it owns for the AVIO context. The callback's
+    /// opaque is an UNRETAINED pointer to `self`, kept alive for the whole session by the remux thread's
+    /// strong capture (see `start()`), so the C callback never touches a freed object.
+    /// MUST stay >= hlsHeadCap. movenc writes every box as a 32-bit size PLACEHOLDER + fourcc and backpatches
+    /// via update_size() -> avio_seek(); with no seek callback that backward seek only succeeds while the box's
+    /// first byte is still in the UNFLUSHED avio buffer (aviobuf's in-buffer write seek). delay_moov writes the
+    /// moov into an empty buffer and flushes right after it, so "moov fits in this buffer" is the exact
+    /// requirement: a moov bigger than the buffer gets its placeholder flushed mid-write, update_size's seek
+    /// fails EPIPE (movenc IGNORES it), and the stream carries a size=0 moov + a zero-size box chain inside it
+    /// that neither hlsIndexHead nor AVPlayer can parse (the "hls init scan aborted: size=0 type=moov" device
+    /// failure on sources with multi-KB..64KB+ hvcC/udta). 4 MiB == hlsHeadCap covers any bloated remux moov;
+    /// for every file whose moov already fit in the old 64 KiB the produced bytes are bit-identical (the only
+    /// flushes this removes are the mid-box overflow ones).
+    private static let avioBufferSize = 4 << 20   // 4 MiB; == hlsHeadCap by design, never shrink below it
 
     /// HLS delivery mode (b166). AVFoundation does NOT support a plain progressive fragmented MP4: it treats
     /// the vortxremux:// asset as a regular file, cannot index an open-ended fMP4, and either fails the item
@@ -87,10 +98,10 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// strings, the DV SUPPLEMENTAL-CODECS compatibility brand, and VIDEO-RANGE. Apple's HLS authoring spec
     /// calls the brand + VIDEO-RANGE mandatory cross-checks for DV 8.1.
     struct HLSSignaling {
-        let videoCodec: String        // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5)
-        let supplementalCodec: String?// "dvh1.08.06/db1p" for P8.1; nil when not applicable
-        let videoRange: String?       // "PQ" / "HLG"
-        let audioCodec: String?       // "ec-3" / "ac-3" / "mp4a.40.2" / ...
+        let videoCodec: String         // "hvc1.2.4.L153.B0" (P8) or "dvh1.05.06" (P5)
+        let supplementalCodec: String? // "dvh1.08.06/db1p" for P8.1; nil when not applicable
+        let videoRange: String?        // "PQ" / "HLG"
+        let audioCodec: String?        // "ec-3" / "ac-3" / "mp4a.40.2" / ...
         let width: Int
         let height: Int
         let bandwidth: Int
@@ -916,16 +927,39 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         hlsHeadBuf.append(contentsOf: UnsafeBufferPointer(start: bytes, count: count))
         var pos = 0
         while pos + 8 <= hlsHeadBuf.count {
-            let size = (Int(hlsHeadBuf[pos]) << 24) | (Int(hlsHeadBuf[pos + 1]) << 16)
+            var size = (Int(hlsHeadBuf[pos]) << 24) | (Int(hlsHeadBuf[pos + 1]) << 16)
                      | (Int(hlsHeadBuf[pos + 2]) << 8) | Int(hlsHeadBuf[pos + 3])
             let fourcc = String(bytes: hlsHeadBuf[(pos + 4)...(pos + 7)], encoding: .ascii) ?? "?"
-            guard size >= 8 else {   // 64-bit largesize / malformed header: give up (fail-soft, see doc)
-                hlsHeadDone = true; hlsHeadBuf = []
-                DiagnosticsLog.log("dv", "hls init scan aborted: unparseable top-level box size=\(size) type=\(fourcc)")
-                return
+            var headerLen = 8
+            if size == 1 {   // ISO-BMFF largesize: real 64-bit size in bytes pos+8..pos+15
+                guard pos + 16 <= hlsHeadBuf.count else { return }   // wait for the largesize field
+                var big: UInt64 = 0
+                for i in 0..<8 { big = (big << 8) | UInt64(hlsHeadBuf[pos + 8 + i]) }
+                guard big >= 16, big <= UInt64(Int.max - pos) else {
+                    hlsHeadDone = true; hlsHeadBuf = []
+                    DiagnosticsLog.log("dv", "hls init scan aborted: malformed largesize \(big) type=\(fourcc)")
+                    return
+                }
+                size = Int(big)
+                headerLen = 16
             }
             if fourcc == "moov" {
-                guard pos + size <= hlsHeadBuf.count else { return }   // moov not fully buffered yet: wait
+                guard size >= headerLen else {
+                    // movenc's UNPATCHED placeholder: the moov outgrew the forward-only AVIO buffer, the muxer
+                    // could not backpatch, and the box chain inside it is zero-sized too (not locally
+                    // repairable). Fail soft as before, but say WHY. avioBufferSize == hlsHeadCap makes this
+                    // unreachable for any init the head scan could accept.
+                    hlsHeadDone = true; hlsHeadBuf = []
+                    DiagnosticsLog.log("dv", "hls init scan aborted: moov size field \(size) unpatched (moov exceeded avioBufferSize=\(Self.avioBufferSize) on the forward-only AVIO)")
+                    return
+                }
+                guard pos + size <= hlsHeadBuf.count else {
+                    if hlsHeadBuf.count > Self.hlsHeadCap {   // bogus giant moov: never wait past the cap
+                        hlsHeadDone = true; hlsHeadBuf = []
+                        DiagnosticsLog.log("dv", "hls init scan aborted: moov size \(size) exceeds the \(Self.hlsHeadCap)B cap")
+                    }
+                    return   // moov not fully buffered yet: wait
+                }
                 let initLen = pos + size
                 let initData = Data(hlsHeadBuf[0..<initLen])
                 hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
@@ -934,9 +968,14 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov)")
                 return
             }
-            if fourcc == "moof" || fourcc == "mdat" {   // fragment data before any moov: cannot delimit
+            if fourcc == "moof" || fourcc == "styp" || fourcc == "mdat" {   // fragment data before any moov
                 hlsHeadDone = true; hlsHeadBuf = []
                 DiagnosticsLog.log("dv", "hls init scan aborted: \(fourcc) arrived before moov")
+                return
+            }
+            guard size >= headerLen else {   // zero/malformed size on a box we must walk PAST: give up
+                hlsHeadDone = true; hlsHeadBuf = []
+                DiagnosticsLog.log("dv", "hls init scan aborted: unparseable top-level box size=\(size) type=\(fourcc)")
                 return
             }
             pos += size   // skip ftyp/free/... ; loop waits for more bytes if the next header is not in yet
@@ -1053,7 +1092,8 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         let n = Int(par.pointee.extradata_size)
         guard n >= 23, ex[0] == 1 else { return nil }
         let profileSpace = Int((ex[1] >> 6) & 0x3)
-        let tier = (ex[1] >> 5) & 0x1
+        // general_tier_flag (ex[1] bit 5) is deliberately NOT read: the HLS CODECS tier is FORCED to Main ("L")
+        // below - the fix for the dominant DV-remux -1002 (see the note on the `s` line).
         let profileIdc = ex[1] & 0x1F
         // general_profile_compatibility_flags, bit-reversed then hex, per RFC 6381 (e.g. Main10 -> "4").
         var compat: UInt32 = (UInt32(ex[2]) << 24) | (UInt32(ex[3]) << 16) | (UInt32(ex[4]) << 8) | UInt32(ex[5])
@@ -1068,7 +1108,19 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             for k in 0...lastNonZero { constraints.append(String(format: "%X", ex[6 + k])) }
         }
         let spacePrefix = ["", "A", "B", "C"][profileSpace]
-        var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).\(tier == 0 ? "L" : "H")\(level)"
+        // TIER FORCED TO MAIN ("L"), never High ("H"). Fix for the dominant DV-remux -1002 ("unsupported URL /
+        // no playable variant", 3 of 4 real DV files). A high-bitrate 4K DV remux whose HEVC base is genuinely
+        // High tier (general_tier_flag=1; e.g. a ~69 Mbps UHD Profile-7 remux, BANDWIDTH ~86 Mbps, above Main
+        // L5.1's 40 Mbps ceiling) makes the muxer's hvcC honestly report High tier, so this would read
+        // "hvc1.2.4.H153.B0". AVFoundation's multivariant Dolby Vision validation rejects a High-tier base for
+        // DV Profile 8.1 (whose conformance is Main-tier-based; Apple's canonical form is "hvc1.2.4.L153.B0").
+        // The master carries exactly ONE variant, so that single rejection leaves ZERO playable variants and
+        // AVFoundation reports NSURLErrorUnsupportedURL / CoreMediaErrorDomain -1002 (it never even degrades to
+        // the plain HDR10 base, proving the BASE codec's tier is what disqualifies the variant). CODECS governs
+        // only variant SELECTION; the init segment's real hvcC (still truthfully High tier) is what VideoToolbox
+        // decodes, and the hardware decodes regardless of the advertised tier. Profile/compat/level/constraints
+        // are left exact.
+        var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).L\(level)"
         if !constraints.isEmpty { s += "." + constraints.joined(separator: ".") }
         return s
     }
@@ -1400,15 +1452,6 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         }
     }
 
-    /// Convert the Dolby Vision RPU inside one base-layer HEVC packet from Profile 7 to Profile 8.1, in place,
-    /// and drop any in-band enhancement-layer (UNSPEC63) NAL. Walks the length-prefixed access unit, and for
-    /// each NAL either passes it through, converts it (the UNSPEC62 RPU), or drops it (the UNSPEC63 EL). The
-    /// packet's data buffer is replaced with the rebuilt access unit via `av_packet_from_data`.
-    ///
-    /// FAIL-SOFT by design: on ANY problem (unparseable prefixing, a libdovi parse/convert/write error, an
-    /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
-    /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
-    /// genuinely can't convert.
     /// Detect the Dolby Vision profile from an IN-BAND HEVC RPU when the container carried no DOVI config. Walks
     /// one base-video access unit's length-prefixed NALs; on the FIRST UNSPEC62 (type 62) RPU it parses the RPU
     /// with libdovi and returns its `guessed_profile` (5/7/8...). Returns -1 when the packet has no parseable RPU.
@@ -1440,6 +1483,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return -1
     }
 
+    /// Convert the Dolby Vision RPU inside one base-layer HEVC packet from Profile 7 to Profile 8.1, in place,
+    /// and drop any in-band enhancement-layer (UNSPEC63) NAL. Walks the length-prefixed access unit, and for
+    /// each NAL either passes it through, converts it (the UNSPEC62 RPU), or drops it (the UNSPEC63 EL). The
+    /// packet's data buffer is replaced with the rebuilt access unit via `av_packet_from_data`.
+    ///
+    /// FAIL-SOFT by design: on ANY problem (unparseable prefixing, a libdovi parse/convert/write error, an
+    /// allocation failure) the packet is left byte-for-byte unchanged. That keeps a single quirky access unit
+    /// from aborting the session; the AVPlayer -> libmpv demotion remains the hard backstop for a source that
+    /// genuinely can't convert.
     private static func convertPacketRPUToProfile81(_ pkt: UnsafeMutablePointer<AVPacket>, nalLengthSize: Int, stats: inout RPUConvStats) {
         guard let src = pkt.pointee.data else { return }
         let total = Int(pkt.pointee.size)

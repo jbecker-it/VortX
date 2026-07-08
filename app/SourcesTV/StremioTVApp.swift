@@ -55,6 +55,11 @@ struct StremioTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
+                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    // Heal a drifted embedded-server session without visiting Settings: one GET that latches
+                    // the real bound port if server.js fell back off 11470 while we were suspended.
+                    Task.detached(priority: .utility) { _ = await StremioServer.isOnline() }
+                    #endif
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                         // Account-owns-everything: if the engine is degraded (no stream add-on), hydrate the

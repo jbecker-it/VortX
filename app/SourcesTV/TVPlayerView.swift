@@ -2085,8 +2085,6 @@ struct TVPlayerView: View {
     /// fallback the .failed case uses. NOT armed for libmpv (torrents legitimately warm up far longer, which
     /// is what the 30s loadTimeout / torrent warm-up budget cover). Cancelled the moment playback starts
     /// (the timePos handler cancels loadTimeout/recoveryDeadline and clears this) or the view goes away.
-    /// When the DV remux is mounted AND its produced-byte count is still growing at a fire, the deadline
-    /// extends bounded rounds (see the loop below) so a slow-but-alive remux is not demoted to HDR10.
     private func startAVStartWatchdog() {
         avStartWatchdog?.cancel()
         guard useAVPlayerEngine, !forceMPV, !avEngineFailed else { return }
@@ -2151,7 +2149,10 @@ struct TVPlayerView: View {
     /// stale across engine-resolved episode switches, so it is only recorded, not
     /// trusted here.
     private var isTorrentPlayback: Bool {
-        guard let u = curURL, u.port == 11470, u.pathComponents.count >= 3 else { return false }
+        // Follow the DISCOVERED server port, not a hardcoded 11470: server.js silently drifts to 11471-11474 on
+        // EADDRINUSE and the embedded base follows it, so a hardcoded 11470 here would misclassify a drifted
+        // torrent URL as non-torrent and skip the engine warm-up wait.
+        guard let u = curURL, u.port == StremioServer.embeddedPort, u.pathComponents.count >= 3 else { return false }
         let hash = u.pathComponents[1]
         return hash.count == 40 && hash.allSatisfy(\.isHexDigit)
     }

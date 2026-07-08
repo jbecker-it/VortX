@@ -1,15 +1,17 @@
 import Foundation
 
 /// A thread-safe, forward-only growing byte buffer for the DV-for-MKV streaming remux (Phase 1). The remux
-/// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the resource
-/// loader (`VortXRemuxResourceLoader`) reads byte ranges out of it to feed AVPlayer.
+/// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the local HLS
+/// server (`VortXRemuxHLSServer`, the default delivery) reads closed-segment byte ranges out of it, and the
+/// legacy progressive loader (`VortXRemuxResourceLoader`, the rollback path) reads it sequentially.
 ///
 /// Design notes:
 /// - APPEND-ONLY at the head. Bytes are only ever added at the end; nothing already produced is rewritten. This
 ///   matches a forward-only stream-copy remux, where the muxer writes fMP4 fragments in order.
-/// - BOUNDED SLIDING WINDOW at the tail. Because the resource loader advertises NO byte-range access
-///   (`isByteRangeAccessSupported = false`), AVPlayer streams the asset strictly sequentially from offset 0 via
-///   one open-ended request, so once a byte has been read it is never re-requested. We therefore drop bytes that
+/// - BOUNDED SLIDING WINDOW at the tail. Both deliveries consume the stream front-to-back: the legacy loader
+///   advertises NO byte-range access (`isByteRangeAccessSupported = false`) so AVPlayer streams strictly
+///   sequentially from offset 0, and the HLS server only serves CLOSED segments of an append-only EVENT
+///   playlist, so once a byte has been read it is essentially never re-requested. We therefore drop bytes that
 ///   sit well below the reader's low-water mark, keeping only a small re-read floor plus a bounded producer
 ///   lead (the producer BLOCKS in `append` once resident bytes hit floor + lead, so a slow/paused reader can
 ///   never let it run away). This caps RAM at roughly (floor + producer lead) instead of the whole
@@ -109,8 +111,9 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         var failure: String?    // non-nil if the remux failed OR the range fell below the evicted window
     }
 
-    /// Snapshot of stream state without blocking. Used by the loader to answer a content-information request
-    /// and to decide whether a data request can be served immediately.
+    /// Snapshot of stream state without blocking. Used by the HLS server's poll loops to detect a remux
+    /// failure, and by the loader to answer a content-information request / decide whether a data request
+    /// can be served immediately.
     func status() -> (produced: Int, finished: Bool, failure: String?) {
         condition.lock(); defer { condition.unlock() }
         return (producedCount, isFinished, failureMessage)

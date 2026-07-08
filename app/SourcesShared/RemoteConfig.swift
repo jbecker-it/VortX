@@ -36,7 +36,14 @@ enum RemoteConfigDefaults {
     static let macCeilingMiB = 1024          // macOS ceiling (was `1_024 * 1024 * 1024`)
     static let offFloorMiB = 64              // hard floor: no ceiling may drop below this
     static let vodReadaheadSecs = 300        // demuxer-readahead-secs for VOD (configureLiveMode else-branch)
-    static let dvRemuxWindowMiB = 64         // DV-for-MKV remux buffer sliding-window re-read floor (VortXRemuxBuffer)
+    static let dvRemuxWindowMiB = 64         // Re-read floor MUST stay >= hlsMaxSegmentBytes (32 MiB) + avio lag, else
+                                             // the 3 startup segments cannot fit the buffer park and a high-bitrate DV
+                                             // remux starves its playlist -> the 20s watchdog demotes to HDR10 (the exact
+                                             // symptom the tier fix rescues). Kept at 64 for the DV emergency build so the
+                                             // ONLY DV change is the tier + buffer fixes; the memory win comes from the
+                                             // AVPlayer preferredForwardBufferDuration cap + the server fixes. Lowering this
+                                             // (with a matching smaller hlsMaxSegmentBytes) is a follow-up, trialable on the
+                                             // fleet via the RemoteConfig dial without a build.
 
     // Timeouts (detail settle / debrid resolve). Present for future wiring; clamped in validate.
     static let detailSettleIOSSecs = 12

@@ -4,8 +4,19 @@ import Foundation
 /// streams play straight from their URL; torrents are created on the local server, which fetches
 /// pieces and exposes the selected file over HTTP for libmpv to play.
 enum StremioServer {
-    /// The on-device server. Used unless the user points at a remote/dedicated server.
-    static let embedded = "http://127.0.0.1:11470"
+    /// The port the on-device server ACTUALLY bound. server.js targets 11470 but silently falls back to
+    /// 11471-11474 on EADDRINUSE (a fast-relaunch race), so the embedded base FOLLOWS the discovered port
+    /// instead of hardcoding 11470. A drifted port used to strand the whole session: badge Offline, every
+    /// torrent request refused. On the Lite build (no embedded server) and on macOS (MacNodeServer reclaims
+    /// and rebinds 11470 reliably via its own port handling), this stays the fixed 11470.
+    static var embeddedPort: Int {
+        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+        if let p = NodeServer.discoveredPort { return p }
+        #endif
+        return 11470
+    }
+    /// The on-device server base. Used unless the user points at a remote/dedicated server.
+    static var embedded: String { "http://127.0.0.1:\(embeddedPort)" }
     private static let urlKey = "stremiox.serverURL"
 
     /// The active streaming-server base, the user's custom URL if set, else the embedded one.
@@ -100,14 +111,40 @@ enum StremioServer {
         return (resp as? HTTPURLResponse)?.statusCode == 200
     }
 
-    /// Is the active streaming server reachable? (Settings shows this.)
+    /// Is the active streaming server reachable? (Settings shows this.) Scans the embedded server's whole
+    /// fallback range (11470-11474) and LATCHES the live port, so a drifted boot self-heals instead of
+    /// reading Offline forever. Validates the /settings body shape so a foreign local listener on one of
+    /// these ports can never be latched as ours.
     static func isOnline() async -> Bool {
-        guard let url = URL(string: "\(base)/settings") else { return false }
+        if await respondsAsServer("\(base)/settings") { return true }
+        guard !isCustom else { return false }
+        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+        // Only the in-process iOS/tvOS server drifts; macOS (MacNodeServer) reclaims and rebinds 11470,
+        // and the Lite build ships no embedded server, so neither scans (and NodeServer.latch is absent there).
+        for port in 11470...11474 where port != embeddedPort {
+            if await respondsAsServer("http://127.0.0.1:\(port)/settings") {
+                NodeServer.latch(port: port)
+                NSLog("StremioX: embedded server discovered on :\(port); latched")
+                return true
+            }
+        }
+        #endif
+        return false
+    }
+
+    /// True only when `urlString` answers /settings with HTTP 200 AND a Stremio settings body (a top-level
+    /// `values` object, per server.js's GET /settings shape). The body check keeps an unrelated local
+    /// listener on one of these ports from being mistaken for, and latched as, our embedded server.
+    private static func respondsAsServer(_ urlString: String) async -> Bool {
+        guard let url = URL(string: urlString) else { return false }
         var req = URLRequest(url: url)
         req.timeoutInterval = 4
         req.cachePolicy = .reloadIgnoringLocalCacheData
-        guard let (_, resp) = try? await URLSession.shared.data(for: req) else { return false }
-        return (resp as? HTTPURLResponse)?.statusCode == 200
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["values"] != nil else { return false }
+        return true
     }
 
     /// The playable URL for a stream, its direct URL, or the local server's file endpoint for a
@@ -192,7 +229,7 @@ enum StremioServer {
     /// (remote) servers are left alone. Best-effort; polls while the server finishes booting.
     @discardableResult
     static func applyServerConfig(maxAttempts: Int = 20) async -> Bool {
-        guard !isCustom, let url = URL(string: "\(embedded)/settings") else { return false }
+        guard !isCustom else { return false }
         // The cache counts toward the app's OWN memory on iOS/iPadOS/tvOS (the server runs in-process), so
         // on top of mpv's 4K decode buffers even a 512 MB cache trips iOS jetsam on a real device during
         // playback (the device-only "server dies" report; the Simulator never hits it because it borrows
@@ -225,6 +262,11 @@ enum StremioServer {
         // the entire session. A successful POST also proves the server is reachable, so it doubles as the
         // readiness gate (no separate isOnline() round-trip). Bounded loop; ~1 s between tries.
         for attempt in 0 ..< max(1, maxAttempts) {
+            // Rebuild the URL each attempt so a mid-boot port latch (server.js drifted off 11470) is
+            // picked up: `embedded` follows NodeServer.discoveredPort, so a later retry POSTs the cap to
+            // the ACTUAL bound port instead of hammering a dead one for the whole loop (which would leave
+            // the 2 GB default cache in place and jetsam the app under torrent load).
+            guard let url = URL(string: "\(embedded)/settings") else { return false }
             var req = URLRequest(url: url)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")

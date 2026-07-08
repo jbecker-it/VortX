@@ -98,10 +98,6 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
     /// seek lands in bytes that do not exist yet, no frame ever arrives, and the start watchdog demotes the
     /// whole session to libmpv (killing BOTH true DV and Atmos on every replay).
     var isRemuxMounted: Bool { remuxLoader != nil || remuxHLSServer != nil }
-    /// Bytes the mounted DV remux has produced so far; -1 when no remux is mounted. The chrome's start
-    /// watchdog reads this to tell a still-muxing remux (bytes growing, extend the deadline) from a dead
-    /// mount (no growth, demote to libmpv exactly as before).
-    var remuxProducedBytes: Int { remuxHLSServer?.producedBytes ?? remuxLoader?.producedBytes ?? -1 }
     /// The launch site sets this from the stream's Dolby Vision flag BEFORE loadFile (same plumbing as the
     /// libmpv lane, MPVMetalViewController.contentIsDolbyVision). Used to request the Apple TV's Dolby Vision
     /// display mode BEFORE the AVPlayerItem is attached (Apple Tech Talk 503 ordering) for ALL DV routes:
@@ -172,6 +168,13 @@ final class AVPlayerEngineController: NSObject, PlayerEngine {
         }
         let newItem = AVPlayerItem(asset: newAsset)
         item = newItem
+        if remuxHLSServer != nil {
+            // The remux window bounds OUR buffer, but AVPlayer keeps its OWN forward buffer of the served HLS
+            // and, left unset, sizes it at its discretion (hundreds of MB at 4K DV bitrates, in the SAME
+            // jetsam-bound process as node + mpv - a major contributor to the ~900MB that gets the app killed
+            // on backgrounding). 30s is ample against a local loopback origin the producer already leads.
+            newItem.preferredForwardBufferDuration = 30
+        }
         // Attach a pull-model frame tap so trickplay can grab the displayed frame on demand (see videoOutput).
         let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
             kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)

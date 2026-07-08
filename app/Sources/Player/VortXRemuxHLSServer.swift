@@ -22,7 +22,7 @@ import Network
 /// FAIL-SOFT GUARANTEE: a listener that will not start makes the factory return nil (the engine then emits
 /// endFileError and the chrome demotes to libmpv HDR10); a remux failure 404s the next playlist reload so
 /// AVPlayer errors into the same demotion; an evicted-segment request 404s the same way; and the chrome's
-/// 10s start watchdog covers a mount that never frames. Nothing here can hang playback.
+/// start watchdog covers a mount that never frames. Nothing here can hang playback.
 final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Delivery flag (rollback switch)
@@ -73,9 +73,6 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// Begin remuxing. Call once, after the asset is (about to be) mounted.
     func start() { stream.start() }
-
-    /// Bytes the remux has produced so far (the chrome's watchdog progress probe).
-    var producedBytes: Int { stream.buffer.status().produced }
 
     /// Stop everything: the remux thread, the listener, and every open connection. Idempotent.
     func invalidate() {
@@ -223,6 +220,11 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Waiting on the remux (bounded polls; every tick re-checks teardown + remux failure)
 
+    /// How long a playlist / init request may poll-wait for the remux to produce what it needs. Generous on
+    /// purpose: the chrome's start watchdog demotes a dead mount long before this bound is the limiter, so
+    /// it only stops an orphaned request from polling forever after a teardown race.
+    private static let resourceWaitSeconds: TimeInterval = 60
+
     /// Poll `probe` until it yields a value, the deadline passes, the server is invalidated, or the remux
     /// FAILS (its classify fail-fast / mid-stream error). Returns nil on every non-success path; the caller
     /// answers 404 and AVPlayer's error path drives the libmpv demotion.
@@ -242,7 +244,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// Master playlist: one variant carrying the DV signaling. Held until the remux has classified the
     /// source and written its header (the signaling exists from then on).
     private func serveMaster(_ connection: NWConnection) {
-        guard let sig = waitFor(seconds: 60, { stream.hlsSnapshot().signaling }) else {
+        guard let sig = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().signaling }) else {
             close(connection, status: "404 Not Found")
             return
         }
@@ -263,15 +265,19 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
         respond(connection, body: Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")
     }
 
+    /// Segments the FIRST media-playlist answer waits for, so AVPlayer's startup buffer math never sees a
+    /// near-empty window (a finished-early remux is exempt: `ended` publishes whatever exists).
+    private static let minStartupSegments = 3
+
     /// Media playlist: EVENT type (playback starts at the beginning; entries are only ever appended) over
-    /// the closed segments. The FIRST answer waits for three segments so AVPlayer's startup buffer math has
-    /// something to chew on; later reloads answer immediately with whatever exists.
+    /// the closed segments. The FIRST answer waits for `minStartupSegments` so AVPlayer's startup buffer
+    /// math has something to chew on; later reloads answer immediately with whatever exists.
     private func serveMedia(_ connection: NWConnection) {
         struct Ready { let segments: [VortXMKVRemuxStream.HLSSegment]; let ended: Bool }
-        let ready = waitFor(seconds: 60) { () -> Ready? in
+        let ready = waitFor(seconds: Self.resourceWaitSeconds) { () -> Ready? in
             let snap = stream.hlsSnapshot()
             guard snap.initData != nil, !snap.segments.isEmpty,
-                  snap.segments.count >= 3 || snap.ended else { return nil }
+                  snap.segments.count >= Self.minStartupSegments || snap.ended else { return nil }
             return Ready(segments: snap.segments, ended: snap.ended)
         }
         guard let ready else {
@@ -304,7 +310,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
     private func serveInit(_ connection: NWConnection) {
-        guard let initData = waitFor(seconds: 60, { stream.hlsSnapshot().initData }) else {
+        guard let initData = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().initData }) else {
             close(connection, status: "404 Not Found")
             return
         }

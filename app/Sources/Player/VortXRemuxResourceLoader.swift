@@ -18,6 +18,10 @@ import AVFoundation
 /// One loader instance backs one playback session. `invalidate()` stops the remux and unblocks any in-flight
 /// request. All delegate callbacks are dispatched to a dedicated serial queue set on the resource loader, so
 /// the blocking reads never touch the main thread.
+///
+/// LEGACY delivery (b166): the default DV-remux delivery is now local HLS (`VortXRemuxHLSServer`), the one
+/// way AVFoundation reliably consumes a growing fMP4. This progressive loader stays compiled as the instant
+/// rollback path behind `VortXRemuxHLSServer.deliveryEnabled`.
 final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     static let scheme = "vortxremux"
@@ -52,12 +56,6 @@ final class VortXRemuxResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
 
     /// Begin remuxing. Call once before / as the asset is mounted.
     func start() { stream.start() }
-
-    /// Total bytes the remux has produced so far (monotonic; the buffer snapshot is lock-guarded). Read-only
-    /// progress probe for the chrome's start watchdog: a count that keeps growing means the remux is alive
-    /// and still muxing toward readyToPlay, so the watchdog can extend instead of demoting a working DV
-    /// session to the libmpv HDR10 fallback.
-    var producedBytes: Int { stream.buffer.status().produced }
 
     /// Stop remuxing and unblock any waiting data request. Idempotent.
     func invalidate() {
