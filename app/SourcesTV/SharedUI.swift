@@ -570,6 +570,10 @@ struct PosterCard: View {
     /// (alongside the progress stripe) so Continue Watching cards say where playback resumes. Nil on
     /// every non-CW card, so their tiles are unchanged.
     var resumeSeconds: Double? = nil
+    /// Watched state (DESIGN.md "PosterCard — Watched state: 55% opacity plus a check badge").
+    /// Mirrors the DetailView episode-thumbnail treatment. Only data-bearing callers pass it
+    /// (the Library grid); the default keeps every other card pixel-identical.
+    var isWatched: Bool = false
     /// Explicit PORTRAIT card width, for callers that lay cards into FIXED grid cells (TVCategoryBrowse's
     /// 4-across grid) and need the card to EXACTLY fill its cell. nil = the self-sizing rails/surfaces, which
     /// honor the user's Poster Style width preset (#105). A fixed-cell caller MUST pass its cell width or the
@@ -638,7 +642,7 @@ struct PosterCard: View {
                     }
                 }
                     .overlay(alignment: .bottom) {
-                        if let progress, progress > 0.01 {
+                        if !isWatched, let progress, progress > 0.01 {
                             ProgressStripe(value: progress).padding(Theme.Space.xs)
                         }
                     }
@@ -653,6 +657,15 @@ struct PosterCard: View {
                                 .accessibilityLabel("Resumes at \(timecode)")
                         }
                     }
+                    .overlay(alignment: .topTrailing) {
+                        if isWatched {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.title2).foregroundStyle(Theme.Palette.accent)
+                                .padding(8).shadow(radius: 3)
+                                .accessibilityLabel("Watched")
+                        }
+                    }
+                    .opacity(isWatched ? 0.55 : 1)
                 if !catalogPrefs.hidePosterLabels {
                     Text(displayTitle)
                         .font(.system(size: 18, weight: .medium))

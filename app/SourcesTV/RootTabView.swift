@@ -228,12 +228,21 @@ struct RootTabView: View {
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(5)
         }
         .tint(theme.accent)
-        // Back/Menu floor: from any non-Home tab at its root, Menu returns to Home first; only Menu from the
-        // Home root exits to tvOS. A pushed page (DetailView, a Settings sub-screen) has a deeper responder
-        // that consumes Menu and pops one level, so this handler never fires there, preserving per-level pop.
-        // Passing nil on Home removes the handler so the system default (suspend to tvOS) runs; on every other
-        // tab the closure consumes Menu and routes to Home (the .onChange below then resets the tab we left).
-        .onExitCommand(perform: selection == 0 ? nil : { selection = 0 })
+        // Back/Menu floor, depth-aware. SwiftUI routes the exit command to the NEAREST .onExitCommand in the
+        // focused view's ancestry BEFORE UIKit's default NavigationStack pop, so this shell-level handler
+        // fires from ANY push depth on a non-Home tab (55ceff8 assumed pushed pages kept a deeper Menu
+        // responder; none exists, and the system pop never outranks a SwiftUI handler). When the active
+        // tab's stack has a page pushed, pop exactly one level (the same UINavigationController pop the
+        // system default performs on the Home tab, where this handler is nil); only at the tab's ROOT does
+        // Menu route to Home (the Beta-10 floor; the .onChange below then resets the tab we left). Home
+        // keeps nil so Menu at the Home root still suspends to tvOS.
+        .onExitCommand(perform: selection == 0 ? nil : {
+            if let nav = focusedNavigationController(), nav.viewControllers.count > 1 {
+                nav.popViewController(animated: true)
+            } else {
+                selection = 0
+            }
+        })
         // Automatic update popup on the shell (never over the player, which replaces this view). Appears once
         // per launch when a newer build exists, and again when the hourly re-check finds a still-newer one.
         .sheet(item: $updates.prompt) { release in
@@ -262,6 +271,34 @@ struct RootTabView: View {
         .onChange(of: theme.accentID) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.oled) { applyTabBarAccent(); ProfileStore.shared.captureTheme() }
         .onChange(of: theme.textScale) { ProfileStore.shared.captureTheme() }
+    }
+
+    /// The UIKit navigation controller backing the ACTIVE tab's `NavigationStack`, resolved from the
+    /// focused item's responder chain (SwiftUI's NavigationStack is UINavigationController-backed on
+    /// tvOS). Focus always lives inside the visible tab, so a dormant tab's stack can never resolve.
+    /// Returns nil when the focused item is not inside a navigation controller (tab bar focused,
+    /// mid-transition, or a future OS changing internals); the caller treats nil as "at root", so the
+    /// worst case is the old go-Home behavior, never a crash or a dead Menu press.
+    private func focusedNavigationController() -> UINavigationController? {
+        let windows = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+        guard let window = windows.first(where: { $0.isKeyWindow }) ?? windows.first else { return nil }
+        // The focused item can be a non-view SwiftUI focus proxy: climb the focus-environment chain to
+        // the first real UIView / UIViewController, then walk the responder chain to the enclosing stack.
+        var environment: (any UIFocusEnvironment)? = UIFocusSystem.focusSystem(for: window)?.focusedItem
+        var responder: UIResponder?
+        while let env = environment {
+            if let view = env as? UIView { responder = view; break }
+            if let vc = env as? UIViewController { responder = vc; break }
+            environment = env.parentFocusEnvironment
+        }
+        while let r = responder {
+            if let nav = r as? UINavigationController { return nav }
+            if let vc = r as? UIViewController, let nav = vc.navigationController { return nav }
+            responder = r.next
+        }
+        return nil
     }
 
     /// The focused / selected tab pill is system white by default; recolor it to the active accent

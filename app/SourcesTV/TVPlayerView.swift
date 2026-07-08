@@ -121,6 +121,7 @@ struct TVPlayerView: View {
     @State private var metadataLine = ""
     @State private var currentSkip: SkipSegment?
     @State private var autoSkippedStarts: Set<Double> = []   // segment starts already auto-skipped this episode
+    @State private var skipPillDismissedStart: Double?   // segment start whose pill Back dismissed: hides the pill without skipping; re-armed when the playhead leaves that segment
     /// Cumulative seek amount shown in a brief pill while seeking with the chrome HIDDEN (Netflix-style
     /// L/R seek that doesn't reveal the control bar). nil = no pill. Cleared after a short delay.
     @State private var hiddenSeekDelta: Double?
@@ -299,7 +300,7 @@ struct TVPlayerView: View {
             if showInfo && !showOptions && !loadFailed { controlBar }
             if showOptions { optionsPanel }
             if loadFailed { loadErrorOverlay }
-            if controlsHidden, let seg = currentSkip, upNextRemaining == nil, !isCreditsUpNext { skipPill(seg) }
+            if let seg = skipPillSegment { skipPill(seg) }
             if controlsHidden, let d = hiddenSeekDelta { hiddenSeekPill(d) }
             if controlsHidden, upNextRemaining != nil || isCreditsUpNext { upNextBand }
             if showStats, !loadFailed { statsOverlay }
@@ -674,10 +675,14 @@ struct TVPlayerView: View {
                 }
             }
             switch type {
-            case .menu: saveProgress(at: currentTime); leavePlayback()
+            case .menu:
+                // Back consumes a visible skip pill (hide it, keep playing); it exits only when no
+                // transient prompt is up — the same dismiss-not-exit precedent as the Up Next band.
+                if let seg = skipPillSegment { skipPillDismissedStart = seg.start }
+                else { saveProgress(at: currentTime); leavePlayback() }
             case .playPause: toggle()
             case .select:
-                if let seg = currentSkip { skipTo(seg) } else { showControls() }   // pill up → skip, else reveal
+                if let seg = skipPillSegment { skipTo(seg) } else { showControls() }   // pill up → skip, else reveal
             // Netflix-style seek-while-hidden: Left/Right nudge -/+10s directly, with a brief time pill,
             // WITHOUT revealing the whole control bar. Up/Down (and any other press) still reveal it.
             case .leftArrow: hiddenSeek(-seekStepSeconds)
@@ -2648,6 +2653,9 @@ struct TVPlayerView: View {
             return
         }
         if skip?.start != currentSkip?.start { currentSkip = skip }
+        // Re-arm a Back-dismissed pill once the playhead leaves that segment (seek-out, natural exit,
+        // or a new file's spans): the dismissal is scoped to one continuous stay inside the segment.
+        if let dismissed = skipPillDismissedStart, skip?.start != dismissed { skipPillDismissedStart = nil }
     }
 
     /// Re-resolve skip spans from every available layer (named chapters + crowd timestamps), once the
@@ -2672,7 +2680,7 @@ struct TVPlayerView: View {
             return
         }
         let key = "\(m.libraryId):\(m.season ?? 0):\(m.episode ?? 0)"
-        if key != skipFetchKey { apiSkipCandidates = []; autoSkippedStarts = [] }   // new episode: reset auto-skip
+        if key != skipFetchKey { apiSkipCandidates = []; autoSkippedStarts = []; skipPillDismissedStart = nil }   // new episode: reset auto-skip + pill dismissal
         skipFetchKey = key
         let dur = duration
         plog.info("skip: fetching key=\(key, privacy: .public) dur=\(Int(dur), privacy: .public)")
@@ -2723,6 +2731,15 @@ struct TVPlayerView: View {
             .padding(.bottom, Theme.Space.screenEdge * 3)
         }
         .transition(.opacity)
+    }
+
+    /// The skip pill actually on screen right now — one source of truth shared by the body render
+    /// and the remote handler: chrome hidden, a segment active, the Up Next band not owning the
+    /// corner, and not Back-dismissed for this segment.
+    private var skipPillSegment: SkipSegment? {
+        guard controlsHidden, let seg = currentSkip, upNextRemaining == nil, !isCreditsUpNext,
+              seg.start != skipPillDismissedStart else { return nil }
+        return seg
     }
 
     /// The "Skip Intro / Skip Outro" pill, bottom-trailing. Shown only while watching (controls hidden);
