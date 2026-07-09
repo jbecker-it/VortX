@@ -8,6 +8,10 @@ struct StremioTVApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
+        // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
+        // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
+        VortXCrashReporter.install()
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
@@ -80,7 +84,9 @@ struct StremioTVApp: App {
                 }
                 if phase == .background {
                     VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
-                    Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                    // push profiles + settings under a background-task grace window so a just-made library
+                    // removal / rewind survives a sideload-update process kill (CW resurrection fix).
+                    VortXSyncManager.shared.syncUpOnBackground()
                 }
             }
             .onAppear {

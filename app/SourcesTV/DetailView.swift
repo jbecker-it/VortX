@@ -247,8 +247,20 @@ struct DetailView: View {
     private func loadRatings() {
         guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
         Task {
-            let r = await MDBListClient.ratings(imdbID: imdb, type: type)
-            await MainActor.run { mdbRatings = r }
+            // VortX's keyless ratings service first (IMDb / RT / Metacritic / TMDB, no user key needed), then
+            // reach for the user's own MDBList key ONLY to fill what VortX did not return. Mirrors iOS so both
+            // surfaces show the same ratings row for every user, keyed or not (tvOS previously showed nothing
+            // unless an MDBList key was set).
+            let vx = await VortXRatingsClient.ratings(imdbID: imdb, type: type)
+            let needsMore = vx == nil || vx?.rottenTomatoes == nil || vx?.metacritic == nil
+            let mdb = needsMore ? await MDBListClient.ratings(imdbID: imdb, type: type) : nil
+            let merged = MDBListRatings(
+                imdb: vx?.imdb ?? mdb?.imdb,
+                rottenTomatoes: vx?.rottenTomatoes ?? mdb?.rottenTomatoes,
+                metacritic: vx?.metacritic ?? mdb?.metacritic,
+                tmdb: vx?.tmdb ?? mdb?.tmdb
+            )
+            await MainActor.run { mdbRatings = merged.hasAny ? merged : nil }
         }
     }
 
@@ -489,6 +501,14 @@ struct DetailView: View {
     /// DOWN past the action band. This is the standard first-party tvOS detail pattern; it fixes the cut-off
     /// Watch button (H12) and removes the upward focus trap (H15) because the first screen's focus chain is
     /// fixed. The focus engine itself is untouched: only layout containers and a Spacer were added.
+    ///
+    /// 5a/6a (build 171): the bottom-anchor only holds while the first-screen content fits one viewport; a
+    /// long synopsis grew the block past `firstScreenHeight`, collapsed the flexible Spacer, and pushed the
+    /// Watch band DOWN (owner: "the button moves") AND scrolled the band into a region tvOS could not project
+    /// focus back UP from, re-trapping the path to the tab bar (the H15 regression). The description is now
+    /// clamped to a FIXED reserved line count, so its length can no longer change where the band lands: the
+    /// Watch button holds one position across titles and the first-screen focus chain (Watch -> tab bar
+    /// upward) stays fixed. Still non-focusable, so the focus engine is untouched.
     private func moviePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
@@ -507,10 +527,16 @@ struct DetailView: View {
                             financialsRow()
                             releaseDatesRow()
                             if let d = m.description, !d.isEmpty {
+                                // 5a/6a (build 171): reserve space for a FIXED 3 lines (was an elastic 4)
+                                // so a short synopsis occupies the SAME height as a long one. The block above
+                                // the action band is now length-independent, so the bottom-anchored Watch
+                                // button holds one position across every title and the first screen can no
+                                // longer overflow into a scrolled state that traps the upward focus path.
+                                // Non-focusable, so Watch keeps default focus and the up-path is untouched.
                                 Text(d)
                                     .font(Theme.Typography.body)
                                     .foregroundStyle(Theme.Palette.textSecondary)
-                                    .lineLimit(4).lineSpacing(2)
+                                    .lineLimit(3, reservesSpace: true).lineSpacing(2)
                                     .frame(maxWidth: 1000, alignment: .leading)
                             }
                         }
@@ -900,9 +926,10 @@ struct DetailView: View {
         .foregroundStyle(Theme.Palette.textSecondary)
     }
 
-    /// Compact MDBList ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), shown only when the user has set
-    /// an MDBList key AND ratings came back. Renders nothing otherwise (no error UI). Same typography as
-    /// metaRow so it reads as a second fact line under the title.
+    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  MC 81  ·  TMDB 78%"), fed by the VortX
+    /// ratings service (no user key needed), with the user's MDBList key filling any gap. Shown only when
+    /// ratings came back; renders nothing otherwise (no error UI). Non-focusable, same typography as metaRow
+    /// so it reads as a second fact line under the title and never disturbs the first-screen focus chain.
     @ViewBuilder private func ratingsRow() -> some View {
         if let text = mdbRatings.flatMap(Self.ratingsText), !text.isEmpty {
             Text(text)
@@ -916,6 +943,7 @@ struct DetailView: View {
         var parts: [String] = []
         if let v = r.imdb { parts.append("IMDb \(imdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
         if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
+        if let v = r.metacritic { parts.append("MC \(v)") }
         if let v = r.tmdb { parts.append("TMDB \(v)%") }
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }

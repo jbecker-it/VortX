@@ -1156,11 +1156,26 @@ final class CoreBridge: ObservableObject {
     func removeFromLibrary(id: String) {
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: dismissing CW must touch only the profile's private history,
-            // never the owner account's library.
+            // never the owner account's library. That path is already tombstone-safe via ProfileStore,
+            // so it must NOT enter the account-scoped LibraryTombstones set.
             ProfileStore.shared.removeWatchEntry(metaId: id)
             return
         }
+        // Record the durable cross-device removal BEFORE the dispatch, the library analogue of
+        // uninstallAddon's AddonTombstones.tombstone: vortxSummary pushes the set into
+        // doc.vortx.deletedLibrary and SUBTRACTS it from the doc.vortx.library UNION, and syncDown re-folds
+        // it on peers, so a title removed here can never be resurrected by a peer's union hydrate or the
+        // cold-device library recovery (the Continue-Watching resurrection fix).
+        LibraryTombstones.tombstone(id)
         dispatchCtx(["action": "RemoveFromLibrary", "args": id])
+        // Propagate the removal to your other devices PROMPTLY. A bare background push can be lost if a
+        // sideload UPDATE kills the process before the unextended background Task's 2-round-trip push
+        // completes (the exact race that resurrected removed titles). Kick an immediate, non-debounced push
+        // so the tombstone lands in doc.vortx.deletedLibrary right away, mirroring uninstallAddon.
+        Task {
+            let ok = await VortXSyncManager.shared.pushThisDevice()
+            NSLog("[library] removal of %@ pushed to sync immediately (ok=%@)", id, ok ? "yes" : "no")
+        }
     }
 
     /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
@@ -1198,6 +1213,11 @@ final class CoreBridge: ObservableObject {
             return
         }
         dispatchCtx(["action": "RewindLibraryItem", "args": libraryId])
+        // A rewind is NOT a removal (the library entry stays), so no tombstone applies; but its pushed
+        // t/d=0 must survive an imminent sideload-update process kill, or the title comes back with stale
+        // pre-finish progress. Kick an immediate best-effort push so the rewound position lands in the
+        // account doc right away instead of only on the next unextended background sync.
+        Task { _ = await VortXSyncManager.shared.pushThisDevice() }
     }
 
     /// Whether the open detail page's title is saved to the library proper (present,
@@ -1236,6 +1256,10 @@ final class CoreBridge: ObservableObject {
             if let loadable = entry["content"] as? [String: Any],
                loadable["type"] as? String == "Ready",
                let meta = loadable["content"] as? [String: Any] {
+                // An explicit add supersedes any prior removal tombstone for this id, so the freshly-added
+                // title is not later suppressed by the recovery skip / union subtract and the next push stops
+                // carrying the stale removal. Mirrors installAddon's AddonTombstones.forget on a fresh install.
+                if let addedId = meta["id"] as? String { LibraryTombstones.forget(addedId) }
                 dispatchCtx(["action": "AddToLibrary", "args": meta])
                 NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
                 return
@@ -1256,6 +1280,7 @@ final class CoreBridge: ObservableObject {
             return
         }
         guard let raw = rawMetaPreview(forId: metaId) else { return }
+        LibraryTombstones.forget(metaId)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": raw])
     }
 
@@ -1272,6 +1297,7 @@ final class CoreBridge: ObservableObject {
                                                 poster: meta["poster"] as? String)
             return
         }
+        LibraryTombstones.forget(id)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": meta])
     }
 
@@ -1292,6 +1318,10 @@ final class CoreBridge: ObservableObject {
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return false }
+        // Explicit add supersedes a prior removal tombstone (dashboard add-to-library targeting the owner).
+        // Harmless during recoverOwnerLibraryIfEmpty: that path already SKIPS tombstoned ids, so no tombstoned
+        // id ever reaches here, and forget on a non-tombstoned id is a no-op.
+        LibraryTombstones.forget(id)
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         return true
     }

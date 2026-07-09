@@ -1,6 +1,9 @@
 import Foundation
 import SwiftUI
 import CryptoKit   // Curve25519 for the QR sign-in pairing session (QrJoinSession.ephemeral)
+#if canImport(UIKit) && !os(macOS)
+import UIKit       // UIApplication.beginBackgroundTask for the on-background sync grace window (iOS + tvOS)
+#endif
 
 /// Bridges the thread-agnostic `VortXSyncManager.addonOrderChangedNote` to a `@Published` the add-on list
 /// READS in its body, so a reorder re-sorts the live list immediately. A never-read `@State` bumped from
@@ -568,6 +571,17 @@ final class VortXSyncManager: ObservableObject {
             for entry in prior { if let id = entry["id"] as? String, !id.isEmpty { libraryByID[id] = entry } }
         }
         for entry in engineLibrary { if let id = entry["id"] as? String { libraryByID[id] = entry } }
+        // SUBTRACT the durable removal tombstones from the library union (the library analogue of subtracting
+        // deletedAddons from the add-on union): a title the user removed must NOT come back, even if the engine
+        // still briefly holds it OR a peer device's prior doc.vortx.library still carries it. Compared on the
+        // same normalized id the tombstone is stored under. A legitimate re-add already cleared the tombstone
+        // (LibraryTombstones.forget), so this only ever drops genuinely-removed titles.
+        let removedLibrary = LibraryTombstones.all()
+        if !removedLibrary.isEmpty {
+            for id in libraryByID.keys where removedLibrary.contains(LibraryTombstones.normalize(id)) {
+                libraryByID.removeValue(forKey: id)
+            }
+        }
         let ownerLibrary = Array(libraryByID.values)
         // Installed add-ons, so the dashboard Add-ons page is populated AND the account can re-hydrate
         // the engine network-free. We now emit the FULL descriptor `{transportUrl, name, manifest,
@@ -656,6 +670,10 @@ final class VortXSyncManager: ObservableObject {
         // the dashboard only READS it). Carries the normalized transportUrls the user removed so a peer
         // device uninstalls them on its next pull instead of re-hydrating them. Empty set is omitted.
         if !removedAddons.isEmpty { v["deletedAddons"] = Array(removedAddons) }
+        // Durable cross-device library REMOVAL tombstones (app-authoritative, exactly like deletedAddons; the
+        // dashboard only READS it). Carries the normalized ids the user removed so a peer device drops them on
+        // its next pull instead of re-hydrating / recovering them. Empty set is omitted.
+        if !removedLibrary.isEmpty { v["deletedLibrary"] = Array(removedLibrary) }
         return v
     }
 
@@ -887,6 +905,17 @@ final class VortXSyncManager: ObservableObject {
             incomingAddonRemovals += webRemoved
         }
         if AddonTombstones.merge(incomingAddonRemovals) { restored = true }
+        // Cross-device LIBRARY REMOVAL tombstones (the library analogue of the deletedAddons fold above).
+        // ALWAYS fold the incoming removals (never version-gate them): merging a removal tombstone is
+        // union-safe - it only ADDS to the durable removal set, it can never resurrect a title. This makes a
+        // removal made on device A durable HERE, so this device's vortxSummary keeps subtracting it from the
+        // library union and recoverOwnerLibraryIfEmpty keeps skipping it: a peer removal can no longer be
+        // union-resurrected or recovered back onto a cold engine. Enforcement is by subtract + recovery-skip
+        // (no live-engine uninstall loop, unlike add-ons: the owner library is the account library and a
+        // logged-out engine has none to mutate; the next cold hydrate simply honors the tombstone).
+        if let vortx = doc["vortx"] as? [String: Any], let removedLib = vortx["deletedLibrary"] as? [String] {
+            if LibraryTombstones.merge(removedLib) { restored = true }
+        }
         // Shared cross-surface add-on ORDER (Bug B, read side). Persist the incoming order locally so it is
         // durable and available to ownedAddons(from:) at the next hydrate (launch / degraded-engine
         // rehydrate), where it becomes the ordering spine so a reorder from any surface converges. Reached
@@ -1052,9 +1081,15 @@ final class VortXSyncManager: ObservableObject {
         guard let engineLibrary = CoreBridge.shared.library?.catalog else { return }
         let engineHasLibrary = engineLibrary.contains { !($0.removed ?? false) && !($0.temp ?? false) }
         guard !engineHasLibrary else { return }
+        // SKIP any id the user removed (the library analogue of ownedAddons(from:) excluding AddonTombstones):
+        // a cold/empty engine must not RE-ADD a title the user explicitly removed, which was the exact
+        // resurrection path (the doc's deletedLibrary subset was already folded into this local set on
+        // syncDown, and we read the local set so even a doc that predates the removal is honored).
+        let removedLibrary = LibraryTombstones.all()
         var recovered = 0
         for item in ownedLibrary {
             guard let id = item["id"] as? String, !id.isEmpty,
+                  !removedLibrary.contains(LibraryTombstones.normalize(id)),
                   // Real catalog ids only (tt… / tmdb…); never a synthetic id, or it poisons account sync.
                   id.hasPrefix("tt") || id.hasPrefix("tmdb") else { continue }
             let type = (item["type"] as? String) == "series" ? "series" : "movie"
@@ -1114,6 +1149,29 @@ final class VortXSyncManager: ObservableObject {
     func useAccountData() async { await syncDown(force: true) }
     /// Conflict resolution / "Sync now": push this device's profiles + settings to the account.
     @discardableResult func pushThisDevice() async -> Bool { await syncUp() }
+
+    /// Push this device's state when the app BACKGROUNDS, with a real time budget. A bare
+    /// `Task { syncUp() }` on scenePhase == .background is an UNEXTENDED task the OS can suspend the instant
+    /// the scene backgrounds, so a library removal / rewind made moments earlier can lose its 2-round-trip
+    /// push if a sideload UPDATE then kills the process before it finishes (the Continue-Watching
+    /// resurrection race). Wrapping the push in a UIKit background task asks the OS for the seconds it needs.
+    /// macOS has no such API (and no jetsam on background), so it falls back to a plain push there. Called
+    /// from BOTH app entry points (tvOS + iOS/Mac) for parity.
+    func syncUpOnBackground() {
+        #if canImport(UIKit) && !os(macOS)
+        let app = UIApplication.shared
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = app.beginBackgroundTask(withName: "vortx.sync.background") {
+            if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
+        }
+        Task {
+            await self.syncUp()
+            if bgTask != .invalid { app.endBackgroundTask(bgTask); bgTask = .invalid }
+        }
+        #else
+        Task { await self.syncUp() }
+        #endif
+    }
 
     /// Conflict resolution (the RECOMMENDED choice on an explicit "Sync now" when the rosters differ):
     /// union both ways so EVERY profile from both sides survives, then push. syncDown unions the cloud

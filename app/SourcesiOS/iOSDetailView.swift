@@ -1740,13 +1740,14 @@ struct iOSDetailView: View {
         guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
         Task {
             let vx = await VortXRatingsClient.ratings(imdbID: imdb, type: type)
-            // Only reach for the user's MDBList key to fill what VortX did not return (e.g. RT before the
-            // server key is set), so most users need no key at all.
-            let needsMore = vx == nil || vx?.rottenTomatoes == nil
+            // Only reach for the user's MDBList key to fill what VortX did not return (e.g. RT / Metacritic
+            // before the server key is set), so most users need no key at all.
+            let needsMore = vx == nil || vx?.rottenTomatoes == nil || vx?.metacritic == nil
             let mdb = needsMore ? await MDBListClient.ratings(imdbID: imdb, type: type) : nil
             let merged = MDBListRatings(
                 imdb: vx?.imdb ?? mdb?.imdb,
                 rottenTomatoes: vx?.rottenTomatoes ?? mdb?.rottenTomatoes,
+                metacritic: vx?.metacritic ?? mdb?.metacritic,
                 tmdb: vx?.tmdb ?? mdb?.tmdb
             )
             await MainActor.run { mdbRatings = merged.hasAny ? merged : nil }
@@ -1771,6 +1772,7 @@ struct iOSDetailView: View {
         var parts: [String] = []
         if let v = r.imdb { parts.append("IMDb \(mdbImdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
         if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
+        if let v = r.metacritic { parts.append("MC \(v)") }
         if let v = r.tmdb { parts.append("TMDB \(v)%") }
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }

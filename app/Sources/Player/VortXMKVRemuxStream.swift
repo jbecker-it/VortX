@@ -38,9 +38,11 @@ import Libdovi
 /// `avcodec_parameters_copy`, fragmented-mp4 movflags, `av_read_frame` -> `av_interleaved_write_frame`) but
 /// swaps the file sink for `avio_alloc_context` with a write callback appending to the buffer.
 ///
-/// Phase-1 scope: FORWARD-ONLY. The custom AVIO exposes no working seek to the muxer, and the source is read
-/// straight through, so AVPlayer scrubbing past buffered content is a documented TODO. The remux loop runs on
-/// one dedicated background thread; `cancel()` requests a clean stop and the loop tears down in the correct
+/// Phase-1 scope: FORWARD-ONLY DELIVERY. The source is read straight through and the produced stream is served
+/// forward-only, so AVPlayer scrubbing past buffered content is a documented TODO. The custom AVIO IS seekable on
+/// the WRITE side, but ONLY so the muxer can backpatch box-size placeholders once a box length is known (see
+/// `avioSeek` / `avioWrite`); it never re-reads and never repositions the source. The remux loop runs on one
+/// dedicated background thread; `cancel()` requests a clean stop and the loop tears down in the correct
 /// AVIO/AVFormatContext free order.
 final class VortXMKVRemuxStream: @unchecked Sendable {
 
@@ -52,19 +54,18 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     private let cancelledFlag = ManagedAtomicFlag()
 
     /// AVIO write scratch: libav wants an aligned malloc'd buffer it owns for the AVIO context. The callback's
-    /// opaque is an UNRETAINED pointer to `self`, kept alive for the whole session by the remux thread's
-    /// strong capture (see `start()`), so the C callback never touches a freed object.
-    /// MUST stay >= hlsHeadCap. movenc writes every box as a 32-bit size PLACEHOLDER + fourcc and backpatches
-    /// via update_size() -> avio_seek(); with no seek callback that backward seek only succeeds while the box's
-    /// first byte is still in the UNFLUSHED avio buffer (aviobuf's in-buffer write seek). delay_moov writes the
-    /// moov into an empty buffer and flushes right after it, so "moov fits in this buffer" is the exact
-    /// requirement: a moov bigger than the buffer gets its placeholder flushed mid-write, update_size's seek
-    /// fails EPIPE (movenc IGNORES it), and the stream carries a size=0 moov + a zero-size box chain inside it
-    /// that neither hlsIndexHead nor AVPlayer can parse (the "hls init scan aborted: size=0 type=moov" device
-    /// failure on sources with multi-KB..64KB+ hvcC/udta). 4 MiB == hlsHeadCap covers any bloated remux moov;
-    /// for every file whose moov already fit in the old 64 KiB the produced bytes are bit-identical (the only
-    /// flushes this removes are the mid-box overflow ones).
-    private static let avioBufferSize = 4 << 20   // 4 MiB; == hlsHeadCap by design, never shrink below it
+    /// opaque is an UNRETAINED pointer to `self`, kept alive for the whole session by the remux thread's strong
+    /// capture (see `start()`), so the C callback never touches a freed object.
+    /// This size NO LONGER bounds correctness. movenc writes every box as a 32-bit size PLACEHOLDER + fourcc and
+    /// backpatches it via update_size() -> avio_seek() once the length is known. The AVIO is now WRITE-SEEKABLE
+    /// (a real `avioSeek`/`avioWrite` pair), so a backpatch that lands OUTSIDE this buffer rewrites the already-
+    /// produced bytes in place (VortXRemuxBuffer.overwrite) instead of failing EPIPE and leaving a size-0 moov.
+    /// The old requirement "the whole moov must fit this buffer or its size field ships unpatched" is gone: the
+    /// moov (and its children) backpatch correctly at ANY size, and the init segment is read back from the
+    /// produced bytes, not from this scratch, so it is deliberately DECOUPLED from hlsHeadCap now. The size is
+    /// therefore just the write-flush granularity (bigger = fewer, larger appends). Kept at 4 MiB so every file
+    /// whose moov already fit produces bit-identical bytes: those seeks stay in-buffer and never reach avioSeek.
+    private static let avioBufferSize = 4 << 20   // 4 MiB; write-flush batch granularity only (not a moov ceiling)
 
     /// HLS delivery mode (b166). AVFoundation does NOT support a plain progressive fragmented MP4: it treats
     /// the vortxremux:// asset as a regular file, cannot index an open-ended fMP4, and either fails the item
@@ -76,6 +77,13 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
     /// HLS from 127.0.0.1. When false (the legacy vortxremux:// loader path, kept for rollback) none of the
     /// indexing runs and the produced byte stream is byte-identical to before.
     private let hlsIndexingEnabled: Bool
+
+    /// The muxer's logical write position (absolute output offset of the next byte the AVIO layer will hand us).
+    /// Mirrors the AVIO context's own `pos`: `avioWrite` advances it by each write, `avioSeek` sets it. When it
+    /// is behind the produced high-water mark a write is a box-size BACKPATCH (overwrite already-stored bytes);
+    /// at the mark it is a normal forward append. Touched ONLY from the remux thread (movenc calls the AVIO
+    /// write/seek callbacks synchronously on it), so it needs no lock.
+    private var avioWriteCursor: Int = 0
 
     init(input: String, headers: [String: String]?, indexForHLS: Bool = false) {
         self.input = input
@@ -121,13 +129,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         return (_hlsInitData, _hlsSegments, _hlsEnded, _hlsSignaling)
     }
 
-    // Init-segment head scan state (remux thread only). Accumulates the first produced bytes until the end
-    // of the top-level `moov` box is buffered; everything up to there (ftyp+moov) IS the init segment, kept
-    // resident for the whole session (it is a few KB and AVPlayer may re-request it on a seek, long after
-    // the sliding window evicted those offsets).
+    // Init-segment head scan state (remux thread only). Accumulates ONLY the leading top-level box headers until
+    // the `moov` box is LOCATED; the init CONTENT (ftyp+moov, any size) is then read straight from the produced
+    // buffer (`hlsFinalizeInit`), so the scan is size-agnostic and never has to hold the whole moov. The moov's
+    // 32-bit size is usually an UNPATCHED placeholder when first seen (movenc backpatches it after writing the
+    // box); `hlsMoovStart` remembers where it is, and the size backpatch (`hlsNoteBackpatch`) publishes the init.
     private var hlsHeadBuf: [UInt8] = []
     private var hlsHeadDone = false
-    private static let hlsHeadCap = 4 << 20   // ftyp+moov land with the first fragment flush, far under 4 MiB
+    private var hlsMoovStart: Int?            // absolute offset of the top-level moov box, once its header is seen
+    private static let hlsHeadCap = 4 << 20   // cap on the box-header WALK to locate moov (ftyp is tiny, so the
+                                              // moov header lands almost immediately); moov CONTENT is unbounded
 
     // Segment-cut state (remux thread only).
     private var hlsSegmentStartSec: Double?   // first video DTS of the OPEN segment (input timebase seconds)
@@ -203,14 +214,15 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         Self.applyDebridHTTPResilience(&openOpts)
         var openRc = avformat_open_input(&ifmt, input, nil, &openOpts)
         av_dict_free(&openOpts)
-        // Cold-debrid warm-up retry. The FIRST open of a debrid link frequently times out (rc=-60 ETIMEDOUT):
-        // the provider is still pulling the file into its CDN cache, so the first request primes it and an
-        // immediate retry connects in a couple seconds. This is exactly why libmpv (which opens the link AFTER
-        // our probe demotes) plays where the probe timed out. Retry ONCE, on timeout only, with a fresh options
-        // dict; a warm retry lands inside the start-watchdog window, a genuinely dead link times out twice and
-        // demotes to libmpv HDR10 as before.
-        if openRc == AVERROR_ETIMEDOUT_CONST {
-            VXProbe.log("dv", "probe open timed out rc=\(openRc); retrying once (cold-debrid warm-up)")
+        // Cold-debrid warm-up retry. The FIRST open of a debrid link frequently fails transiently: it times out
+        // (rc=-60 ETIMEDOUT) OR the still-warming CDN answers the first request with HTTP 400 (rc=-808465656,
+        // AVERROR_HTTP_BAD_REQUEST) while the provider pulls the file into cache. The first request primes it and
+        // an immediate retry connects in a couple seconds; this is exactly why libmpv (which opens the link AFTER
+        // our probe demotes) plays where the probe failed. Retry ONCE, on either transient class, with a fresh
+        // options dict; a warm retry lands inside the start-watchdog window, a genuinely dead link fails twice
+        // and demotes to libmpv HDR10 as before. (400 is the proven cold-CDN class here; ETIMEDOUT already was.)
+        if openRc == AVERROR_ETIMEDOUT_CONST || openRc == AVERROR_HTTP_BAD_REQUEST_CONST {
+            VXProbe.log("dv", "probe open failed rc=\(openRc) (transient); retrying once (cold-debrid warm-up)")
             var retryOpts: OpaquePointer? = nil
             if let headers, !headers.isEmpty {
                 let joined = headers.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n") + "\r\n"
@@ -257,16 +269,22 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             opaque,
             nil,        // read_packet: not needed for a write-only muxer
             { (opaque, buf, size) -> Int32 in
-                // Write callback: copy the muxed bytes into the growing buffer. Runs on the remux thread.
+                // Write callback: route the muxed bytes to the growing buffer (append at the head, or overwrite
+                // an already-produced box-size placeholder on a backpatch). Runs on the remux thread.
                 guard let opaque, let buf, size > 0 else { return 0 }
                 let me = Unmanaged<VortXMKVRemuxStream>.fromOpaque(opaque).takeUnretainedValue()
                 if me.isCancelled { return AVERROR_EXIT_CONST }   // abort muxing on cancel
-                me.buffer.append(buf, count: Int(size))
-                me.scanForDec3(buf, count: Int(size))   // one-time Atmos-signaling verification; no-op once done
-                me.hlsIndexHead(buf, count: Int(size))  // HLS lane: delimit the ftyp+moov init segment; no-op once done
+                me.avioWrite(buf, Int(size))
                 return size
             },
-            nil         // seek: forward-only (Phase 1); the muxer only appends with these movflags
+            { (opaque, offset, whence) -> Int64 in
+                // Seek callback: makes the AVIO WRITE-seekable so movenc's update_size() can backpatch box-size
+                // placeholders (chiefly the init moov) even after they flush out of the AVIO buffer. Never used
+                // to re-read or reposition the source. Runs on the remux thread.
+                guard let opaque else { return -1 }
+                let me = Unmanaged<VortXMKVRemuxStream>.fromOpaque(opaque).takeUnretainedValue()
+                return me.avioSeek(offset, whence)
+            }
         )
         guard let avio else {
             av_free(avioBuf)
@@ -855,6 +873,72 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         NSLog("[dv-remux-stream] done: %d bytes muxed", buffer.producedCount)
     }
 
+    // MARK: - Custom AVIO write/seek (the muxer's file emulation; remux-thread only)
+
+    /// AVIO write callback body. Routes `count` muxed bytes to the buffer at the current `avioWriteCursor`:
+    /// a forward write at (or beyond) the produced high-water mark APPENDS; a write behind it is movenc
+    /// backpatching a box-size placeholder, so it OVERWRITES the already-stored bytes in place. The muxer only
+    /// ever seeks back to rewrite a size field it already emitted, so the overwrite target is always within the
+    /// produced region (and, before the init is published, always still resident). Cursor advances by `count`,
+    /// mirroring the AVIO context's own `pos`. The one-time Atmos (dec3) scan and the HLS init-head walk run on
+    /// the forward-append path only, where bytes arrive in order; a backpatch feeds neither (it only corrects a
+    /// size field), except that patching the moov's own size finalizes the init segment (hlsNoteBackpatch).
+    private func avioWrite(_ buf: UnsafePointer<UInt8>, _ count: Int) {
+        let cursor = avioWriteCursor
+        let head = buffer.producedCount   // produced high-water mark (overwrite never advances it)
+        if cursor >= head {
+            // Forward write at the head (cursor == head is the only shape movenc produces; a cursor strictly
+            // beyond head would require a seek past EOF then a write, which it never does with these movflags).
+            buffer.append(buf, count: count)
+            scanForDec3(buf, count: count)   // one-time Atmos-signaling verification; no-op once done
+            hlsIndexHead(buf, count: count)  // HLS lane: locate the ftyp+moov init segment; no-op once done
+        } else {
+            // Backpatch: rewrite an already-produced box-size placeholder now that the box length is known.
+            let overlap = min(count, head - cursor)
+            if buffer.overwrite(at: cursor, bytes: buf, count: overlap) {
+                hlsNoteBackpatch(at: cursor, bytes: buf, count: overlap)
+            } else if hlsIndexingEnabled, !hlsHeadDone {
+                // A backpatch below the sliding window BEFORE the init is even published should be impossible
+                // (nothing is served or evicted pre-init). If it ever happens the init is likely doomed; surface
+                // it once. After the init is published (hlsHeadDone) a dropped backpatch is the expected, harmless
+                // trailer-time case (an evicted moov/mehd patch movenc ignores anyway), so it stays silent.
+                DiagnosticsLog.log("dv", "hls init: box-size backpatch at \(cursor) fell below the window (pre-init eviction?)")
+            }
+            // A pure size patch never spills past the head; stay total in case a future movflag ever does.
+            if count > overlap {
+                let tail = buf + overlap
+                buffer.append(tail, count: count - overlap)
+                scanForDec3(tail, count: count - overlap)
+                hlsIndexHead(tail, count: count - overlap)
+            }
+        }
+        avioWriteCursor += count
+    }
+
+    /// AVIO seek callback body. movenc drives this ONLY to backpatch box-size placeholders (update_size seeks
+    /// back to a box start, rewrites its 32-bit size, then seeks forward to resume). We emulate a file cursor:
+    /// SEEK_SET/CUR/END move `avioWriteCursor` and the next writes land there (patching produced bytes via
+    /// avioWrite's overwrite path, or appending at the head). Returning a valid offset is what sets the context
+    /// AVIO_SEEKABLE_NORMAL so update_size actually runs; a nil seek returned EPIPE and shipped a size-0 moov the
+    /// instant the moov outgrew the AVIO buffer. AVSEEK_SIZE reports the current produced length. Never touches
+    /// the source. Remux-thread only, so `avioWriteCursor` needs no lock.
+    private func avioSeek(_ offset: Int64, _ whence: Int32) -> Int64 {
+        if (whence & AVSEEK_SIZE_CONST) != 0 {
+            return Int64(buffer.producedCount)   // current logical file size (the high-water mark)
+        }
+        let w = whence & ~AVSEEK_FORCE_CONST
+        let target: Int64
+        switch w {
+        case SEEK_SET_CONST: target = offset
+        case SEEK_CUR_CONST: target = Int64(avioWriteCursor) + offset
+        case SEEK_END_CONST: target = Int64(buffer.producedCount) + offset
+        default: return -1
+        }
+        guard target >= 0 else { return -1 }
+        avioWriteCursor = Int(target)
+        return target
+    }
+
     // MARK: - dec3 (E-AC3 / Atmos JOC signaling) verification, message-only and fail-soft
 
     /// Accumulates the FIRST bytes of muxed output until the `dec3` sample-entry box is found (it rides in
@@ -916,14 +1000,16 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
 
     // MARK: - HLS output indexing (b166; every method no-ops unless `hlsIndexingEnabled`)
 
-    /// Delimit the init segment: accumulate the first produced bytes and walk the top-level boxes until the
-    /// END of the `moov` box is buffered (with delay_moov, movenc writes ftyp+moov at the first fragment
-    /// flush, so both arrive in one burst). Everything up to there is the init segment, retained as `Data`
-    /// for the whole session. Runs on the remux thread from the AVIO write callback; fail-soft: a malformed
-    /// walk just gives up (the server then never gets an init, the playlist starves, and the chrome's start
+    /// Locate the init segment's `moov` box by walking the leading top-level boxes. Runs on the forward-append
+    /// path of the AVIO write callback. Once `moov` is located we STOP accumulating and wait for the muxer to
+    /// backpatch its 32-bit size (a >AVIO-buffer moov is patched via the seekable AVIO's overwrite path, not in
+    /// the AVIO buffer); that patch (`hlsNoteBackpatch`) publishes the init. If the moov already fit the AVIO
+    /// buffer it was patched in-buffer before this flush, so a valid size here finalizes immediately. The init
+    /// CONTENT is read from the produced buffer, so this walk never has to hold the moov and is size-agnostic.
+    /// Fail-soft: a malformed walk gives up (the server never gets an init, the playlist starves, and the start
     /// watchdog demotes to libmpv exactly like any other dead mount).
     private func hlsIndexHead(_ bytes: UnsafePointer<UInt8>, count: Int) {
-        guard hlsIndexingEnabled, !hlsHeadDone, count > 0 else { return }
+        guard hlsIndexingEnabled, !hlsHeadDone, hlsMoovStart == nil, count > 0 else { return }
         hlsHeadBuf.append(contentsOf: UnsafeBufferPointer(start: bytes, count: count))
         var pos = 0
         while pos + 8 <= hlsHeadBuf.count {
@@ -936,54 +1022,71 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
                 var big: UInt64 = 0
                 for i in 0..<8 { big = (big << 8) | UInt64(hlsHeadBuf[pos + 8 + i]) }
                 guard big >= 16, big <= UInt64(Int.max - pos) else {
-                    hlsHeadDone = true; hlsHeadBuf = []
-                    DiagnosticsLog.log("dv", "hls init scan aborted: malformed largesize \(big) type=\(fourcc)")
-                    return
+                    hlsAbortInitScan("malformed largesize \(big) type=\(fourcc)"); return
                 }
                 size = Int(big)
                 headerLen = 16
             }
             if fourcc == "moov" {
-                guard size >= headerLen else {
-                    // movenc's UNPATCHED placeholder: the moov outgrew the forward-only AVIO buffer, the muxer
-                    // could not backpatch, and the box chain inside it is zero-sized too (not locally
-                    // repairable). Fail soft as before, but say WHY. avioBufferSize == hlsHeadCap makes this
-                    // unreachable for any init the head scan could accept.
-                    hlsHeadDone = true; hlsHeadBuf = []
-                    DiagnosticsLog.log("dv", "hls init scan aborted: moov size field \(size) unpatched (moov exceeded avioBufferSize=\(Self.avioBufferSize) on the forward-only AVIO)")
-                    return
+                // Located. Remember it and STOP accumulating (guard above short-circuits future calls). The size
+                // field is very likely an unpatched 0 placeholder right now; the muxer backpatches it once the
+                // whole moov is written, and hlsNoteBackpatch finalizes on that patch. If it is ALREADY valid
+                // (the moov fit the AVIO buffer and was patched in-buffer before this flush) finalize now.
+                hlsMoovStart = pos
+                hlsHeadBuf = []
+                if size >= headerLen {
+                    hlsFinalizeInit(moovStart: pos, moovSize: size)
+                } else {
+                    DiagnosticsLog.log("dv", "hls init: moov located at byte \(pos), awaiting size backpatch (placeholder size field=\(size))")
                 }
-                guard pos + size <= hlsHeadBuf.count else {
-                    if hlsHeadBuf.count > Self.hlsHeadCap {   // bogus giant moov: never wait past the cap
-                        hlsHeadDone = true; hlsHeadBuf = []
-                        DiagnosticsLog.log("dv", "hls init scan aborted: moov size \(size) exceeds the \(Self.hlsHeadCap)B cap")
-                    }
-                    return   // moov not fully buffered yet: wait
-                }
-                let initLen = pos + size
-                let initData = Data(hlsHeadBuf[0..<initLen])
-                hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
-                hlsSegmentStartByte = initLen   // segment 0 starts right after the init
-                hlsHeadDone = true; hlsHeadBuf = []
-                DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov)")
                 return
             }
             if fourcc == "moof" || fourcc == "styp" || fourcc == "mdat" {   // fragment data before any moov
-                hlsHeadDone = true; hlsHeadBuf = []
-                DiagnosticsLog.log("dv", "hls init scan aborted: \(fourcc) arrived before moov")
-                return
+                hlsAbortInitScan("\(fourcc) arrived before moov"); return
             }
             guard size >= headerLen else {   // zero/malformed size on a box we must walk PAST: give up
-                hlsHeadDone = true; hlsHeadBuf = []
-                DiagnosticsLog.log("dv", "hls init scan aborted: unparseable top-level box size=\(size) type=\(fourcc)")
-                return
+                hlsAbortInitScan("unparseable top-level box size=\(size) type=\(fourcc)"); return
             }
             pos += size   // skip ftyp/free/... ; loop waits for more bytes if the next header is not in yet
         }
         if hlsHeadBuf.count > Self.hlsHeadCap {
-            hlsHeadDone = true; hlsHeadBuf = []
-            DiagnosticsLog.log("dv", "hls init scan aborted: no moov in the first \(Self.hlsHeadCap) bytes")
+            hlsAbortInitScan("no moov header in the first \(Self.hlsHeadCap) bytes")
         }
+    }
+
+    /// The muxer backpatched a box-size placeholder (the seekable-AVIO overwrite path, `avioWrite`). If it
+    /// patched the TOP-LEVEL moov's size field, the init length is now known, so publish the init segment. A
+    /// no-op for every other backpatch (a nested box inside the moov, or a trailer-time patch): only the moov's
+    /// own size (the 4 bytes at [hlsMoovStart, +4)) triggers finalization, and it is written in a single wb32.
+    private func hlsNoteBackpatch(at offset: Int, bytes: UnsafePointer<UInt8>, count: Int) {
+        guard hlsIndexingEnabled, !hlsHeadDone, let m = hlsMoovStart else { return }
+        guard offset <= m, offset + count >= m + 4 else { return }   // must fully cover the moov size field
+        let o = m - offset
+        let size = (Int(bytes[o]) << 24) | (Int(bytes[o + 1]) << 16) | (Int(bytes[o + 2]) << 8) | Int(bytes[o + 3])
+        guard size >= 8 else { return }   // still a placeholder: keep waiting for the real wb32
+        hlsFinalizeInit(moovStart: m, moovSize: size)
+    }
+
+    /// Publish the init segment (ftyp .. end-of-moov) read back from the produced buffer. One-shot. Nothing is
+    /// served until this sets `_hlsInitData`, so the whole init is still resident from offset 0 (no eviction
+    /// yet) and `snapshotPrefix` returns it regardless of moov size.
+    private func hlsFinalizeInit(moovStart: Int, moovSize: Int) {
+        guard !hlsHeadDone else { return }
+        let initLen = moovStart + moovSize
+        guard let initData = buffer.snapshotPrefix(length: initLen) else {
+            hlsAbortInitScan("init \(initLen)B (moov \(moovSize)B @\(moovStart)) not fully resident")
+            return
+        }
+        hlsLock.lock(); _hlsInitData = initData; hlsLock.unlock()
+        hlsSegmentStartByte = initLen   // segment 0 starts right after the init
+        hlsHeadDone = true; hlsHeadBuf = []
+        DiagnosticsLog.log("dv", "hls init segment indexed: \(initLen)B (ftyp+moov, moov=\(moovSize)B)")
+    }
+
+    /// Give up on the init scan (fail-soft): the playlist starves and the start watchdog demotes to libmpv.
+    private func hlsAbortInitScan(_ reason: String) {
+        hlsHeadDone = true; hlsHeadBuf = []
+        DiagnosticsLog.log("dv", "hls init scan aborted: \(reason)")
     }
 
     /// Cut a segment boundary BEFORE writing this base-video packet when the open segment has reached the
@@ -1617,8 +1720,22 @@ private let AVERROR_EXIT_CONST: Int32 = -1414092869   // AVERROR_EXIT
 /// not surface the AVERROR macro, so hardcode the observed value to gate the cold-debrid open retry.
 private let AVERROR_ETIMEDOUT_CONST: Int32 = -60
 
+/// AVERROR_HTTP_BAD_REQUEST = -FFERRTAG(0xF8,'4','0','0') = -808465656: a transient HTTP 400 a still-warming
+/// debrid CDN can answer the first open with. The Swift importer does not surface the FFERRTAG macro, so
+/// hardcode it to widen the single cold-debrid open retry to this class (same fresh-options retry as ETIMEDOUT).
+private let AVERROR_HTTP_BAD_REQUEST_CONST: Int32 = -808465656
+
 /// AVFMT_FLAG_CUSTOM_IO is a plain #define (0x0080) not always surfaced as a Swift constant.
 private let AVFMT_FLAG_CUSTOM_IO_CONST: Int32 = 0x0080
+
+/// AVIO seek `whence` values. SEEK_SET/CUR/END are the standard libc constants; AVSEEK_SIZE / AVSEEK_FORCE are
+/// libavformat #defines the Swift importer does not surface. `avioSeek` uses them to service movenc's box-size
+/// backpatch seeks and any avio_size() query.
+private let SEEK_SET_CONST: Int32 = 0
+private let SEEK_CUR_CONST: Int32 = 1
+private let SEEK_END_CONST: Int32 = 2
+private let AVSEEK_SIZE_CONST: Int32 = 0x10000
+private let AVSEEK_FORCE_CONST: Int32 = 0x20000
 
 /// AV_NOPTS_VALUE = INT64_MIN via a cast macro the Swift importer does not surface.
 private let AV_NOPTS_VALUE_CONST: Int64 = Int64.min

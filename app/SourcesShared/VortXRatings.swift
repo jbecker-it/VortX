@@ -35,11 +35,12 @@ enum VortXRatingsClient {
             let (data, resp) = try await URLSession.shared.data(for: request)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
-            // The VortX service returns IMDb on its native 0-10 scale and RT/TMDB as 0-100, matching the
-            // MDBListRatings model the detail row already renders.
+            // The VortX service returns IMDb on its native 0-10 scale and RT / Metacritic / TMDB as 0-100,
+            // matching the MDBListRatings model the detail row already renders.
             let r = MDBListRatings(
                 imdb: numeric(root["imdb"]),
                 rottenTomatoes: numeric(root["rt"]).map { Int($0.rounded()) },
+                metacritic: numeric(root["metacritic"]).map { Int($0.rounded()) },
                 tmdb: numeric(root["tmdb"]).map { Int($0.rounded()) }
             )
             return r.hasAny ? r : nil

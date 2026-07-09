@@ -165,19 +165,32 @@ enum StreamRanking {
     }
 
     static func score(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Int {
-        // Coordinator-confirmed cache hits bypass the memo: the score cache is keyed only by the
-        // stream's own text fields (streamKey), NOT by the cached set, so caching a hit-adjusted score
-        // under that key would leak into an empty-set call (and an empty-set score would leak into a
-        // hit call). When the set is empty — every existing call site — this is the unchanged memoized
-        // path, so output is byte-identical to today.
-        if !debridCachedHashes.isEmpty, let hash = s.infoHash?.lowercased(), debridCachedHashes.contains(hash) {
-            return computeScore(s, debridCachedHashes: debridCachedHashes)
+        // A coordinator-confirmed debrid cache hit adjusts the score, so it must NOT share a memo entry with
+        // the same stream scored without the cached set (that would leak a hit-adjusted score into an empty-set
+        // call and vice-versa). Earlier this BYPASSED the memo for cached hits, but that made every cached
+        // stream re-run full computeScore on every call: on iOS the control bar re-ranks per body eval, so
+        // 4000 cached streams times N evals of unmemoized regex scoring saturated the main thread. Instead fold
+        // the cached bit INTO the Int memo key (re-hash of the base key plus the hit flag, the same 64-bit
+        // collision class streamKey itself already tolerates) so both variants coexist and both stay memoized.
+        // Folding a single BIT is sound because computeScore reads the set only through membership of this
+        // stream's own infoHash (the isCached +8000 override), so the score depends on the set through
+        // exactly that bit. The empty set, which is every existing non-debrid call site, keeps the plain
+        // streamKey and is byte-identical to before.
+        let isCachedHit = !debridCachedHashes.isEmpty
+            && (s.infoHash?.lowercased()).map(debridCachedHashes.contains) == true
+        let key: Int
+        if isCachedHit {
+            var hasher = Hasher()
+            hasher.combine(streamKey(s))
+            hasher.combine(true)
+            key = hasher.finalize()
+        } else {
+            key = streamKey(s)
         }
-        let key = streamKey(s)
         cacheLock.lock()
         if let hit = scoreCache[key] { cacheLock.unlock(); return hit }
         cacheLock.unlock()
-        let value = computeScore(s)
+        let value = isCachedHit ? computeScore(s, debridCachedHashes: debridCachedHashes) : computeScore(s)
         cacheLock.lock()
         // Cap above the largest realistic source list (popular titles return a few thousand
         // streams across add-ons). At 4096 a single big title thrashed the cache mid-render
@@ -968,7 +981,12 @@ enum StreamRanking {
                                                withTemplate: "")
         }
         cacheLock.lock()
-        if textCache.count > 4096 { textCache.removeAll() }
+        // Cap matched to scoreCache (32768): textCache is the substrate under score/qualityLabel/tiers/
+        // flavorTags/sizeText/isNonVideo. At 4096 a popular title returning a few thousand UNIQUE stream
+        // keys (TorBox/Singularity duplicates carry distinct names) thrashed this mid-render (clear, refill,
+        // clear), turning every per-stream text access into a full rebuild and saturating the main thread on
+        // a 4000+ source title (the Infinity War watchdog kill). 32768 clears that while still bounding a runaway.
+        if textCache.count > 32_768 { textCache.removeAll() }
         textCache[key] = text
         cacheLock.unlock()
         return text

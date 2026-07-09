@@ -432,6 +432,26 @@ final class SourceIndexServeSource: ObservableObject {
     private var lastContentID: String?
     private var task: Task<Void, Never>?
 
+    // MARK: Process-lifetime result bank (publish-lost fix)
+
+    /// Last successfully BUILT pool result per content id, process-lifetime. The fetch result used to live
+    /// ONLY on this per-view @StateObject: the detail screens derive their page from the GLOBAL
+    /// `core.metaDetails` slot, so the owning CoreStreamList is routinely destroyed (meta nil-swap when the
+    /// next title's load clears the slot, the player covering the page, a navigation pop) BEFORE the ~0.5s
+    /// network round trip returns, and the built streams were dropped at the `let self` guard ("publish
+    /// SKIPPED ... self gone"): the owner-reported "Singularity sources never appear". Banking the built
+    /// result by content id lets the NEXT instance for the same title publish instantly instead of
+    /// re-losing the race. Keyed strictly by the pool content id (always the tt[:S:E] form from
+    /// `SourceIndexClient.contentID`), so a banked answer for title A can never paint into a view showing
+    /// title B. Statics of this @MainActor class are MainActor-isolated, so every read/write below is
+    /// synchronous on the main actor (refresh() and the Task body both run there). Bounded defensively,
+    /// mirroring ResumeSeedGuard: on overflow it resets (worst case one re-fetch, still correct).
+    private static var resultBank: [String: [CoreStream]] = [:]
+    private static func bank(_ contentID: String, _ built: [CoreStream]) {
+        if resultBank.count >= 64, resultBank[contentID] == nil { resultBank.removeAll(keepingCapacity: true) }
+        resultBank[contentID] = built
+    }
+
     /// Fetch pooled sources for `contentID` when SERVE is enabled + the user is signed in (owner decision
     /// 2026-07-04: Singularity results are a VortX-user-only benefit). Fail-soft + deduped by content id. Safe
     /// to call on every meta change / `.task` / `.onAppear`.
@@ -443,12 +463,24 @@ final class SourceIndexServeSource: ObservableObject {
             return
         }
         lastContentID = contentID
+        // WARM PAINT: a fetch for this exact content id already landed this process (often on a predecessor
+        // @StateObject SwiftUI destroyed before the round trip returned). Publish it synchronously so the
+        // recreated view merges the pool immediately; the network fetch below still runs and replaces it
+        // with the fresh answer.
+        if let banked = Self.resultBank[contentID], !banked.isEmpty {
+            VXProbe.log("sing", "refresh seeded from bank contentID=\(contentID) streams=\(banked.count)")
+            streams = banked
+        }
         task?.cancel()
         task = Task { [weak self] in
             let pooled = await SourceIndexClient.fetchPooled(contentID: contentID, isSignedIn: isSignedIn)
             let built = SourceIndexClient.streams(from: pooled)
+            // Bank BEFORE the liveness guard: the result is correct for this content id whether or not the
+            // requesting view survived. A dead view just means the NEXT view for this title publishes it
+            // instantly. Empty results are never banked (a young pool may fill; keep re-asking).
+            if !built.isEmpty { Self.bank(contentID, built) }
             guard !Task.isCancelled, let self else {
-                VXProbe.log("sing", "refresh publish SKIPPED contentID=\(contentID) (cancelled or self gone) built=\(built.count)")
+                VXProbe.log("sing", "refresh publish SKIPPED contentID=\(contentID) (cancelled or self gone) built=\(built.count) banked=\(built.isEmpty ? "no" : "yes")")
                 return
             }
             VXProbe.log("sing", "refresh publish contentID=\(contentID) streams=\(built.count) (now merge-ready)")

@@ -6,8 +6,14 @@ import Foundation
 /// legacy progressive loader (`VortXRemuxResourceLoader`, the rollback path) reads it sequentially.
 ///
 /// Design notes:
-/// - APPEND-ONLY at the head. Bytes are only ever added at the end; nothing already produced is rewritten. This
-///   matches a forward-only stream-copy remux, where the muxer writes fMP4 fragments in order.
+/// - APPEND-ONLY at the head, with ONE narrow exception. Bytes are almost always added only at the end, matching
+///   a forward-only stream-copy remux that writes fMP4 fragments in order. The exception is `overwrite(at:)`: the
+///   mov muxer (movenc) writes every box with a 32-bit size PLACEHOLDER and later seeks back to patch it once the
+///   box length is known. When a box (chiefly the init `moov`) outgrows the muxer's AVIO buffer, that backpatch
+///   cannot be done in the muxer's own unflushed buffer and must rewrite bytes already stored here. `overwrite`
+///   patches those already-produced bytes in place; it never grows the stream and never advances `producedCount`.
+///   It is only ever used to correct box-size fields the muxer already emitted, so a reader that has not yet been
+///   handed those bytes (the init segment is not served until it is fully indexed) always sees the corrected value.
 /// - BOUNDED SLIDING WINDOW at the tail. Both deliveries consume the stream front-to-back: the legacy loader
 ///   advertises NO byte-range access (`isByteRangeAccessSupported = false`) so AVPlayer streams strictly
 ///   sequentially from offset 0, and the HLS server only serves CLOSED segments of an append-only EVENT
@@ -84,6 +90,34 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         condition.unlock()
     }
 
+    /// Patch `count` already-stored bytes at absolute `offset` in place (the muxer's box-size backpatch). Used
+    /// ONLY by the remux thread's seekable custom AVIO: movenc seeks back to a box's start and rewrites its
+    /// 32-bit size once the box length is known, which for a box larger than the muxer's AVIO buffer targets
+    /// bytes that have already been flushed into `storage`. Returns true iff the WHOLE `[offset, offset+count)`
+    /// range is still resident (at/above `storageBase`, at/below `producedCount`) and was patched; false if any
+    /// of it was already evicted below the sliding window, in which case the caller drops the patch, which
+    /// reproduces the pre-seek behaviour exactly (movenc ignored the failed seek and the bytes were never
+    /// written). NEVER appends and NEVER changes `producedCount`: a backpatch only corrects bytes already
+    /// produced. Nothing is served until the init segment is indexed, so every backpatch that matters (the moov
+    /// and its children, all patched before the init is published) is still fully resident when it lands.
+    func overwrite(at offset: Int, bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
+        guard count > 0 else { return true }
+        condition.lock()
+        defer { condition.unlock() }
+        // Must lie fully within the resident, already-produced window. storage always spans exactly
+        // [storageBase, producedCount) (eviction only drops BELOW storageBase, appends only grow the top), so
+        // this bound alone guarantees the byte range is present.
+        guard offset >= storageBase, offset + count <= producedCount else { return false }
+        // `withUnsafeMutableBytes` exposes the LOGICAL content 0-based (it hides `storage.startIndex`), so the
+        // byte at absolute `offset` maps to local index `offset - storageBase`, never a bare `startIndex` add.
+        let local = offset - storageBase
+        storage.withUnsafeMutableBytes { raw in
+            // local + count <= raw.count is guaranteed by the bound above (raw.count == producedCount - storageBase).
+            raw.baseAddress!.advanced(by: local).copyMemory(from: bytes, byteCount: count)
+        }
+        return true
+    }
+
     /// Mark the stream complete (the remux loop wrote its trailer). Readers waiting past the end return the
     /// bytes they can and then see EOF instead of blocking forever.
     func finish() {
@@ -117,6 +151,19 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     func status() -> (produced: Int, finished: Bool, failure: String?) {
         condition.lock(); defer { condition.unlock() }
         return (producedCount, isFinished, failureMessage)
+    }
+
+    /// Copy the first `length` produced bytes, or nil if they are not (or no longer) fully resident from absolute
+    /// offset 0. Used ONCE to publish the HLS init segment (ftyp+moov) after the muxer has backpatched the moov
+    /// size: at that moment nothing has been served yet, so nothing below offset 0 has been evicted and the whole
+    /// init (any size, no fixed-buffer ceiling) is guaranteed present. Non-blocking; the caller treats nil as a
+    /// fail-soft abort of the init scan (the start-watchdog then demotes to libmpv like any other dead mount).
+    func snapshotPrefix(length: Int) -> Data? {
+        guard length > 0 else { return nil }
+        condition.lock(); defer { condition.unlock() }
+        guard storageBase == 0, producedCount >= length, storage.count >= length else { return nil }
+        let lo = storage.startIndex
+        return storage.subdata(in: lo..<(lo + length))
     }
 
     /// Read up to `length` bytes starting at absolute `offset`, BLOCKING until either enough bytes are

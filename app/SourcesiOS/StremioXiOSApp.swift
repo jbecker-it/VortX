@@ -37,6 +37,10 @@ struct StremioXiOSApp: App {
     #endif
 
     init() {
+        // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
+        // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a
+        // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
+        VortXCrashReporter.install()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()
@@ -86,7 +90,9 @@ struct StremioXiOSApp: App {
                     }
                     if phase == .background {
                         VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
-                        Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                        // push profiles + settings under a background-task grace window so a just-made library
+                        // removal / rewind survives a sideload-update process kill (CW resurrection fix).
+                        VortXSyncManager.shared.syncUpOnBackground()
                     }
                 }
                 .onAppear {
