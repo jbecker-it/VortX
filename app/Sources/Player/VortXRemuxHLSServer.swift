@@ -8,10 +8,13 @@ import Network
 /// without ever producing a frame. HLS is the one delivery AVFoundation documents for a live fMP4 stream,
 /// and the one Apple's authoring spec defines for Dolby Vision 8.1 (CODECS + SUPPLEMENTAL-CODECS +
 /// VIDEO-RANGE), so this server presents the remux as:
-///   - `/master.m3u8`: one EXT-X-STREAM-INF advertising the DV codec strings the remux classified.
+///   - `/master.m3u8`: two EXT-X-STREAM-INF variants on the SAME media.m3u8 - the DV variant (CODECS +
+///     SUPPLEMENTAL-CODECS + VIDEO-RANGE) plus a range-unlabeled "lifeboat" variant, so AVFoundation's
+///     variant filter (which drops an explicit PQ/HLG variant when the pipeline is not provably HDR at
+///     parse time) always leaves one playable variant instead of zero -> -1002 (the b170 fix).
 ///   - `/media.m3u8`:  an EVENT playlist (starts at the beginning, append-only) of the closed segments the
 ///     remux has produced so far, EXT-X-ENDLIST once the trailer is written. The first answer is held until
-///     three segments exist so AVPlayer's startup never sees an empty window.
+///     a small startup window of segments exists so AVPlayer's startup never sees an empty playlist.
 ///   - `/init.mp4`:    the ftyp+moov init segment (retained in memory for the whole session).
 ///   - `/seg{N}.m4s`:  one closed segment, read out of the remux's sliding-window buffer.
 ///
@@ -204,6 +207,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return
         }
         let path = parts[1].components(separatedBy: "?").first ?? parts[1]
+        DiagnosticsLog.log("dv", "hls req \(path)")
         switch path {
         case "/master.m3u8": serveMaster(connection)
         case "/media.m3u8":  serveMedia(connection)
@@ -213,6 +217,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                let index = Int(path.dropFirst(4).dropLast(4)) {
                 serveSegment(connection, index: index)
             } else {
+                DiagnosticsLog.log("dv", "hls 404 \(path)")
                 close(connection, status: "404 Not Found")
             }
         }
@@ -241,33 +246,45 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
 
     // MARK: - Resources
 
-    /// Master playlist: one variant carrying the DV signaling. Held until the remux has classified the
-    /// source and written its header (the signaling exists from then on).
+    /// Master playlist: TWO variants on the SAME media.m3u8. Held until the remux has classified the source
+    /// and written its header (the signaling exists from then on).
     private func serveMaster(_ connection: NWConnection) {
         guard let sig = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().signaling }) else {
+            DiagnosticsLog.log("dv", "hls 404 /master.m3u8")
             close(connection, status: "404 Not Found")
             return
         }
         var codecs = sig.videoCodec
         if let audio = sig.audioCodec { codecs += ",\(audio)" }
-        var streamInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
-        if sig.width > 0, sig.height > 0 { streamInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
-        streamInf += ",CODECS=\"\(codecs)\""
-        if let supplemental = sig.supplementalCodec { streamInf += ",SUPPLEMENTAL-CODECS=\"\(supplemental)\"" }
-        if let range = sig.videoRange { streamInf += ",VIDEO-RANGE=\(range)" }
-        let playlist = """
-        #EXTM3U
-        #EXT-X-VERSION:7
-        \(streamInf)
-        media.m3u8
-
-        """
+        // DV variant FIRST (Apple authoring-spec truth: SUPPLEMENTAL-CODECS + VIDEO-RANGE) so it is the
+        // initial pick whenever the pipeline admits HDR at parse time.
+        var dvInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(sig.bandwidth)"
+        if sig.width > 0, sig.height > 0 { dvInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
+        dvInf += ",CODECS=\"\(codecs)\""
+        if let supplemental = sig.supplementalCodec { dvInf += ",SUPPLEMENTAL-CODECS=\"\(supplemental)\"" }
+        if let range = sig.videoRange { dvInf += ",VIDEO-RANGE=\(range)" }
+        // Lifeboat (the b170 -1002 fix): same URI, same CODECS, NO VIDEO-RANGE / NO SUPPLEMENTAL-CODECS.
+        // AVFoundation's multivariant selector drops any variant carrying an explicit non-SDR VIDEO-RANGE
+        // (PQ/HLG) whenever the output pipeline is not provably HDR at the instant the master is parsed
+        // (SDR-base Match-Content state, display switch not settled, layerless probe). With exactly ONE
+        // variant that single drop leaves ZERO playable variants, which CoreMedia surfaces as
+        // NSURLErrorDomain -1002 / CoreMediaErrorDomain -1002 (empirically bisected off-device, byte-exact:
+        // the VIDEO-RANGE tag alone is the poison; an untagged copy of the same stream is accepted). A
+        // range-unlabeled variant is never range-filtered, so a variant always survives. Same segments
+        // either way: the fMP4 sample entry (hvc1+dvvC) and the in-band RPUs drive the actual DV decode, and
+        // VortX forces the Apple TV panel itself via HDRDisplayMode. BANDWIDTH-1 keeps the DV variant
+        // preferred when both survive; identical URIs make any ABR switch a no-op.
+        var fbInf = "#EXT-X-STREAM-INF:BANDWIDTH=\(max(sig.bandwidth - 1, 1))"
+        if sig.width > 0, sig.height > 0 { fbInf += ",RESOLUTION=\(sig.width)x\(sig.height)" }
+        fbInf += ",CODECS=\"\(codecs)\""
+        let playlist = "#EXTM3U\n#EXT-X-VERSION:7\n\(dvInf)\nmedia.m3u8\n\(fbInf)\nmedia.m3u8\n"
+        DiagnosticsLog.log("dv", "hls master served (2 variants)")
         respond(connection, body: Data(playlist.utf8), contentType: "application/vnd.apple.mpegurl")
     }
 
     /// Segments the FIRST media-playlist answer waits for, so AVPlayer's startup buffer math never sees a
     /// near-empty window (a finished-early remux is exempt: `ended` publishes whatever exists).
-    private static let minStartupSegments = 3
+    private static let minStartupSegments = 2
 
     /// Media playlist: EVENT type (playback starts at the beginning; entries are only ever appended) over
     /// the closed segments. The FIRST answer waits for `minStartupSegments` so AVPlayer's startup buffer
@@ -281,12 +298,14 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
             return Ready(segments: snap.segments, ended: snap.ended)
         }
         guard let ready else {
+            DiagnosticsLog.log("dv", "hls 404 /media.m3u8")
             close(connection, status: "404 Not Found")
             return
         }
         // A FAILED remux must stop feeding AVPlayer (never ENDLIST: that would end playback "successfully"
         // mid-movie and auto-advance). 404 the reload so AVPlayer errors into the libmpv demotion.
         if stream.buffer.status().failure != nil, !ready.ended {
+            DiagnosticsLog.log("dv", "hls 404 /media.m3u8 (remux failed)")
             close(connection, status: "404 Not Found")
             return
         }
@@ -311,6 +330,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     /// The ftyp+moov init segment, retained in memory for the whole session (immune to window eviction).
     private func serveInit(_ connection: NWConnection) {
         guard let initData = waitFor(seconds: Self.resourceWaitSeconds, { stream.hlsSnapshot().initData }) else {
+            DiagnosticsLog.log("dv", "hls 404 /init.mp4")
             close(connection, status: "404 Not Found")
             return
         }
@@ -323,6 +343,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
     private func serveSegment(_ connection: NWConnection, index: Int) {
         let snap = stream.hlsSnapshot()
         guard index >= 0, index < snap.segments.count else {
+            DiagnosticsLog.log("dv", "hls 404 /seg\(index).m4s")
             close(connection, status: "404 Not Found")
             return
         }
@@ -332,6 +353,7 @@ final class VortXRemuxHLSServer: @unchecked Sendable {
                                        length: min(Self.segmentChunk, seg.byteLength),
                                        cancelled: { [weak self] in self?.isInvalidated ?? true })
         guard first.failure == nil, !first.data.isEmpty else {
+            DiagnosticsLog.log("dv", "hls 404 /seg\(index).m4s (evicted)")
             close(connection, status: "404 Not Found")
             return
         }

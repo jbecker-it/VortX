@@ -179,6 +179,13 @@ struct TVPlayerView: View {
     // 10s (b165) is the deliberate middle ground: past the 5s mid-open cancel, yet a fast-fail to libmpv, while
     // the 30s loadTimeout + AVPlayer .failed path stay as backstops for a genuinely dead mount.
     private let avStartWatchdogSeconds: Double = 10
+    // Remux-only start headroom (b170). Once the local HLS master survives AVFoundation's variant filter (the
+    // -1002 fix in VortXRemuxHLSServer: a range-unlabeled lifeboat variant now always survives), a real first
+    // frame is classify (3.8-8.2s observed) + the startup-segment publish + fetch/decode, so the flat 10s
+    // clips a healthy DV remux mount. ONLY the remux lane waits this long; a non-remux AVPlayer no-frame still
+    // demotes on the short deadline, and the .failed instant-demote path is untouched (a real "Cannot Open"
+    // still bails in ~1s). Bounded: at worst 10 extra seconds of spinner before demoting a genuinely dead mount.
+    private let avRemuxStartWatchdogSeconds: Double = 20
     @State private var loadTimeout: Task<Void, Never>?
     @State private var autoRetryCount = 0              // bounded auto-recovery attempts before the error overlay
     @State private var reconnecting = false            // showing the "Reconnecting…" auto-retry state
@@ -2113,23 +2120,27 @@ struct TVPlayerView: View {
         // watchdog exists only for the DV/remux mount-but-never-frames case, which is never HLS.
         if PlayerEngineRouter.isHLS(url) { return }
         avStartWatchdog = Task { @MainActor in
-            // Fail FAST to libmpv when the AVPlayer / DV-remux lane produces no frame (#76 b165/b166). ozdek's
-            // device logs proved this lane has a 0% first-frame rate on his 4K debrid DV MKVs: it either
-            // .fails "Cannot Open" in ~3s or never reaches readyToPlay at all, and an earlier attempt to EXTEND
-            // the deadline (waiting up to 60s while the remux kept muxing bytes) only made the user wait a full
-            // minute for the SAME inevitable HDR10 fallback, the exact "loads for a minute then just plays HDR"
-            // the owner reported. Waiting longer never turned into a frame, so a short single deadline bails to
-            // the fast libmpv HDR10 path instead. A genuinely-working remux reaches readyToPlay (timePos cancels
-            // this) well inside the window; the .failed instant-demote path is untouched.
-            try? await Task.sleep(for: .seconds(avStartWatchdogSeconds))
+            // The AVPlayer no-frame safety net (#76 b165/b166/b170). Historically this lane first-framed 0% of
+            // the time on 4K debrid DV MKVs because the local HLS master was rejected outright (-1002, the
+            // VIDEO-RANGE single-variant filter, now fixed in VortXRemuxHLSServer with a range-unlabeled
+            // lifeboat variant). With the master accepted a healthy DV remux DOES reach readyToPlay, but only
+            // after classify (3.8-8.2s) + the startup-segment publish, so the remux lane gets
+            // avRemuxStartWatchdogSeconds of headroom while everything else keeps the short
+            // avStartWatchdogSeconds. Read the mount BEFORE the sleep: the mount happens synchronously in
+            // loadFile, so isRemuxMounted is already true at arm time. A genuinely stuck mount still demotes to
+            // the fast libmpv HDR10 path (bounded, remux-only), and the .failed instant-demote path is
+            // untouched, so a real "Cannot Open" still bails in ~1s. A working remux cancels this via the
+            // timePos handler well inside the window.
+            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
+            let deadline = remuxMounted ? avRemuxStartWatchdogSeconds : avStartWatchdogSeconds
+            try? await Task.sleep(for: .seconds(deadline))
             guard !Task.isCancelled, !hasStartedPlaying else { return }
             guard isAVPlayerActive else { return }   // already on libmpv (or torn down): nothing to demote
-            let remuxMounted = (coordinator.player as? AVPlayerEngineController)?.isRemuxMounted == true
-            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(avStartWatchdogSeconds))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
+            DiagnosticsLog.log("player", "AVPlayer start watchdog \(Int(deadline))s reached with no playable frame (remux mounted=\(remuxMounted)), falling back to libmpv")
             if remuxMounted {
                 // The [dv] demote reason for the exportable trail: this is the exact edge that turns a DV +
                 // Atmos session into HDR10 + multichannel PCM, so name it explicitly.
-                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(avStartWatchdogSeconds))s -> libmpv HDR10")
+                DiagnosticsLog.log("dv", "remux demoted: no frame in \(Int(deadline))s -> libmpv HDR10")
             }
             demoteAVPlayerToMPV()
         }

@@ -1093,7 +1093,7 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
         guard n >= 23, ex[0] == 1 else { return nil }
         let profileSpace = Int((ex[1] >> 6) & 0x3)
         // general_tier_flag (ex[1] bit 5) is deliberately NOT read: the HLS CODECS tier is FORCED to Main ("L")
-        // below - the fix for the dominant DV-remux -1002 (see the note on the `s` line).
+        // below (kept as a harmless canonical-form choice; it was NOT the -1002 fix - see the note on the `s` line).
         let profileIdc = ex[1] & 0x1F
         // general_profile_compatibility_flags, bit-reversed then hex, per RFC 6381 (e.g. Main10 -> "4").
         var compat: UInt32 = (UInt32(ex[2]) << 24) | (UInt32(ex[3]) << 16) | (UInt32(ex[4]) << 8) | UInt32(ex[5])
@@ -1108,18 +1108,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             for k in 0...lastNonZero { constraints.append(String(format: "%X", ex[6 + k])) }
         }
         let spacePrefix = ["", "A", "B", "C"][profileSpace]
-        // TIER FORCED TO MAIN ("L"), never High ("H"). Fix for the dominant DV-remux -1002 ("unsupported URL /
-        // no playable variant", 3 of 4 real DV files). A high-bitrate 4K DV remux whose HEVC base is genuinely
-        // High tier (general_tier_flag=1; e.g. a ~69 Mbps UHD Profile-7 remux, BANDWIDTH ~86 Mbps, above Main
-        // L5.1's 40 Mbps ceiling) makes the muxer's hvcC honestly report High tier, so this would read
-        // "hvc1.2.4.H153.B0". AVFoundation's multivariant Dolby Vision validation rejects a High-tier base for
-        // DV Profile 8.1 (whose conformance is Main-tier-based; Apple's canonical form is "hvc1.2.4.L153.B0").
-        // The master carries exactly ONE variant, so that single rejection leaves ZERO playable variants and
-        // AVFoundation reports NSURLErrorUnsupportedURL / CoreMediaErrorDomain -1002 (it never even degrades to
-        // the plain HDR10 base, proving the BASE codec's tier is what disqualifies the variant). CODECS governs
-        // only variant SELECTION; the init segment's real hvcC (still truthfully High tier) is what VideoToolbox
-        // decodes, and the hardware decodes regardless of the advertised tier. Profile/compat/level/constraints
-        // are left exact.
+        // TIER FORCED TO MAIN ("L"), never High ("H"). This is KEPT, but it is NOT what fixed the DV-remux
+        // -1002 - an earlier note here claimed AVFoundation rejects a High-tier base for DV Profile 8.1; a
+        // byte-exact off-device bisect (13 cases on the same CoreMedia HLS stack) disproved that. The -1002
+        // was AVFoundation's VIDEO-RANGE single-variant filter: an explicit non-SDR VIDEO-RANGE (PQ/HLG)
+        // variant is dropped when the output pipeline is not provably HDR at master-parse time, and the master
+        // carried exactly ONE variant, so that single drop left ZERO playable variants -> NSURLErrorDomain
+        // -1002 / CoreMediaErrorDomain -1002. The bisect proved: an HONEST High-tier "hvc1.2.4.H153.B0" with
+        // NO VIDEO-RANGE plays fine (so forced-L was never load-bearing), and a genuine codec-level reject
+        // surfaces as AVFoundationErrorDomain -11848 / CoreMediaErrorDomain -15517 ("Cannot Open"), a DIFFERENT
+        // signature from -1002. The actual -1002 fix is the range-unlabeled "lifeboat" second variant in
+        // VortXRemuxHLSServer.serveMaster (b170), which always survives the filter. Forced-L is retained only
+        // because it is proven harmless: CODECS governs only variant SELECTION, the init segment's real hvcC
+        // (still truthfully High tier) is what VideoToolbox decodes, and the hardware decodes regardless of the
+        // advertised tier. Profile/compat/level/constraints are left exact.
         var s = "hvc1.\(spacePrefix)\(profileIdc).\(String(reversed, radix: 16, uppercase: true)).L\(level)"
         if !constraints.isEmpty { s += "." + constraints.joined(separator: ".") }
         return s
