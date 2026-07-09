@@ -475,8 +475,9 @@ struct CoreContinueWatchingRow: View {
                     // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
                     NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
                     bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
+                    let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
                     presenter.request = PlaybackRequest(
-                        url: resolvedURL, title: entry.title, meta: meta, episodes: [],
+                        url: resolvedURL, title: entry.title, meta: meta, episodes: eps,
                         sourceHint: entry.qualityText, torrent: false,
                         bingeGroup: entry.bingeGroup, headers: entry.headers,
                         debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
@@ -495,12 +496,29 @@ struct CoreContinueWatchingRow: View {
                 if bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
                     bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
                 }
+                let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
                 presenter.request = PlaybackRequest(
                     url: resolvedURL, title: entry.title, meta: meta,
-                    episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
+                    episodes: eps, sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
                     headers: entry.headers, wasResume: true)
             }
         }
+    }
+
+    /// Direct-resume episode prefetch (mirrors iOSRootView's CW-resume prefetch): hand the player its
+    /// episode list BEFORE it mounts so auto-advance never depends on the in-player backfill race.
+    /// Bounded ~1.5s; a miss returns [] and playback starts exactly as today (the player's own loader
+    /// plus the EOF last-chance retry remain the backstop). The raw unsorted videos are byte-equivalent
+    /// to what the in-player backfill sets (loadedEpisodes = vids), the proven 0.3.11 behavior.
+    @MainActor
+    private func prefetchEpisodes(_ bridge: CoreBridge, itemID: String, entryType: String) async -> [CoreVideo] {
+        guard entryType == "series" else { return [] }
+        for _ in 0 ..< 6 {
+            if let meta = bridge.metaDetails?.meta, meta.id == itemID,
+               let vids = meta.videos, !vids.isEmpty { return vids }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return []
     }
 }
 
