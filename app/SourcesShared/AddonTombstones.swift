@@ -176,7 +176,13 @@ enum AddonTombstones {
         for rawURL in webIDs {
             let url = normalize(rawURL)
             guard !url.isEmpty, url.count <= maxIDLength else { continue }
-            guard !stamped.contains(url), state.removedAt[url] == nil else { continue }   // published stamp or already tracked: never mint
+            // Mint removedAt=now ONLY for a url this device has never tracked: a published stamp, an existing
+            // removedAt, OR a local install (addedAt present) all block the mint. A stamp-less web array cannot
+            // distinguish "installed then web-removed" from "web-removed then reinstalled", so minting now over a
+            // known local install (addedAt) would uninstall an add-on the user installed after the web removal.
+            // Per the sanctioned design a stamp-less removal folds below any real install and never uninstalls it;
+            // a genuine web removal of an installed add-on takes effect once the web lane emits stamps via stampsRaw.
+            guard !stamped.contains(url), state.removedAt[url] == nil, state.addedAt[url] == nil else { continue }
             state.removedAt[url] = nowMs()
         }
 
