@@ -1044,22 +1044,37 @@ struct PlayerScreen: View {
     /// "2:05:00"). Kept here because the raw JSON path above never decodes a full CoreMeta.
     private static func parseRuntimeSeconds(_ raw: String?) -> Double {
         guard let r = raw?.lowercased().trimmingCharacters(in: .whitespaces), !r.isEmpty else { return 0 }
+        // Twin of CoreMeta.runtimeSeconds: compute in Double and cap each field so an add-on/Cinemeta garbage
+        // value yields 0 rather than trapping on Int overflow. A field over 24h (86_400s) is rejected; the
+        // total must be finite and positive and is clamped to a 24h ceiling.
+        let maxSeconds = 86_400.0
+        func field(_ rawField: Substring) -> Double? {
+            guard let n = Double(rawField.trimmingCharacters(in: .whitespaces)),
+                  n.isFinite, n >= 0, n <= maxSeconds else { return nil }
+            return n
+        }
+        func finalize(_ seconds: Double) -> Double {
+            guard seconds.isFinite, seconds > 0 else { return 0 }
+            return min(seconds, maxSeconds)
+        }
         if r.contains(":") {
-            let p = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if p.count == 3 { return Double(p[0] * 3600 + p[1] * 60 + p[2]) }
-            if p.count == 2 { return Double(p[0] * 60 + p[1]) }
+            let p = r.split(separator: ":").compactMap { field($0) }
+            if p.count == 3 { return finalize(p[0] * 3600 + p[1] * 60 + p[2]) }
+            if p.count == 2 { return finalize(p[0] * 60 + p[1]) }
         }
         if let hRange = r.range(of: #"\d+\s*h"#, options: .regularExpression) {
-            let h = Int(r[hRange].filter(\.isNumber)) ?? 0
-            var mins = 0
+            let h = Double(r[hRange].filter(\.isNumber)) ?? 0
+            var mins = 0.0
             if let mRange = r.range(of: #"\d+\s*m"#, options: .regularExpression,
                                     range: hRange.upperBound..<r.endIndex) {
-                mins = Int(r[mRange].filter(\.isNumber)) ?? 0
+                mins = Double(r[mRange].filter(\.isNumber)) ?? 0
             }
-            return Double(h * 3600 + mins * 60)
+            guard h <= maxSeconds, mins <= maxSeconds else { return 0 }
+            return finalize(h * 3600 + mins * 60)
         }
-        let minutes = Int(r.prefix { $0.isNumber }) ?? 0
-        return Double(minutes * 60)
+        let minutes = Double(r.prefix { $0.isNumber }) ?? 0
+        guard minutes <= maxSeconds else { return 0 }
+        return finalize(minutes * 60)
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
