@@ -258,8 +258,7 @@ final class TorBoxSearchSource: ObservableObject {
         // H9 diagnostic (terminal-run repro): confirm refresh actually fires with a key. Logs the id + whether
         // a non-empty TorBox key is present (never the key itself). If this line never appears, the gate above
         // no-op'd; if it appears but the count line below is 0, the index returned nothing for the id.
-        NSLog("[torbox-search] refresh id=%@ s=%d e=%d hasKey=%@", imdbId, season ?? -1, episode ?? -1,
-              key.isEmpty ? "no" : "yes")
+        VXProbe.log("torbox-search", "refresh id=\(imdbId) s=\(season ?? -1) e=\(episode ?? -1) hasKey=\(key.isEmpty ? "no" : "yes")")
         task = Task { [weak self] in
             let result = await TorBoxSearch.streams(imdbId: imdbId, season: season, episode: episode, apiKey: key)
             guard !Task.isCancelled, let self else { return }
@@ -268,17 +267,17 @@ final class TorBoxSearchSource: ObservableObject {
                 // Over the TorBox scraper allowance. Back off ~15 min before re-probing; do NOT cache the
                 // empty result, so it re-fetches for real once the cooldown lifts.
                 self.cooldownUntil = Date().addingTimeInterval(15 * 60)
-                NSLog("[torbox-search] rate-limited (scraper cooldown) for id=%@ - backing off ~15m", imdbId)
+                VXProbe.log("torbox-search", "rate-limited (scraper cooldown) for id=\(imdbId), backing off ~15m")
                 return
             }
             if result.transportError {
                 // The request never completed (offline / network failure). Do NOT cache the empty result and do
                 // NOT set a cooldown, so the next meta change or reopen re-fetches for real once the network is
                 // back. Without this, an offline first open cached an empty list for the whole session.
-                NSLog("[torbox-search] transport error for id=%@ - not caching, will retry", imdbId)
+                VXProbe.log("torbox-search", "transport error for id=\(imdbId), not caching, will retry")
                 return
             }
-            NSLog("[torbox-search] fetched %d stream(s) for id=%@", result.streams.count, imdbId)
+            VXProbe.log("torbox-search", "fetched \(result.streams.count) stream(s) for id=\(imdbId)")
             self.cache[fetchKey] = result.streams
             if self.shownKey == fetchKey { self.streams = result.streams }
         }

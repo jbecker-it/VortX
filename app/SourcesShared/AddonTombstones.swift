@@ -158,15 +158,21 @@ enum AddonTombstones {
         for (rawURL, rawEntry) in stampsRaw {
             let url = normalize(rawURL)
             guard !url.isEmpty, url.count <= maxIDLength, let entry = rawEntry as? [String: Any] else { continue }
-            stamped.insert(url)
+            var applied = false
             if let r = (entry["removedAt"] as? NSNumber)?.doubleValue, r.isFinite {
                 if r > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, r) }
                 state.removedAt[url] = max(state.removedAt[url] ?? 0, r)
+                applied = true
             }
             if let a = (entry["addedAt"] as? NSNumber)?.doubleValue, a.isFinite {
                 if a > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, a) }
                 state.addedAt[url] = max(state.addedAt[url] ?? 0, a)
+                applied = true
             }
+            // Only suppress the legacy epoch fold for a url that actually carried a finite stamp. An empty or
+            // non-finite Ts entry must NOT mask the legacy removed array, or a peer-deleted url present in the
+            // legacy deletedAddons array would skip its migration-epoch fold and get re-unioned back in.
+            if applied { stamped.insert(url) }
         }
         for rawURL in legacyIDs {
             let url = normalize(rawURL)
@@ -176,7 +182,13 @@ enum AddonTombstones {
         for rawURL in webIDs {
             let url = normalize(rawURL)
             guard !url.isEmpty, url.count <= maxIDLength else { continue }
-            guard !stamped.contains(url), state.removedAt[url] == nil else { continue }   // published stamp or already tracked: never mint
+            // Mint removedAt=now ONLY for a url this device has never tracked: a published stamp, an existing
+            // removedAt, OR a local install (addedAt present) all block the mint. A stamp-less web array cannot
+            // distinguish "installed then web-removed" from "web-removed then reinstalled", so minting now over a
+            // known local install (addedAt) would uninstall an add-on the user installed after the web removal.
+            // Per the sanctioned design a stamp-less removal folds below any real install and never uninstalls it;
+            // a genuine web removal of an installed add-on takes effect once the web lane emits stamps via stampsRaw.
+            guard !stamped.contains(url), state.removedAt[url] == nil, state.addedAt[url] == nil else { continue }
             state.removedAt[url] = nowMs()
         }
 
@@ -252,6 +264,11 @@ enum AddonTombstones {
         for raw in transportUrls {
             let url = normalize(raw)
             guard !url.isEmpty, url.count <= maxIDLength else { continue }
+            // Baseline exists only to out-race a STAMP-LESS migration-epoch removal (removedAt == migrationEpochMs)
+            // carried by a pre-b172 peer array for an add-on the user has reinstalled. It must NOT manufacture
+            // install-intent over a genuine wall-clock removal a b172 peer folded in, or that peer's deletion is
+            // resurrected. Skip any url whose folded removedAt is a real, post-epoch removal.
+            if let removed = state.removedAt[url], removed > migrationEpochMs { continue }
             state.addedAt[url] = max(state.addedAt[url] ?? 0, now)
         }
         save(state)

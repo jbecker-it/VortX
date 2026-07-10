@@ -149,15 +149,21 @@ enum LibraryTombstones {
         for (rawID, rawEntry) in stampsRaw {
             let id = normalize(rawID)
             guard !id.isEmpty, id.count <= maxIDLength, let entry = rawEntry as? [String: Any] else { continue }
-            stamped.insert(id)
+            var applied = false
             if let r = (entry["removedAt"] as? NSNumber)?.doubleValue, r.isFinite {
                 if r > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, r) }
                 state.removedAt[id] = max(state.removedAt[id] ?? 0, r)
+                applied = true
             }
             if let a = (entry["addedAt"] as? NSNumber)?.doubleValue, a.isFinite {
                 if a > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, a) }
                 state.addedAt[id] = max(state.addedAt[id] ?? 0, a)
+                applied = true
             }
+            // Only suppress the legacy epoch fold for an id that actually carried a finite stamp. An empty or
+            // non-finite Ts entry must NOT mask the legacy removed array, or a peer-removed id present in the
+            // legacy deletedLibrary array would skip its migration-epoch fold and stay in the library union.
+            if applied { stamped.insert(id) }
         }
         for rawID in legacyIDs {
             let id = normalize(rawID)
