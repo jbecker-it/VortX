@@ -481,7 +481,7 @@ struct TVCategoryBrowse: View {
 /// gesture, so "Your services" rows carry Up / Down / Remove; "All services" is a LazyVStack of every service
 /// TMDB knows, each with Add. With nothing chosen the hub shows every service in the region (AUTO), exactly as
 /// before. Rows load through RemoteLogo (PosterImageLoader: dedicated cache, bounded concurrency, off-main
-/// decode); the "All services" list is a LazyVStack so its ~hundreds of rows never instantiate all at once.
+/// decode); both lists are LazyVStacks so neither ever instantiates all of its rows at once.
 struct TVReorderServicesView: View {
     @ObservedObject private var model = CollectionsHubModel.shared
     @State private var allServices: [TMDBClient.ProviderTile] = []
@@ -498,8 +498,14 @@ struct TVReorderServicesView: View {
                     .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.sm)
 
                 sectionHeader("Your services")
-                ForEach(Array(model.providers.enumerated()), id: \.element.id) { index, provider in
-                    yourServiceRow(index: index, provider: provider)
+                // LazyVStack (matching "All services" below) so a user with dozens of pinned services does not
+                // instantiate every row at once. Row identity (stable \.element.id), order, and the Up/Down/Remove
+                // controls are unchanged; interactive adjacent swaps act only on on-screen rows, so focus is
+                // preserved exactly as with the eager stack, the same pattern the shipped All-services list uses.
+                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                    ForEach(Array(model.providers.enumerated()), id: \.element.id) { index, provider in
+                        yourServiceRow(index: index, provider: provider)
+                    }
                 }
 
                 sectionHeader("All services")
