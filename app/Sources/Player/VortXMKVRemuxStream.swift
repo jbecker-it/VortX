@@ -573,14 +573,20 @@ final class VortXMKVRemuxStream: @unchecked Sendable {
             outStream.pointee.codecpar.pointee.codec_tag = 0
             if i == baseVideoIn {
                 baseVideoOut = Int(outIndex)
-                // DV HEVC in mp4 MUST use the 'hvc1' sample entry (parameter sets out-of-band in hvcC). A Dolby
-                // Vision config box (dvcC/dvvC) on an 'hev1' entry (in-band parameter sets) is rejected by
-                // movenc's mov_init with EINVAL, and the codec_tag=0 above lets the muxer derive 'hev1' for some
-                // Profile 7 rips - which is exactly the write_header rc=-22 we hit only on convertP7. Force
-                // 'hvc1' (MKTAG little-endian) on the base video so the DV config box sits on a valid entry.
-                outStream.pointee.codecpar.pointee.codec_tag =
-                    UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
-                    | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24
+                // A Dolby Vision config box (dvcC/dvvC) demands a sample entry whose parameter sets are
+                // OUT-OF-BAND: on an 'hev1' entry (in-band parameter sets) movenc's mov_init rejects it with
+                // EINVAL, and the codec_tag=0 above lets the muxer derive 'hev1' for some rips (the convertP7
+                // write_header rc=-22). Force the correct entry (MKTAG little-endian): 'dvh1' for the DV-ONLY
+                // Profile 5 (per Dolby's ISOBMFF spec + Apple authoring rule 1.10, a P5 stream is not
+                // cross-compatible so it takes the DV sample entry), and 'hvc1' for the cross-compatible 8.x
+                // profiles so a non-DV decoder can still read the base layer. movenc accepts both tags for HEVC
+                // in mp4; the hvcC parameter sets stay out-of-band either way, so the extradata-repair gate
+                // below still applies.
+                outStream.pointee.codecpar.pointee.codec_tag = info.dvProfile == 5
+                    ? (UInt32(UInt8(ascii: "d")) | UInt32(UInt8(ascii: "v")) << 8
+                        | UInt32(UInt8(ascii: "h")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
+                    : (UInt32(UInt8(ascii: "h")) | UInt32(UInt8(ascii: "v")) << 8
+                        | UInt32(UInt8(ascii: "c")) << 16 | UInt32(UInt8(ascii: "1")) << 24)
                 // 'hvc1' is only valid when the hvcC box carries the parameter sets OUT-OF-BAND, and movenc
                 // does NOT enforce that: it ignores ff_isom_write_hvcc's error and writes an EMPTY hvcC, a
                 // structurally-fine moov AVPlayer then fails with "Cannot Open" AFTER mounting. So when the
