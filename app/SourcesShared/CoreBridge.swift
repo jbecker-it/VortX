@@ -1407,6 +1407,13 @@ final class CoreBridge: ObservableObject {
         dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
     }
 
+    /// Tear down the engine Player so a stale Player from a previous title cannot absorb the next title's
+    /// TimeChanged ticks (downloads, paste-a-link, and direct CW resume play without loading their own
+    /// Player). Call ONLY from a player cover's onClose, never a load path. Mirrors `unloadMeta`.
+    func unloadEnginePlayer() {
+        dispatch(action: ["action": "Unload"], field: "player")
+    }
+
     private func streamMatches(_ raw: [String: Any], _ stream: CoreStream) -> Bool {
         if let url = stream.url { return raw["url"] as? String == url }
         if let hash = stream.infoHash { return raw["infoHash"] as? String == hash }
