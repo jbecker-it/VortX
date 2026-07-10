@@ -45,8 +45,9 @@ final class VortXSyncManager: ObservableObject {
     private let kcAccount = "vortx.sync.session.v1"
     private var token: String?
     private var dataKey: Data?
-    /// Newest doc version this device has pushed or applied. Persisted to UserDefaults (kVersionKey) so the
-    /// version-wins guard stays consistent across relaunches: an in-memory 0 after a cold launch would treat
+    /// Newest doc version this device has pushed or applied. Persisted to UserDefaults per account (see
+    /// versionKey(for:)) so the version-wins guard stays consistent across relaunches: an in-memory 0 after a
+    /// cold launch would treat
     /// the account's current doc as "newer" and re-apply it once on every launch (harmless but wasteful, and
     /// it re-runs the restore). Seeded from UserDefaults at init.
     /// MIGRATION flip for the version-bound sync-document format (see VortXSyncCrypto.sealDocument). Stays
@@ -70,7 +71,6 @@ final class VortXSyncManager: ObservableObject {
     ///      NOT DONE.
     /// Flip this AND WRITE_SYNC_DOC_V2 in vortx-site vault.ts AND webapp/src/lib/vault.ts together.
     static let writeSyncDocV2 = false
-    private static let kVersionKey = "vortx.sync.lastSyncedVersion"   // legacy GLOBAL key (pre per-account)
     // H-2: the newest doc version this device has pushed or applied, keyed PER ACCOUNT so the version-wins
     // guard and the merge-base floor follow the signed-in account. A single global int broke on account-switch
     // (sign out of A at v1000, into B at v5 -> B's pulls would look stale). A fresh per-account key starts at
@@ -83,13 +83,16 @@ final class VortXSyncManager: ObservableObject {
     }
     private func persistLastSyncedVersion() { /* the computed setter above persists per-account; no-op kept so
         the advance-then-persist call sites read unchanged */ }
-    /// LWW stamp of the last web profileEdits applied. Persisted to UserDefaults so a sign-out / re-login
-    /// does not re-window an old dashboard edit (e.g. a delete the app has already honored): an in-memory
-    /// 0 after re-login would re-apply a stale profileEdits overlay. Re-apply is idempotent regardless.
-    private static let kEditsAtKey = "vortx.sync.lastAppliedProfileEditsAt"
+    /// LWW stamp of the last web profileEdits applied, keyed PER ACCOUNT (mirroring versionKey(for:)) so an
+    /// account switch cannot skip the new account's dashboard edits against the previous account's high-water
+    /// mark. Persisted to UserDefaults so a sign-out / re-login for the SAME account does not re-window an old
+    /// dashboard edit (e.g. a delete the app has already honored); a fresh per-account key starts at 0, and
+    /// re-apply is idempotent regardless. The per-account key RETAINS each account's high-water mark across
+    /// re-login, so signOut deliberately does NOT reset it.
+    private func editsAtKey(for accountId: String?) -> String { "vortx.sync.lastAppliedProfileEditsAt." + (accountId ?? "") }
     private var lastAppliedProfileEditsAt: Double {
-        get { UserDefaults.standard.double(forKey: Self.kEditsAtKey) }
-        set { UserDefaults.standard.set(newValue, forKey: Self.kEditsAtKey) }
+        get { UserDefaults.standard.double(forKey: editsAtKey(for: account?.id)) }
+        set { UserDefaults.standard.set(newValue, forKey: editsAtKey(for: account?.id)) }
     }
     /// Last shared add-on ORDER applied from the account (Bug B). Persisted normalized transportUrls in the
     /// converged priority order. Read by ownedAddons(from:) as the ordering spine when a pulled doc does not
@@ -207,6 +210,11 @@ final class VortXSyncManager: ObservableObject {
         stopRealtime()   // drop the SyncRoom socket + poll before clearing the token
         token = nil; account = nil; dataKey = nil; isSignedIn = false
         Keychain.set(nil, for: kcAccount)
+        // The shared add-on ORDER is a global static with no account context, so a switched-in account would
+        // otherwise inherit the previous account's order until its own pull lands. Clear it here so the next
+        // account starts from the descriptor spine and converges on its own doc.addonOrder. The per-account
+        // version and edits high-water marks are deliberately NOT reset (they are keyed by account id).
+        Self.appliedAddonOrder = []
     }
 
     // MARK: - HTTP
@@ -836,7 +844,7 @@ final class VortXSyncManager: ObservableObject {
         if !force, hasPendingPush { return false }
         guard let pulled = await pullDocVersioned() else { return false }
         // VERSION-WINS: once no local edit is pending, apply only a STRICTLY NEWER remote; a stale or equal pull
-        // is a no-op. lastSyncedVersion is persisted (kVersionKey) so this holds across relaunches.
+        // is a no-op. lastSyncedVersion is persisted per account (versionKey(for:)) so this holds across relaunches.
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
@@ -1380,6 +1388,12 @@ final class VortXSyncManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 2_500_000_000)
             if Task.isCancelled { return }
             await self?.syncUp()
+            // A newer edit that arrived while syncUp awaited cancelled this task and queued its own push.
+            // Clearing the flag here would open the pull guard while that newer push is still pending, letting
+            // an interleaved pull re-apply the account's pre-edit value and revert the just-made edit.
+            // Cancellation reliably means superseded, so bail without clearing: the final, non-cancelled task
+            // always reaches this line and clears the flag, so it can never stick true.
+            if Task.isCancelled { return }
             self?.hasPendingPush = false
         }
     }
