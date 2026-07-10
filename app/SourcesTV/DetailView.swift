@@ -1448,6 +1448,8 @@ struct CoreStreamList: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
+    @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    private static let sourceRefreshDebounceMs = 400   // trailing settle for the add-on load storm, mirrors coalesceMs intent
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
@@ -1685,19 +1687,11 @@ struct CoreStreamList: View {
         // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
         // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
         // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
-        .onChange(of: core.streamLoadProgress().loaded) { _ in
-            // Unfiltered: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
-            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
-            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-            refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
-        }
+        .onChange(of: core.streamLoadProgress().loaded) { _ in scheduleSourceRefresh() }
         // The Singularity pool answers asynchronously (a network fetch), so re-run the debrid cache check when
         // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
         // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
-        .onChange(of: sourceIndex.streams.count) { _ in
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-        }
+        .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
         // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
         // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).
@@ -1706,6 +1700,7 @@ struct CoreStreamList: View {
             torboxSearch.refresh(imdbId: imdbId)
             refreshSourceIndex()
         }
+        .onDisappear { sourceRefreshDebounce?.cancel() }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -1803,13 +1798,33 @@ struct CoreStreamList: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex() {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         guard let contentID = sourceContentID else { return }
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
-        let groups = torboxSearch.merged(into: core.streamGroups())
+        // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
+        // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
+        // itself would be wrong.
+        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+    }
+
+    /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
+    /// each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst settles, and
+    /// compute the torbox-base ONCE so the debrid (pool-inclusive) and hoard (pool-excluded) sets share it.
+    private func scheduleSourceRefresh() {
+        sourceRefreshDebounce?.cancel()
+        sourceRefreshDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
+            guard !Task.isCancelled else { return }
+            let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
+            // Pool-INCLUDED: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
+            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
+            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
+            refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
+        }
     }
 
     /// Play a stream by handing a request to the root, which swaps the whole shell out for the player
