@@ -106,7 +106,7 @@ enum StreamRanking {
     /// heuristic; both fall back to the plain best when absent.
     static func best(_ groups: [CoreStreamSourceGroup], continuity hint: String?, binge: String? = nil,
                      pin: ResolvedPin? = nil, debridCachedHashes: Set<String> = []) -> CoreStream? {
-        let groups = applyUserFilters(groups)
+        let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         if SourcePreferences.reading.useAddonOrder {
             // Add-on order is the user's explicit "don't re-rank" choice, but a pin is an even more
             // explicit "play THIS" - so an applicable pin still wins, falling back to add-on order.
@@ -370,7 +370,7 @@ enum StreamRanking {
         // resolution marker is present, the whole text is treated as tags (current behaviour).
         let tags = technicalTags(text)
         let foreign = langTokens.keys.filter { !preferred.contains($0) }
-        return foreign.contains(where: { claimsLanguage(tags, $0) }) ? -5000 : 0
+        return foreign.contains(where: { claimsAudioLanguage(tags, $0) }) ? -5000 : 0
     }
 
     /// The technical-tags substring (from the first year or resolution marker onward), where audio
@@ -386,6 +386,21 @@ enum StreamRanking {
     private static func claimsLanguage(_ text: String, _ code: String) -> Bool {
         (langTokens[code] ?? []).contains { token in
             token.count <= 3 ? boundedMatch(text, token) : text.contains(token)
+        }
+    }
+
+    /// Subtitle-context tokens that also live in `langTokens` (korsub = Korean SUBS, vostfr = French SUBS,
+    /// legendado = Portuguese SUBS). They stay in `langTokens` so `languageCodesAdvertised` and the subtitle
+    /// index keep detecting them, but they must NOT drive the foreign-AUDIO demotion: such a release is
+    /// usually the original audio with those subtitles burned in, not that language's audio.
+    private static let subtitleContextTokens: Set<String> = ["korsub", "vostfr", "legendado"]
+
+    /// True when `text` advertises AUDIO language `code`. Like `claimsLanguage`, but ignores subtitle-context
+    /// tokens so a burned-in-subtitle release (korsub / vostfr / legendado) is never read as foreign audio.
+    private static func claimsAudioLanguage(_ text: String, _ code: String) -> Bool {
+        (langTokens[code] ?? []).contains { token in
+            guard !subtitleContextTokens.contains(token) else { return false }
+            return token.count <= 3 ? boundedMatch(text, token) : text.contains(token)
         }
     }
 
@@ -575,7 +590,7 @@ enum StreamRanking {
     /// among ties). Scores are computed once per stream, not per comparison.
     /// Whether a stream survives the user's keyword + safety filters (Settings > Streams). Default
     /// preferences pass everything, so this is a no-op until the user opts in.
-    static func passesUserFilters(_ s: CoreStream) -> Bool {
+    static func passesUserFilters(_ s: CoreStream, debridCachedHashes: Set<String> = []) -> Bool {
         let prefs = SourcePreferences.reading
         let kids = ProfileStore.activeIsKids()
         if !kids, prefs.noFiltersActive { return true }   // fast path: nothing opted in (and not a Kids profile)
@@ -600,7 +615,7 @@ enum StreamRanking {
         case "strict":   if junkClass(text) != nil || implausibleForResolution(text) { return false }
         default: break
         }
-        if prefs.instantOnly, !isCached(s, text) { return false }                       // only cached / direct
+        if prefs.instantOnly, !isCached(s, text, debridCachedHashes: debridCachedHashes) { return false }  // only cached / direct or account-cached
         if prefs.hideDeadTorrents, sourceType(s, text) == .torrent,
            let seeders = seederCount(text), seeders == 0 { return false }               // explicitly-dead swarm
         if prefs.excludeAV1, boundedMatch(text, "av1") { return false }                 // no Apple AV1 hw decode
@@ -645,21 +660,21 @@ enum StreamRanking {
         }
     }
 
-    static func applyUserFilters(_ groups: [CoreStreamSourceGroup]) -> [CoreStreamSourceGroup] {
+    static func applyUserFilters(_ groups: [CoreStreamSourceGroup], debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
         let groups = stripNonVideo(groups)   // always: diagnostic/info pseudo-streams are never real video
         let prefs = SourcePreferences.reading
         // A Kids profile must run passesUserFilters even with zero manual filters (its content guard
         // lives there), so only take the no-op fast path when not a Kids profile.
         guard !prefs.noFiltersActive || ProfileStore.activeIsKids() else { return groups }
         return groups.compactMap { group in
-            let kept = group.streams.filter { passesUserFilters($0) }
+            let kept = group.streams.filter { passesUserFilters($0, debridCachedHashes: debridCachedHashes) }
             return kept.isEmpty ? nil : CoreStreamSourceGroup(id: group.id, addon: group.addon, streams: kept)
         }
     }
 
     static func rankedGroups(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                              debridCachedHashes: Set<String> = []) -> [CoreStreamSourceGroup] {
-        let groups = applyUserFilters(groups)
+        let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         guard !SourcePreferences.reading.useAddonOrder else { return groups }
         return groups.map { group in
             var scored: [(stream: CoreStream, score: Int, index: Int)] = []
@@ -674,7 +689,7 @@ enum StreamRanking {
     /// The single best playable stream across all groups, for the one-press "Watch Now".
     static func best(_ groups: [CoreStreamSourceGroup], pin: ResolvedPin? = nil,
                      debridCachedHashes: Set<String> = []) -> CoreStream? {
-        let groups = applyUserFilters(groups)
+        let groups = applyUserFilters(groups, debridCachedHashes: debridCachedHashes)
         if SourcePreferences.reading.useAddonOrder {
             if pin != nil, let hit = firstPinned(groups, pin: pin) { return hit }
             return groups.flatMap { $0.streams }.first { $0.playableURL != nil && !$0.isYouTubeTrailer }
@@ -749,7 +764,7 @@ enum StreamRanking {
         for s in playable {
             let t = qualityText(s)
             var tags = [qualityLabel(s)]
-            if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi") || t.contains(" dv ") {
+            if StreamRanking.isDolbyVision(t) {
                 tags.append("Dolby Vision")
             } else if t.contains("hdr") {
                 tags.append("HDR")
@@ -783,12 +798,12 @@ enum StreamRanking {
     static func variantOptions(_ groups: [CoreStreamSourceGroup], tier wanted: String)
         -> [(label: String, stream: CoreStream)] {
         let playable = groups.flatMap { $0.streams }
-            .filter { $0.playableURL != nil && tier(of: $0) == wanted }
+            .filter { $0.playableURL != nil && !$0.isYouTubeTrailer && tier(of: $0) == wanted }
         var best: [String: (score: Int, stream: CoreStream)] = [:]
         for s in playable {
             let t = qualityText(s)
             var tags: [String] = []
-            if t.contains("dolby vision") || t.contains("dolbyvision") || t.contains("dovi") || t.contains(" dv ") {
+            if StreamRanking.isDolbyVision(t) {
                 tags.append("Dolby Vision")
             } else if t.contains("hdr") {
                 tags.append("HDR")
@@ -1047,11 +1062,14 @@ enum StreamRanking {
             || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\s+download\]"#) {
             return false
         }
-        // "[RD+]"-style plus tags, "⚡" bolt, "(Instant RD)", plain "cached", "🎫" ticket.
+        // "[RD+]"-style plus tags, "⚡" bolt, "(Instant RD)" (instant bound to a service code, so the movie
+        // title "Instant Family" is not read as cached, T9), a bounded "cached" inside the technical tags
+        // (after the year/resolution marker, so a title word does not force it), "🎫" ticket.
         // The "+" plus tag only counts bound to a known service code inside brackets; a bare "+]"
         // substring occurs in ordinary release names and would misclassify them as cached.
         if text.contains("⚡") || matches(text, #"\[(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)\+\]"#)
-            || text.contains("instant") || text.contains("cached") || text.contains("🎫") {
+            || matches(text, #"instant\s*(rd|ad|pm|tb|dl|oc|ed|st|db|pp|putio)(?![a-z0-9])"#)
+            || boundedMatch(technicalTags(text), "cached") || text.contains("🎫") {
             return true
         }
         return s.url != nil && s.infoHash == nil   // plain URL with no contrary marker

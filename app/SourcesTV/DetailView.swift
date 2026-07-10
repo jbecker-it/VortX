@@ -555,7 +555,8 @@ struct DetailView: View {
                             languageChips
                             HStack(spacing: Theme.Space.sm) { trailerChip(m) }
                             CoreStreamList(title: m.name,
-                                           meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
+                                           meta: PlaybackMeta(libraryId: m.id, videoId: m.id,
+                                                              type: m.type.isEmpty ? effectiveType : m.type,
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
                                            imdbId: ratingsImdbID)
@@ -1111,6 +1112,7 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (#7 return-to-episode)
     @State private var season: Int = 1
     @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
+    @State private var seasonClampPending = false   // the next season change is the programmatic validity clamp, not a real pick, so it must not lock the hint
     @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
@@ -1194,9 +1196,12 @@ struct CoreSeasonedEpisodes: View {
             DispatchQueue.main.async { focusedEpisode = id }
         }
         .onChange(of: season) {
-            // Any season change (a manual tap, OR our own programmatic apply below) locks the auto-pick, so a
-            // later videos-arrived pass never clobbers the season you chose.
-            didApplyInitial = true
+            // A manual tap or the programmatic preferred-season apply locks the auto-pick, so a later
+            // videos-arrived pass never clobbers the season you chose. The validity CLAMP below is exempt:
+            // it is a stopgap while episodes stream in, and locking on it would shut out a not-yet-loaded
+            // Continue-Watching hint before it can land.
+            if seasonClampPending { seasonClampPending = false }
+            else { didApplyInitial = true }
             recomputeEpisodes()
         }
         // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
@@ -1217,7 +1222,10 @@ struct CoreSeasonedEpisodes: View {
                 season = preferred   // triggers onChange(season) -> didApplyInitial = true
             }
         }
-        if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        if !seasons.contains(season) {
+            let clamped = seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if clamped != season { seasonClampPending = true; season = clamped }
+        }
         recomputeEpisodes()
     }
 
@@ -1364,7 +1372,7 @@ struct CoreEpisodeStreams: View {
                         }
                     }
                     CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
-                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: meta.type,
                                                       name: meta.name, poster: meta.poster,
                                                       season: video.season, episode: video.episode),
                                    episodes: episodes,
@@ -1954,7 +1962,7 @@ struct CoreStreamList: View {
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
                                                         infoHash: hash, torrentId: entry.debridTorrentId,
                                                         fileId: entry.debridFileId, fileIdx: entry.fileIdx),
-                                                    wasExplicitPick: true)
+                                                    wasExplicitPick: true, wasResume: true)
                 return
             }
         }
