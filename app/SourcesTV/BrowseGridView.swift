@@ -324,13 +324,13 @@ struct RemoteLogo: View {
         .task(id: url) { await load() }
     }
     private func load() async {
-        guard let url, let u = URL(string: url) else { return }
-        var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
-        // Composite the decoded mark onto the shared plate so the long tail matches the bundled majors. The
-        // plate is a rounded rect a touch wider than tall, so the caller's `.fit` sees a mark already padded
-        // and centered; a wide wordmark aspect-fits inside the plate instead of shrinking to nothing.
-        if let (data, _) = try? await URLSession.shared.data(for: req),
-           let img = UIImage(data: data) { plated = BundledLogo.plated(img) }
+        // Shared poster loader (dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode) instead
+        // of URLSession.shared + a main-thread UIImage(data:), which decoded a full-size mark on the main actor
+        // per tile and thrashed the tiny 4MB shared cache. Composite the downsampled mark onto the shared plate
+        // so the long tail matches the bundled majors: the plate is a rounded rect a touch wider than tall, so
+        // the caller's `.fit` sees a mark already padded and centered.
+        guard let img = await PosterImageLoader.load(url, maxPixel: 600) else { return }
+        plated = BundledLogo.plated(img)
     }
 }
 
@@ -347,9 +347,10 @@ struct RemoteCover: View {
         .task(id: url) { await load() }
     }
     private func load() async {
-        guard let url, let u = URL(string: url) else { return }
-        var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
-        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) { image = img }
+        // Shared poster loader (dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode) instead
+        // of URLSession.shared + a main-thread UIImage(data:); genre covers are landscape art downsampled to a
+        // sane on-card size.
+        if let img = await PosterImageLoader.load(url, maxPixel: 900) { image = img }
     }
 }
 

@@ -146,6 +146,41 @@ enum iOSPillMetrics {
     }
 }
 
+/// A catalog-tile image backed by the shared `PosterImageLoader` (dedicated large URLCache, bounded
+/// concurrency, OFF-MAIN ImageIO decode) rather than `AsyncImage` + `URLSession.shared`, which decoded
+/// full-size art on the main actor per tile and thrashed the tiny shared cache. Paints instantly from the
+/// decoded-memory cache on a warm scroll; a scroll-away cancel retries on the next appear, so a transient
+/// miss never latches a blank tile. Mirrors `AsyncImage`'s success/placeholder shape so a caller keeps its
+/// own placeholder (a gradient base, or the service-tile name fallback).
+private struct iOSTileImage<Placeholder: View>: View {
+    let url: String?
+    var maxPixel: CGFloat = 900
+    var contentMode: ContentMode = .fill
+    @ViewBuilder var placeholder: () -> Placeholder
+    @State private var image: UIImage?
+
+    private var synchronousCache: UIImage? {
+        guard let raw = url, let u = URL(string: raw) else { return nil }
+        return PosterImageLoader.cached(u)
+    }
+
+    var body: some View {
+        Group {
+            if let image = image ?? synchronousCache {
+                Image(uiImage: image).resizable().aspectRatio(contentMode: contentMode)
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: url) { await load() }
+    }
+
+    private func load() async {
+        image = nil   // clear so a recycled tile with a changed URL never shows stale art; warm cells repaint from synchronousCache
+        if let img = await PosterImageLoader.load(url, maxPixel: maxPixel) { image = img }
+    }
+}
+
 struct iOSDiscoverCard: View {
     let list: DiscoverList
     /// Representative movie backdrop for this card (resolved + daily-cached by CollectionsHubModel). The
@@ -156,8 +191,8 @@ struct iOSDiscoverCard: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: list.gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let backdrop, let url = URL(string: backdrop) {
-                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
+            if let backdrop {
+                iOSTileImage(url: backdrop, maxPixel: 900, contentMode: .fill) { Color.clear }
             }
             // Bottom-up scrim like iOSGenreTile so the title/subtitle stay legible over real artwork.
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.25), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
@@ -242,9 +277,7 @@ struct iOSServiceTile: View {
                     .fill(BundledLogo.plateFill)
                     .frame(width: plateWidth, height: plateHeight)
                     .overlay(
-                        AsyncImage(url: url) { img in
-                            img.resizable().aspectRatio(contentMode: .fit)
-                        } placeholder: {
+                        iOSTileImage(url: url.absoluteString, maxPixel: 300, contentMode: .fit) {
                             // While the logo streams in (or on failure), show the provider FULL NAME so the tile
                             // is never a blank box and NEVER a bare single letter (owner: "show the provider full
                             // name, e.g. Hulu / Peacock, when there is no logo"). Dark ink on the warm near-white
@@ -292,8 +325,8 @@ struct iOSGenreTile: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [genre.tint.opacity(0.9), genre.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let backdrop, let url = URL(string: backdrop) {
-                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
+            if let backdrop {
+                iOSTileImage(url: backdrop, maxPixel: 900, contentMode: .fill) { Color.clear }
             }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {
