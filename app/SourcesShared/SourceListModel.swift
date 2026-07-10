@@ -38,6 +38,12 @@ final class SourceListModel: ObservableObject {
     @Published private(set) var groups: [CoreStreamSourceGroup] = []
     /// The ranked best playable stream (continuity-aware), the Watch-Now pick.
     @Published private(set) var best: CoreStream?
+    /// Resolution-tier labels present in the ranked list (["4K","1080p",...]); the Quality picker's first level.
+    /// Computed once per off-main rebuild so the detail bodies stop re-ranking on every body eval.
+    @Published private(set) var tiers: [String] = []
+    /// Best playable stream per resolution label (forward-compat: the player's resolution dropdown).
+    /// Computed alongside `tiers` on the same off-main pass.
+    @Published private(set) var resolutionOptions: [(label: String, stream: CoreStream)] = []
 
     // MARK: Context (the view-owned ranking inputs, set from body, equality-guarded)
 
@@ -193,12 +199,13 @@ final class SourceListModel: ObservableObject {
             // Run the rank against the frozen prefs snapshot (task-local), so StreamRanking never reads the
             // mutable SourcePreferences singleton across threads. withValue binds it for this synchronous
             // scope only; existing main-actor StreamRanking callers install nothing and read the live singleton.
-            let (ranked, rankedBest) = SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
-                let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
-                let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
-                                              debridCachedHashes: cachedHashes)
-                return (groups, best)
-            }
+            let (ranked, rankedBest, rankedTiers, rankedResOpts) =
+                SourcePreferences.$readingOverride.withValue(prefsSnapshot) {
+                    let groups = StreamRanking.rankedGroups(assembled, pin: ctx.pin, debridCachedHashes: cachedHashes)
+                    let best = StreamRanking.best(groups, continuity: ctx.continuity, pin: ctx.pin,
+                                                  debridCachedHashes: cachedHashes)
+                    return (groups, best, StreamRanking.tiers(groups), StreamRanking.resolutionOptions(groups))
+                }
             let streamCount = ranked.reduce(0) { $0 + $1.streams.count }
 
             await MainActor.run {
@@ -212,6 +219,8 @@ final class SourceListModel: ObservableObject {
                 VXProbe.log("sing", "merged rebuild meta=\(ctx.metaId.isEmpty ? "-" : ctx.metaId) groups=\(ranked.count) streams=\(streamCount) torbox=\(torboxStreams.count) singularity=\(singularityStreams.count) gen=\(gen)")
                 self.groups = ranked
                 self.best = rankedBest
+                self.tiers = rankedTiers
+                self.resolutionOptions = rankedResOpts
             }
         }
     }
