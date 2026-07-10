@@ -2031,7 +2031,10 @@ struct TVPlayerView: View {
             resumeSeconds = reconcileResume
             Task { @MainActor in
                 try? await Task.sleep(for: .milliseconds(400))
-                guard avEngineFailed, !Task.isCancelled else { return }
+                // curURL == cu is load-bearing: if the viewer picks another source during the 400ms settle,
+                // switchStream has already moved curURL and loaded it, so this stale reload must stand down
+                // instead of overriding the explicit pick (which would play cu while curURL says otherwise).
+                guard avEngineFailed, !Task.isCancelled, curURL == cu else { return }
                 appliedResume = false
                 loadIntoPlayer(cu, headers: curHeaders, live: curIsLive)
             }
