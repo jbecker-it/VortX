@@ -355,7 +355,7 @@ final class MPVMetalViewController: PlatformViewController {
         if !startMuted { configureAudioSession() }
         mpv = mpv_create()
         if mpv == nil {
-            print("failed creating context\n")
+            mpvLog.error("failed creating mpv context")
             exit(1)
         }
 
@@ -1717,8 +1717,11 @@ final class MPVMetalViewController: PlatformViewController {
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
                 default:
-                    let eventName = mpv_event_name(event!.pointee.event_id )
-                    print("event: \(String(cString: (eventName)!))");
+                    #if DEBUG
+                    let eventName = mpv_event_name(event!.pointee.event_id)
+                    print("event: \(String(cString: eventName!))")
+                    #endif
+                    break
                 }
                 
             }
@@ -1728,7 +1731,7 @@ final class MPVMetalViewController: PlatformViewController {
     
     private func checkError(_ status: CInt) {
         if status < 0 {
-            print("MPV API error: \(String(cString: mpv_error_string(status)))\n")
+            mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
         }
     }
     
