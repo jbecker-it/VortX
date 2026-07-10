@@ -1238,7 +1238,7 @@ struct iOSLibraryDownloadsPill: View {
                     Text("Downloads")
                         .font(Theme.Typography.cardTitle)
                         .foregroundStyle(Theme.Palette.textPrimary)
-                    Text(count == 1 ? "1 item saved offline" : "\(count) items saved offline")
+                    Text(count == 1 ? "1 item" : "\(count) items")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(Theme.Palette.textSecondary)
                 }
@@ -1883,7 +1883,10 @@ extension View {
                     guard let meta = item.meta else { return }
                     Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
                 },
-                onClose: { launch.wrappedValue = nil }
+                onClose: {
+                    core.unloadEnginePlayer()
+                    launch.wrappedValue = nil
+                }
             )
             .ignoresSafeArea()
         }

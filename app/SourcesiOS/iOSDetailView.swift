@@ -567,7 +567,10 @@ struct iOSDetailView: View {
                     // doing the latter, so nothing reached the engine and CW never updated (tvOS does both).
                     onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                     onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                    onClose: { presentation = nil }
+                    onClose: {
+                        core.unloadEnginePlayer()
+                        presentation = nil
+                    }
                 )
                 .ignoresSafeArea()
             case .trailerPlayer(let url, let title, let audioSidecar):
@@ -2785,7 +2788,10 @@ struct iOSEpisodeStreams: View {
                     warmNextEpisode: { await warmEpisodeStream($0) },
                     onProgress: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
                     onSeek: { pos, dur in core.reportProgress(timeSeconds: pos, durationSeconds: dur); Task { [weak account] in await account?.saveProgress(for: launch.meta, positionSeconds: pos, durationSeconds: dur) } },
-                    onClose: { presentation = nil }
+                    onClose: {
+                        core.unloadEnginePlayer()
+                        presentation = nil
+                    }
                 )
                 .ignoresSafeArea()
             case .trailer(let launch):
