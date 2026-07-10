@@ -158,15 +158,21 @@ enum AddonTombstones {
         for (rawURL, rawEntry) in stampsRaw {
             let url = normalize(rawURL)
             guard !url.isEmpty, url.count <= maxIDLength, let entry = rawEntry as? [String: Any] else { continue }
-            stamped.insert(url)
+            var applied = false
             if let r = (entry["removedAt"] as? NSNumber)?.doubleValue, r.isFinite {
                 if r > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, r) }
                 state.removedAt[url] = max(state.removedAt[url] ?? 0, r)
+                applied = true
             }
             if let a = (entry["addedAt"] as? NSNumber)?.doubleValue, a.isFinite {
                 if a > futureThresholdMs { maxFutureSeen = max(maxFutureSeen, a) }
                 state.addedAt[url] = max(state.addedAt[url] ?? 0, a)
+                applied = true
             }
+            // Only suppress the legacy epoch fold for a url that actually carried a finite stamp. An empty or
+            // non-finite Ts entry must NOT mask the legacy removed array, or a peer-deleted url present in the
+            // legacy deletedAddons array would skip its migration-epoch fold and get re-unioned back in.
+            if applied { stamped.insert(url) }
         }
         for rawURL in legacyIDs {
             let url = normalize(rawURL)
