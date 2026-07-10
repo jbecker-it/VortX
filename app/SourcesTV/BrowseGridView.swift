@@ -41,8 +41,6 @@ struct TVCollectionsHub: View {
             }
             if showStreaming, !model.providers.isEmpty {
                 section(title: "Streaming Services", eyebrow: "Browse by service") {
-                    // TODO(0.3.11): dedup by brand identity (move ProviderBrandMap.dedupeProviders from
-                    // SourcesiOS to SourcesShared so tvOS can call it; SourcesiOS is not in the tvOS target).
                     ForEach(model.providers) { p in
                         NavigationLink { TVCategoryBrowse(target: .service(id: p.providerID, name: p.name)) } label: { TVServiceTile(provider: p) }
                             .buttonStyle(CardFocusStyle())
@@ -324,13 +322,13 @@ struct RemoteLogo: View {
         .task(id: url) { await load() }
     }
     private func load() async {
-        guard let url, let u = URL(string: url) else { return }
-        var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
-        // Composite the decoded mark onto the shared plate so the long tail matches the bundled majors. The
-        // plate is a rounded rect a touch wider than tall, so the caller's `.fit` sees a mark already padded
-        // and centered; a wide wordmark aspect-fits inside the plate instead of shrinking to nothing.
-        if let (data, _) = try? await URLSession.shared.data(for: req),
-           let img = UIImage(data: data) { plated = BundledLogo.plated(img) }
+        // Shared poster loader (dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode) instead
+        // of URLSession.shared + a main-thread UIImage(data:), which decoded a full-size mark on the main actor
+        // per tile and thrashed the tiny 4MB shared cache. Composite the downsampled mark onto the shared plate
+        // so the long tail matches the bundled majors: the plate is a rounded rect a touch wider than tall, so
+        // the caller's `.fit` sees a mark already padded and centered.
+        guard let img = await PosterImageLoader.load(url, maxPixel: 600) else { return }
+        plated = BundledLogo.plated(img)
     }
 }
 
@@ -347,9 +345,10 @@ struct RemoteCover: View {
         .task(id: url) { await load() }
     }
     private func load() async {
-        guard let url, let u = URL(string: url) else { return }
-        var req = URLRequest(url: u); req.cachePolicy = .returnCacheDataElseLoad
-        if let (data, _) = try? await URLSession.shared.data(for: req), let img = UIImage(data: data) { image = img }
+        // Shared poster loader (dedicated large URLCache, bounded concurrency, OFF-MAIN ImageIO decode) instead
+        // of URLSession.shared + a main-thread UIImage(data:); genre covers are landscape art downsampled to a
+        // sane on-card size.
+        if let img = await PosterImageLoader.load(url, maxPixel: 900) { image = img }
     }
 }
 
@@ -369,6 +368,10 @@ struct TVCategoryBrowse: View {
     @State private var loading = false
     @State private var done = false
     @State private var loadTask: Task<Void, Never>?
+    /// Bumped on every pill switch. A load captures it before its await and drops every post-await mutation
+    /// when the token has moved on, so an in-flight (or pagination) load for the OLD pill can never clear the
+    /// spinner or clobber the new pill's `loading` state.
+    @State private var loadGen = 0
 
     private var subs: [SubCatalog] { CollectionsCatalog.subCatalogs(for: target, region: TMDBClient.deviceRegion) }
 
@@ -441,7 +444,11 @@ struct TVCategoryBrowse: View {
     private func select(_ id: String) {
         guard id != selectedID || items.isEmpty else { return }
         selectedID = id
-        items = []; seen = []; page = 1; done = false
+        // Reset `loading` too: an in-flight load leaves it true, and without this the next loadNext() bails on
+        // its `guard !loading` and the grid stays stuck on the spinner. Bump the generation so any stale load
+        // (the cancelled loadTask AND any onAppear pagination load) drops its result.
+        items = []; seen = []; page = 1; done = false; loading = false
+        loadGen += 1
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
     }
@@ -449,9 +456,11 @@ struct TVCategoryBrowse: View {
     private func loadNext() async {
         guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
         loading = true
-        let requested = selectedID
+        let gen = loadGen
         let next = await sub.load(page)
-        guard requested == selectedID else { loading = false; return }   // a pill switched mid-fetch
+        // A pill switched mid-fetch: a newer select() already reset `loading` and owns the new load, so return
+        // WITHOUT touching loading (clearing it here would clobber the new pill's in-flight state).
+        guard gen == loadGen else { return }
         loading = false
         if next.isEmpty { done = true; return }
         page += 1
@@ -466,39 +475,82 @@ struct TVCategoryBrowse: View {
     }
 }
 
-// MARK: - Reorder streaming services (Settings)
+// MARK: - Streaming services picker (Settings)
 
-/// Settings screen to reorder the streaming-service tiles (owner: "Prime first, Netflix last"). tvOS has no
-/// drag gesture, so each row carries Up / Down controls; the order persists immediately via the hub model.
+/// Settings screen to CHOOSE and reorder the streaming-service tiles on Home and Discover. tvOS has no drag
+/// gesture, so "Your services" rows carry Up / Down / Remove; "All services" is a LazyVStack of every service
+/// TMDB knows, each with Add. With nothing chosen the hub shows every service in the region (AUTO), exactly as
+/// before. Rows load through RemoteLogo (PosterImageLoader: dedicated cache, bounded concurrency, off-main
+/// decode); both lists are LazyVStacks so neither ever instantiates all of its rows at once.
 struct TVReorderServicesView: View {
     @ObservedObject private var model = CollectionsHubModel.shared
+    @State private var allServices: [TMDBClient.ProviderTile] = []
+
+    private var selectedIDs: Set<Int> { Set(model.providers.map(\.providerID)) }
+    private var addable: [TMDBClient.ProviderTile] { allServices.filter { !selectedIDs.contains($0.providerID) } }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Theme.Space.xs) {
-                Text("Reorder Streaming Services").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
-                Text("Set the order services appear in the Streaming row on Home and Discover.")
+            VStack(alignment: .leading, spacing: Theme.Space.md) {
+                Text("Streaming Services").screenTitleStyle().padding(.horizontal, Theme.Space.screenEdge)
+                Text("Choose and reorder the services on Home and Discover. With none chosen, every service in your region shows.")
                     .font(Theme.Typography.label).foregroundStyle(Theme.Palette.textSecondary)
-                    .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.md)
-                ForEach(Array(model.providers.enumerated()), id: \.element.id) { index, provider in
-                    HStack(spacing: Theme.Space.md) {
-                        Text("\(index + 1)").font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(Theme.Palette.textTertiary).frame(width: 44)
-                        if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
-                        Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
-                        Spacer()
-                        Button { move(index, by: -1) } label: { Image(systemName: "chevron.up") }
-                            .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == 0)
-                        Button { move(index, by: 1) } label: { Image(systemName: "chevron.down") }
-                            .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == model.providers.count - 1)
+                    .padding(.horizontal, Theme.Space.screenEdge).padding(.bottom, Theme.Space.sm)
+
+                sectionHeader("Your services")
+                // LazyVStack (matching "All services" below) so a user with dozens of pinned services does not
+                // instantiate every row at once. Row identity (stable \.element.id), order, and the Up/Down/Remove
+                // controls are unchanged; interactive adjacent swaps act only on on-screen rows, so focus is
+                // preserved exactly as with the eager stack, the same pattern the shipped All-services list uses.
+                LazyVStack(alignment: .leading, spacing: Theme.Space.md) {
+                    ForEach(Array(model.providers.enumerated()), id: \.element.id) { index, provider in
+                        yourServiceRow(index: index, provider: provider)
                     }
-                    .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
+                }
+
+                sectionHeader("All services")
+                LazyVStack(alignment: .leading, spacing: Theme.Space.xs) {
+                    ForEach(addable) { provider in allServiceRow(provider) }
                 }
             }
             .padding(.vertical, Theme.Space.lg)
         }
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .onAppear { model.load() }
+        .task { allServices = await model.allServices() }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title).font(.system(size: 24, weight: .bold)).foregroundStyle(Theme.Palette.textPrimary)
+            .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.sm)
+    }
+
+    private func yourServiceRow(index: Int, provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            Text("\(index + 1)").font(.system(size: 18, weight: .bold))
+                .foregroundStyle(Theme.Palette.textTertiary).frame(width: 44)
+            if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
+            Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer()
+            Button { move(index, by: -1) } label: { Image(systemName: "chevron.up") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == 0)
+            Button { move(index, by: 1) } label: { Image(systemName: "chevron.down") }
+                .buttonStyle(ChipButtonStyle(selected: false)).disabled(index == model.providers.count - 1)
+            Button { model.removeService(provider.providerID) } label: { Image(systemName: "minus.circle") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+        }
+        .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
+    }
+
+    private func allServiceRow(_ provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            if provider.logoURL != nil { RemoteLogo(url: provider.logoURL).frame(width: 70, height: 40) }
+            Text(provider.name).font(.system(size: 22, weight: .medium)).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer()
+            Button { model.addService(provider.providerID) } label: { Image(systemName: "plus.circle.fill") }
+                .buttonStyle(ChipButtonStyle(selected: false))
+        }
+        .padding(.horizontal, Theme.Space.screenEdge).padding(.vertical, Theme.Space.sm)
     }
 
     private func move(_ index: Int, by delta: Int) {
