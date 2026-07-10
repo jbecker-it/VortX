@@ -935,12 +935,14 @@ struct PlayerScreen: View {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
                 // auto-advancing. The episode is already marked watched above, so Continue Watching
                 // rolls to the next episode on its own without yanking the viewer out of the credits.
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
@@ -957,6 +959,7 @@ struct PlayerScreen: View {
                 // is a mid-season episode misread as a finale, so do NOT clear the whole series from Continue
                 // Watching here; only genuine finishes (movies, or a series with a real list) rewind it out.
                 if let m = curMeta, !(m.type == "series" && episodes.isEmpty && !hasNext) { core.finishedWatching(libraryId: m.libraryId) }
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             }
@@ -1633,6 +1636,33 @@ struct PlayerScreen: View {
         return try? JSONDecoder().decode(TorrentStats.self, from: data)
     }
 
+    /// Tell the embedded server to destroy a torrent engine (GET /{hash}/remove). Each engine holds
+    /// peers, sockets, and a growing disk/RAM cache; leaving them running when we switch source, auto-fail
+    /// over, advance an episode, or close the player piled them up until the server's RSS ballooned and it
+    /// stopped answering (the 0.2.48 "torrents stopped playing, server went offline" regression). tvOS
+    /// TVPlayerView already did this; the iOS/iPad/Mac player did not, so engines leaked here across every
+    /// switch and exit. Fire-and-forget on URLSession's own queue (never blocks the main thread), guards a
+    /// 40-hex hash, and is a no-op for direct/debrid playback (no hash). Symmetric with the create/warm-up.
+    private func closeTorrent(hash: String) {
+        let h = hash.lowercased()
+        guard h.count == 40, let url = URL(string: "\(StremioServer.base)/\(h)/remove") else { return }
+        DiagnosticsLog.log("torrent", "remove engine \(h.prefix(8))")
+        URLSession.shared.dataTask(with: url).resume()
+    }
+
+    /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream. Decided by
+    /// the URL SHAPE ({server}/{40-hex-hash}/{idx}) against the ACTIVE streaming server's host:port, NOT by
+    /// the launch `recordIsTorrent` / `curIsTorrent` flag, which goes stale across engine-resolved episode
+    /// switches. curURL is built from StremioServer.base, so comparing host+port against base is exact and
+    /// also covers a custom remote server, not just a hardcoded :11470. Mirrors TVPlayerView.currentTorrentHash.
+    private var currentTorrentHash: String? {
+        guard let u = curURL, let serverBase = URL(string: StremioServer.base),
+              u.host == serverBase.host, u.port == serverBase.port,
+              u.pathComponents.count >= 2 else { return nil }
+        let hash = u.pathComponents[1]
+        return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
+    }
+
     /// One wall-clock cap over the WHOLE pre-start recovery sequence (30s timeout × retries × 4 hops
     /// would otherwise chain into minutes of spinner on a dead title). Idempotent; reset on a fresh
     /// deliberate pick and on playback actually starting. Mirrors tvOS `startRecoveryDeadline`.
@@ -1874,6 +1904,16 @@ struct PlayerScreen: View {
         srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
         srcProbeLoadStart = Date()   // [src-probe] a source switch is a fresh attempt: re-anchor the elapsed clock
         if userInitiated { close() }
+        // Cleanly destroy the torrent engine we're leaving BEFORE loading the next source, so engines never
+        // pile up on the embedded server (the 0.2.48 RSS-balloon regression). Every in-place transition funnels
+        // through here: a source-row pick, an auto-failover hop, and an episode advance (goToEpisode calls
+        // switchStream). Guarded on a DIFFERENT hash: a season-pack torrent shares one infoHash across every
+        // episode (only the file index differs), and destroy-then-recreate would cold-start warm-up at 0 peers,
+        // so a same-hash episode switch keeps the live engine. currentTorrentHash reads curURL, so it must be
+        // evaluated before curURL is overwritten just below. No-op for a direct/debrid source (no hash).
+        if let oldHash = currentTorrentHash, oldHash != stream.infoHash?.lowercased() {
+            closeTorrent(hash: oldHash)
+        }
         let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         curURL = newURL
         curHeaders = stream.requestHeaders
@@ -2010,7 +2050,10 @@ struct PlayerScreen: View {
             guard let es = resolved else {
                 reconnecting = false; buffering = false
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
-                if autoAdvance { onClose() }            // nothing playable on auto-advance: leave, don't hang on a spinner
+                if autoAdvance {
+                    if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the finished episode's engine (no-op for direct/debrid)
+                    onClose()            // nothing playable on auto-advance: leave, don't hang on a spinner
+                }
                 else { loadErrorMsg = "Couldn't load that episode"; withAnimation { loadFailed = true } }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
                 return
             }
@@ -3681,6 +3724,10 @@ struct PlayerScreen: View {
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
             if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
         }
+        // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
+        // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
+        // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.
+        if let hash = currentTorrentHash { closeTorrent(hash: hash) }
         // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
         // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
         // guardrail). No-op when the disk cache is off or empty. Genuine-exit path only; additive,
