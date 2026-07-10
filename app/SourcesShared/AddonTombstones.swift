@@ -252,6 +252,11 @@ enum AddonTombstones {
         for raw in transportUrls {
             let url = normalize(raw)
             guard !url.isEmpty, url.count <= maxIDLength else { continue }
+            // Baseline exists only to out-race a STAMP-LESS migration-epoch removal (removedAt == migrationEpochMs)
+            // carried by a pre-b172 peer array for an add-on the user has reinstalled. It must NOT manufacture
+            // install-intent over a genuine wall-clock removal a b172 peer folded in, or that peer's deletion is
+            // resurrected. Skip any url whose folded removedAt is a real, post-epoch removal.
+            if let removed = state.removedAt[url], removed > migrationEpochMs { continue }
             state.addedAt[url] = max(state.addedAt[url] ?? 0, now)
         }
         save(state)

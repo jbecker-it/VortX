@@ -848,10 +848,6 @@ final class VortXSyncManager: ObservableObject {
         if !force, pulled.version <= lastSyncedVersion { return false }
         let doc = pulled.doc
         var restored = false
-        // Baseline-stamp installed add-ons before any fold runs, so the add-on removal fold + uninstall loop
-        // below can never re-uninstall an add-on the user demonstrably has on the first b172 run (see the
-        // helper). One-shot and self-suppressed; a no-op if the engine has not hydrated its add-ons yet.
-        baselineInstalledAddonsOnce()
         // SUPPRESS THE OBSERVER for the whole apply region. SettingsBackup.restore + the apiKeys/overlay/
         // tombstone/profileEdits writes below all hit UserDefaults; without suppression each fires the
         // global didChangeNotification observer, which calls requestSyncSoon() -> re-arms hasPendingPush and
@@ -945,6 +941,13 @@ final class VortXSyncManager: ObservableObject {
         }
         let webAddonRemovals = (doc["webAddonRemovals"] as? [String]) ?? []   // web agent owns this write; we only READ it
         if AddonTombstones.merge(legacyIDs: incomingAddonRemovals, stampsRaw: incomingAddonRemovalsTs, webIDs: webAddonRemovals) { restored = true }
+        // Baseline-stamp installed add-ons AFTER the incoming removal fold above but BEFORE the uninstall set is
+        // computed below. Ordering is load-bearing: run before the fold and a genuine wall-clock b172 removal is
+        // not yet in local state, so the baseline would stamp addedAt=now over it and resurrect a peer's deletion
+        // (the baselineInstalled guard also refuses to stamp over a real post-epoch removedAt). Run after the
+        // uninstall set and a legacy migration-epoch removal would strip the add-on before the baseline can
+        // protect it. One-shot and self-suppressed; a no-op if the engine has not hydrated its add-ons yet.
+        baselineInstalledAddonsOnce()
         // Cross-device LIBRARY REMOVAL tombstones (the library analogue of the deletedAddons fold above).
         // ALWAYS fold the incoming removals (never version-gate them): the fold is a per-id last-writer-wins
         // max on both stamps (removedAt / addedAt), which is monotone and idempotent, so folding a stale,
