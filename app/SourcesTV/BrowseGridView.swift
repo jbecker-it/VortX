@@ -370,6 +370,10 @@ struct TVCategoryBrowse: View {
     @State private var loading = false
     @State private var done = false
     @State private var loadTask: Task<Void, Never>?
+    /// Bumped on every pill switch. A load captures it before its await and drops every post-await mutation
+    /// when the token has moved on, so an in-flight (or pagination) load for the OLD pill can never clear the
+    /// spinner or clobber the new pill's `loading` state.
+    @State private var loadGen = 0
 
     private var subs: [SubCatalog] { CollectionsCatalog.subCatalogs(for: target, region: TMDBClient.deviceRegion) }
 
@@ -442,7 +446,11 @@ struct TVCategoryBrowse: View {
     private func select(_ id: String) {
         guard id != selectedID || items.isEmpty else { return }
         selectedID = id
-        items = []; seen = []; page = 1; done = false
+        // Reset `loading` too: an in-flight load leaves it true, and without this the next loadNext() bails on
+        // its `guard !loading` and the grid stays stuck on the spinner. Bump the generation so any stale load
+        // (the cancelled loadTask AND any onAppear pagination load) drops its result.
+        items = []; seen = []; page = 1; done = false; loading = false
+        loadGen += 1
         loadTask?.cancel()
         loadTask = Task { await loadNext() }
     }
@@ -450,9 +458,11 @@ struct TVCategoryBrowse: View {
     private func loadNext() async {
         guard !loading, !done, let sub = subs.first(where: { $0.id == selectedID }) else { return }
         loading = true
-        let requested = selectedID
+        let gen = loadGen
         let next = await sub.load(page)
-        guard requested == selectedID else { loading = false; return }   // a pill switched mid-fetch
+        // A pill switched mid-fetch: a newer select() already reset `loading` and owns the new load, so return
+        // WITHOUT touching loading (clearing it here would clobber the new pill's in-flight state).
+        guard gen == loadGen else { return }
         loading = false
         if next.isEmpty { done = true; return }
         page += 1
