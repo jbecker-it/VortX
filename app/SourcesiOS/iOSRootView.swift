@@ -3195,7 +3195,9 @@ private struct MacBackAffordance: ViewModifier {
                         .foregroundStyle(Theme.Palette.textPrimary)
                         .padding(.horizontal, Theme.Space.sm)
                         .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        // Floating Back chrome over the detail content: Liquid Glass on macOS 26, the frosted
+                        // material below. Interactive since it is a pressable control.
+                        .glassChrome(in: Capsule(), interactive: true) { Capsule().fill(.ultraThinMaterial) }
                 }
                 .buttonStyle(.plain)
                 .padding(.leading, Theme.Space.md)
