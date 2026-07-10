@@ -35,6 +35,17 @@ extension View {
         #endif
     }
 
+    /// `isPresented`-driven twin of the cover above: a real full-screen cover on iPhone / iPad, a sheet on
+    /// macOS. Used for the launch "Who's watching?" picker, which tvOS presents with `.fullScreenCover`.
+    @ViewBuilder func platformFullScreenCover<C: View>(
+        isPresented: Binding<Bool>, @ViewBuilder content: @escaping () -> C) -> some View {
+        #if os(iOS)
+        self.fullScreenCover(isPresented: isPresented, content: content)
+        #else
+        self.sheet(isPresented: isPresented, content: content)
+        #endif
+    }
+
     /// Like `platformFullScreenCover`, but on macOS the presented content is sized to fill the screen
     /// so the player / trailer reads as a large, window-filling, in-app surface — NOT the tiny floating
     /// sheet a `.sheet` collapses to around full-bleed (`Color.black.ignoresSafeArea`) content with no

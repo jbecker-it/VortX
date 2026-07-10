@@ -117,11 +117,42 @@ struct iOSRootView: View {
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     @Environment(\.openURL) private var openURL
+    /// The profile roster + launch-picker gate, shared with every surface. When the roster has more than
+    /// one profile and none has been chosen this launch, the "Who's watching?" picker is owed at cold
+    /// start (and re-presented from Settings' Switch Profile), exactly as tvOS RootView drives it.
+    @EnvironmentObject private var profiles: ProfileStore
+    /// Process-wide "a fullscreen player is up" signal. The tvOS launch picker gates on
+    /// `presenter.request == nil`; on touch / Mac the player presents from within the shell, so this is
+    /// the equivalent "no player cover is presented" guard.
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
 
     /// Whether a tab's screen should be mounted: only after its first selection (#24). The active tab
     /// is always mounted (covers the initial Home and any programmatic switch before onChange lands).
     private func isMounted(_ item: Tab) -> Bool {
         tab == item || visitedTabs.contains(item.rawValue)
+    }
+
+    /// The launch "Who's watching?" picker is owed when the roster has more than one profile and none has
+    /// been chosen this launch (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
+    /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
+    /// brand splash lives one level up in StremioXiOSApp), so per the shared design it gates on needsPicker
+    /// alone here rather than inventing a splash flag.
+    private var pickerOwed: Bool { profiles.needsPicker && !playbackGate.playerActive }
+
+    /// The main shell is visible only once a profile has settled: while the picker is owed it is hidden
+    /// behind brand canvas so no main-profile content (Continue Watching, Library) shows before a viewer is
+    /// chosen. On Mac the picker presents as a centered sheet, so hiding the shell here is what keeps the
+    /// owner's rails from showing around it too. Mirrors tvOS RootView.shellVisible.
+    private var shellVisible: Bool { !pickerOwed }
+
+    /// Presentation binding for the launch picker: shown while it is owed; dismissing it by any means marks
+    /// the launch as picked (pickedThisLaunch), so it never re-appears until Settings' Switch Profile asks.
+    /// Mirrors tvOS RootView.pickerPresented.
+    private var pickerPresented: Binding<Bool> {
+        Binding(
+            get: { pickerOwed },
+            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+        )
     }
 
     var body: some View {
@@ -160,6 +191,12 @@ struct iOSRootView: View {
             VXProbe.event("nav", "tab \(newTab.probeName)")
         }
         .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
+        // Hide the whole shell (screens, tab bar, update banner) behind brand canvas while the launch
+        // "Who's watching?" picker is owed, so none of the main profile's rails leak before a viewer is
+        // chosen. The canvas background below stays fully opaque behind the faded shell. tvOS twin:
+        // RootView wraps RootTabView in the same opacity + disabled gate (shellVisible).
+        .opacity(shellVisible ? 1 : 0)
+        .disabled(!shellVisible)
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
         .animation(.easeOut(duration: 0.25), value: updates.available?.build)
@@ -195,6 +232,14 @@ struct iOSRootView: View {
             tab = dest
         }
         #endif
+        // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
+        // profile and none has been chosen this launch (ProfileStore.needsPicker), re-presented whenever
+        // Settings' Switch Profile flips pickedThisLaunch back to false. `.platformFullScreenCover` is a
+        // real fullScreenCover on iPhone / iPad and a sheet on Mac (which has no fullScreenCover). The
+        // shell is hidden behind canvas while it is owed (opacity gate above), so nothing of the main
+        // profile leaks behind it, matching the tvOS RootView flow. Selecting a profile goes through
+        // ProfileStore.select via the shared ProfilePickerView, honoring the per-profile history invariant.
+        .platformFullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
     }
 
     #if os(macOS)
