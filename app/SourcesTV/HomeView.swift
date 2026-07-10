@@ -133,6 +133,9 @@ struct HomeView: View {
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
+        // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
+        .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
         // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
         // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
