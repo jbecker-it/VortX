@@ -1548,7 +1548,7 @@ struct iOSDetailView: View {
     /// submenus is the touch/Mac idiom for the tvOS two-step quality `confirmationDialog`. Plays the
     /// chosen source straight through `playStream`. Hidden until at least one tier resolves.
     @ViewBuilder private func qualityMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
-        let tiers = StreamRanking.tiers(groups)
+        let tiers = sourceList.tiers
         if !tiers.isEmpty {
             Menu {
                 ForEach(tiers, id: \.self) { tier in
@@ -1591,6 +1591,8 @@ struct iOSDetailView: View {
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
             play: { stream, url in Task { await playStream(stream, url: url) } },
+            bestStream: sourceList.best,
+            resolutionTiers: sourceList.tiers,
             download: movieDownloadHandler,
             isSuspended: suspended
         )
@@ -2284,6 +2286,8 @@ struct iOSDetailView: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
+            bestStream: sourceList.best,
+            resolutionTiers: sourceList.tiers,
             isSuspended: suspended
         )
         .equatable()   // see sourceSection: skip re-diffing the list on unrelated re-renders
@@ -2692,6 +2696,8 @@ struct iOSEpisodeStreams: View {
                     play: { stream, url in Task { await play(stream, url: url) } },
                     playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
                     playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
+                    bestStream: sourceList.best,
+                    resolutionTiers: sourceList.tiers,
                     download: episodeDownloadHandler,
                     isSuspended: presentation != nil
                 )
@@ -3200,6 +3206,12 @@ struct iOSSourceList: View {
     /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
     /// resolves exactly that row through `play`.
     var playBest: (([CoreStream], CoreStream) -> Void)? = nil
+    /// Ranked best playable stream, computed once off-main by SourceListModel; the control bar's Watch pick.
+    /// Defaults nil so a caller that omits it keeps the Watch button hidden rather than crashing.
+    var bestStream: CoreStream? = nil
+    /// Resolution tiers, computed once off-main by SourceListModel; the control bar's Quality picker first level.
+    /// Defaults empty so an omitting caller renders no Quality menu rather than re-ranking on every body eval.
+    var resolutionTiers: [String] = []
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
@@ -3388,7 +3400,7 @@ struct iOSSourceList: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
             // on the same quality it last played (same-release-group biased) — matching tvOS.
-            if let best = StreamRanking.best(groups, continuity: continuity, debridCachedHashes: cachedHashes), let url = best.playableURL {
+            if let best = bestStream, let url = best.playableURL {
                 HStack(spacing: Theme.Space.sm) {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
@@ -3427,7 +3439,7 @@ struct iOSSourceList: View {
     /// Others), then the flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A native
     /// `Menu` with submenus is the touch / Mac idiom for the tvOS two-step `confirmationDialog`.
     @ViewBuilder private var qualityMenu: some View {
-        let tiers = StreamRanking.tiers(groups)
+        let tiers = resolutionTiers
         if !tiers.isEmpty {
             Menu {
                 ForEach(tiers, id: \.self) { tier in
@@ -3650,6 +3662,8 @@ extension iOSSourceList: Equatable {
             && lhs.cachedHashes == rhs.cachedHashes
             && lhs.cachedUsenetURLs == rhs.cachedUsenetURLs
             && lhs.states == rhs.states
+            && lhs.bestStream == rhs.bestStream
+            && lhs.resolutionTiers == rhs.resolutionTiers
             && lhs.groups == rhs.groups
     }
 }

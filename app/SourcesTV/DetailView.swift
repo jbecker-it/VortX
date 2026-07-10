@@ -1573,7 +1573,6 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(watchReady ? 1 : 0.55)
-                    .contextMenu { resolutionMenu(groups) }
                     .focused($watchFocused)   // FIX H: target of the page's default focus
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
@@ -1583,7 +1582,7 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(ChipButtonStyle())
                     .confirmationDialog("Pick a quality", isPresented: $showQualityPicker, titleVisibility: .visible) {
-                        ForEach(StreamRanking.tiers(groups), id: \.self) { tier in
+                        ForEach(sourceList.tiers, id: \.self) { tier in
                             Button(tier) {
                                 Task { @MainActor in
                                     try? await Task.sleep(nanoseconds: 250_000_000)   // let level 1 dismiss first
@@ -1788,13 +1787,6 @@ struct CoreStreamList: View {
     private func downloadEpisode(_ pm: PlaybackMeta) -> DebridEpisode? {
         guard pm.type == "series", let s = pm.season, let e = pm.episode else { return nil }
         return DebridEpisode(season: s, episode: e)
-    }
-
-    /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.
-    @ViewBuilder private func resolutionMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
-        ForEach(StreamRanking.resolutionOptions(groups), id: \.label) { opt in
-            Button { play(opt.stream) } label: { Label("Watch in \(opt.label)", systemImage: "play.fill") }
-        }
     }
 
     /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
