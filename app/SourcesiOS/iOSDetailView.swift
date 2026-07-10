@@ -528,7 +528,7 @@ struct iOSDetailView: View {
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
         // detail's loadMeta replaces the resident meta anyway, so leaving it loaded is harmless.
         .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel(); langChipsDebounce?.cancel() }
-        // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
+        // Flip the spinner to "No sources found" if resolution hangs past 20s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(20))
             settleTimedOut = true
@@ -826,11 +826,15 @@ struct iOSDetailView: View {
     /// carries actions that are always safe. Inset from the top so it clears the status bar / notch.
     @ViewBuilder private var heroChrome: some View {
         HStack {
+            #if os(iOS)
+            // macOS supplies its own in-content Back via .macBackAffordance() at the same topLeading anchor;
+            // showing this disc too would stack two overlapping back affordances (T24), so gate it to iOS.
             CircleIconButton(systemName: "chevron.left", diameter: Theme.Control.circleChrome) { dismiss() }
                 .accessibilityLabel("Back")
+            #endif
             Spacer()
             Menu {
-                if let m = core.metaDetails?.meta {
+                if let m = meta {
                     if m.id.hasPrefix("tt"), let url = URL(string: "https://www.imdb.com/title/\(m.id)/") {
                         ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
                     } else {
@@ -896,7 +900,7 @@ struct iOSDetailView: View {
             // Movies carry a 16:9 `background`, so .fill crops cleanly. A SERIES usually has no landscape
             // background and falls back to the PORTRAIT `poster`; .fill on that in the landscape band crops
             // it to black bars (the "shows all have cut off hero image" report), so series fit instead.
-            case .success(let img): img.resizable().aspectRatio(contentMode: (type == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill)
+            case .success(let img): img.resizable().aspectRatio(contentMode: (effectiveType == "series" && (meta?.background?.isEmpty ?? true)) ? .fit : .fill)
             default: Theme.Palette.surface1
             }
         }
@@ -1429,7 +1433,7 @@ struct iOSDetailView: View {
     /// Share chip: shares the title's IMDb page (or its name when there is no imdb id) via the native
     /// share sheet. Shown in the movie action row and the series hero.
     @ViewBuilder private var shareChip: some View {
-        if let m = core.metaDetails?.meta {
+        if let m = meta {
             if m.id.hasPrefix("tt"), let url = URL(string: "https://www.imdb.com/title/\(m.id)/") {
                 ShareLink(item: url) { Label("Share", systemImage: "square.and.arrow.up") }
                     .buttonStyle(ChipButtonStyle())
@@ -1644,7 +1648,7 @@ struct iOSDetailView: View {
     /// The IMDb id to fetch MDBList ratings for: prefer the meta's imdb `defaultVideoId` (tt...) when the
     /// catalog id is non-imdb (tmdb:/kitsu:), else the catalog id when it is itself an imdb id.
     private var ratingsImdbID: String? {
-        if let dv = core.metaDetails?.meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
+        if let dv = meta?.behaviorHints?.defaultVideoId, dv.hasPrefix("tt") { return dv }
         return id.hasPrefix("tt") ? id : nil
     }
 
@@ -2584,9 +2588,9 @@ struct iOSDetailView: View {
     /// Legal streaming availability for the title in the viewer's region (TMDB watch/providers). Only
     /// runs with a TMDB key + an IMDb id; a nil result simply hides the section.
     private func loadWatchProviders() {
-        guard !LiveTypes.contains(type), id.hasPrefix("tt") else { return }
+        guard !LiveTypes.contains(type), let imdb = ratingsImdbID else { return }
         Task {
-            let avail = await TMDBClient.watchProviders(imdbID: id, type: type)
+            let avail = await TMDBClient.watchProviders(imdbID: imdb, type: effectiveType)
             await MainActor.run { watchAvail = avail }
         }
     }
@@ -2773,8 +2777,9 @@ struct iOSEpisodeStreams: View {
             case .player(let launch):
                 PlayerScreen(
                     url: launch.url, title: launch.title, headers: launch.headers, resumeSeconds: launch.resume,
-                    recordMeta: launch.meta, recordQualityText: launch.qualityText, recordIsTorrent: launch.isTorrent,
-                    startedFromExplicitPick: launch.wasExplicitPick,
+                    recordMeta: launch.meta, recordQualityText: launch.qualityText,
+                    recordBingeGroup: launch.bingeGroup, recordIsTorrent: launch.isTorrent,
+                    recordDebridRef: launch.debridRef, startedFromExplicitPick: launch.wasExplicitPick,
                     episodes: seasonEpisodes.map { PlayerEpisodeRef(id: $0.id, label: "S\($0.season ?? 1)E\($0.episodeNumber) · \($0.episodeTitle)") },
                     loadEpisode: { await loadEpisodeStream($0) },
                     warmNextEpisode: { await warmEpisodeStream($0) },
@@ -2930,6 +2935,7 @@ struct iOSEpisodeStreams: View {
         presentation = .player(iOSDetailView.PlayerLaunch(url: playURL, title: name, headers: stream.requestHeaders,
                                             resume: await resume(pm), meta: pm,
                                             qualityText: StreamRanking.signature(stream),
+                                            bingeGroup: stream.behaviorHints?.bingeGroup,
                                             isTorrent: isTorrent, debridRef: ref, wasExplicitPick: explicit))
     }
 
@@ -2960,6 +2966,7 @@ struct iOSEpisodeStreams: View {
             presentation = .player(iOSDetailView.PlayerLaunch(url: win.ref.url, title: name, headers: win.stream.requestHeaders,
                                                 resume: await resume(pm), meta: pm,
                                                 qualityText: StreamRanking.signature(win.stream),
+                                                bingeGroup: win.stream.behaviorHints?.bingeGroup,
                                                 isTorrent: false, debridRef: win.ref))
             return
         }
