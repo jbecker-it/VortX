@@ -332,7 +332,10 @@ struct TVPlayerView: View {
                     .padding(.horizontal, Theme.Space.lg)
                     .padding(.vertical, Theme.Space.md)
                     .frame(maxWidth: 900)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous))
+                    // Floating engine note over the video: Liquid Glass on tvOS 26, the frosted material below.
+                    .glassChrome(in: RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)) {
+                        RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous).fill(.ultraThinMaterial)
+                    }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(.top, Theme.Space.xl)
                     .transition(.opacity)
@@ -2857,7 +2860,8 @@ struct TVPlayerView: View {
             }
             .padding(.horizontal, Theme.Space.xl).padding(.vertical, Theme.Space.md)
             .foregroundStyle(Theme.Palette.textPrimary)
-            .background(.ultraThinMaterial, in: Capsule())
+            // Floating seek feedback over the video: Liquid Glass on tvOS 26, the frosted material below.
+            .glassChrome(in: Capsule()) { Capsule().fill(.ultraThinMaterial) }
             .padding(.bottom, Theme.Space.screenEdge * 3)
         }
         .transition(.opacity)
