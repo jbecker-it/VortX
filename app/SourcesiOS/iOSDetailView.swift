@@ -223,6 +223,8 @@ struct iOSDetailView: View {
     @State private var season = 1
     @State private var didApplySeason = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
     @State private var settleTimedOut = false            // movie/live resolution gave up → "No sources found", not a spinner
+    @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    private static let sourceRefreshDebounceMs = 400     // trailing settle for the movie/live add-on load storm
     // Debrid cache AWARENESS for the movie/live source list: which raw torrents the user's debrid account
     // has cached, so they badge + rank up. Empty (zero badges, ranking unchanged) with no debrid key.
     @StateObject private var debridCache = DebridCacheAwareness()
@@ -284,6 +286,8 @@ struct iOSDetailView: View {
     /// compute per title/episode set.
     @State private var langChips: [(code: String, label: String)] = []
     @State private var langChipsKey = ""
+    @State private var langChipsDebounce: Task<Void, Never>? = nil
+    private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
 
     /// The one thing presented full-screen at a time: a resolved player stream or the trailer. Both play
     /// IN-APP through the native libmpv player; there is no longer a YouTube web-embed presentation.
@@ -523,7 +527,7 @@ struct iOSDetailView: View {
         // source list empty ("No stream add-ons responded"). That race is why SERIES found no streams on
         // iOS while MOVIES (no child push) and macOS (different onDisappear timing) worked. The next
         // detail's loadMeta replaces the resident meta anyway, so leaving it loaded is harmless.
-        .onDisappear { torrentPrime?.cancel() }
+        .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel(); langChipsDebounce?.cancel() }
         // Flip the spinner to "No sources found" if resolution hangs past 12s (mirrors iOSEpisodeStreams).
         .task {
             try? await Task.sleep(for: .seconds(20))
@@ -534,23 +538,14 @@ struct iOSDetailView: View {
         // when the torrents actually change; with no debrid key it returns an empty set and nothing renders.
         // Series load streams per-episode (iOSEpisodeStreams owns its own awareness); movie + live read here.
         .onChange(of: core.streamLoadProgress().loaded) { _ in
-            // Cache awareness reads the UNFILTERED groups PLUS the TorBox search sources (usenet + torrent):
-            // the Direct-links-only filter drops raw torrents, but a raw torrent / usenet nzb is exactly what
-            // the native cache-check needs, so filtering here would starve the check. Cache awareness is
-            // orthogonal to the playback filter.
-            if effectiveType != "series" {
-                debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-                refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
-            }
-            refreshLanguageChips()   // recompute the "Also available in" chips as more sources answer
+            if effectiveType != "series" { scheduleSourceRefresh() }
+            refreshLanguageChips()   // recompute the "Also available in" chips as more sources answer (own debounce)
         }
         // The Singularity pool answers asynchronously, so re-run the debrid cache check when its streams
         // arrive: a pooled torrent's infoHash gets checked against the user's own debrid (and a pooled nzb
         // against their TorBox), so pooled sources RESOLVE per-user, not just render.
         .onChange(of: sourceIndex.streams.count) { _ in
-            if effectiveType != "series" {
-                debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-            }
+            if effectiveType != "series" { scheduleSourceRefresh() }
         }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources once the meta's imdb id is
         // known (gated on a TorBox key inside `refresh`; de-duped by imdb id). Series episodes fetch in
@@ -1548,7 +1543,7 @@ struct iOSDetailView: View {
     /// submenus is the touch/Mac idiom for the tvOS two-step quality `confirmationDialog`. Plays the
     /// chosen source straight through `playStream`. Hidden until at least one tier resolves.
     @ViewBuilder private func qualityMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
-        let tiers = StreamRanking.tiers(groups)
+        let tiers = sourceList.tiers
         if !tiers.isEmpty {
             Menu {
                 ForEach(tiers, id: \.self) { tier in
@@ -1591,6 +1586,8 @@ struct iOSDetailView: View {
             // duplicate control bar; the grouped per-add-on list shows directly instead.
             showsPrimaryControls: false,
             play: { stream, url in Task { await playStream(stream, url: url) } },
+            bestStream: sourceList.best,
+            resolutionTiers: sourceList.tiers,
             download: movieDownloadHandler,
             isSuspended: suspended
         )
@@ -1666,34 +1663,38 @@ struct iOSDetailView: View {
         // Gate the whole compute (incl. the TMDB spoken_languages verify fetch) on the master feature flag, so
         // it is a hard no-op when off rather than relying only on the per-client internal no-ops.
         guard LanguageIndexClient.isEnabled, let contentKey = languageContentKey else { return }
-        // AGGREGATE across EVERY loaded source for this title (all add-ons), scanning BOTH the stream `name`
-        // AND its `description`: add-ons commonly split the release name into `name` and the audio/sub language
-        // tags into `description` (or vice-versa), so `name ?? description` under-labelled a lazy add-on. Taking
-        // both widens the union of language tokens (MULTI, DUAL, KOR+ENG, audio/sub tags) we can see.
-        let names: [String] = displayGroups(core.streamGroups())
-            .flatMap { $0.streams }
-            .flatMap { [$0.name, $0.description] }
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-        // Re-run only when the title or the set of observed names changes (sources stream in over time).
-        let key = "\(contentKey)#\(names.count)"
+        // Cheap main-thread dedup: an integer stream count over the per-profile filtered snapshot, NO per-stream
+        // string/regex work. The O(N) name flatten + the ~10^5-regex audioSubCodes parse both move off the main
+        // thread below, so this gate can no longer stall the render even when it fires per loaded tick.
+        let snapshot = displayGroups(core.streamGroups())      // per-profile filtered, value-type snapshot on main
+        let streamCount = snapshot.reduce(0) { $0 + $1.streams.count }
+        let key = "\(contentKey)#\(streamCount)"
         guard key != langChipsKey else { return }
         langChipsKey = key
-
-        // Split into AUDIO vs SUBTITLE claims per stream context: a bare release-name language word is an audio
-        // claim (verified below); a code from a subtitle-marked string (vostfr, "ESubs", ...) is a subtitle
-        // claim (kept). This split is what lets the verify drop a FALSE audio claim without dropping real subs.
-        let observed = LanguageIndexClient.audioSubCodes(fromNames: names)
         let imdb = ratingsImdbID
-        Task { @MainActor in
+        let mediaType = type
+        langChipsDebounce?.cancel()                            // supersede any in-flight settle
+        langChipsDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.langChipsDebounceMs))
+            guard !Task.isCancelled, languageContentKey == contentKey else { return }   // title switched during settle
+            // AGGREGATE across EVERY loaded source for this title (all add-ons), scanning BOTH the stream `name`
+            // AND its `description`, then split into AUDIO vs SUBTITLE claims. The heavy flatten + regex parse
+            // runs OFF the main thread; audioSubCodes is pure/static so it is safe to call from the detached task.
+            let observed = await Task.detached(priority: .utility) { () -> (audio: [String], sub: [String]) in
+                let names = snapshot.flatMap { $0.streams }
+                    .flatMap { [$0.name, $0.description] }
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                return LanguageIndexClient.audioSubCodes(fromNames: names)
+            }.value
+            guard languageContentKey == contentKey else { return }
             // Fetch the community index AND TMDB's real spoken_languages in PARALLEL: the two verification
             // sources for a name-parsed audio claim. Both fail soft to nil (no signal), never falsely contradict.
             async let availabilityTask = LanguageIndexClient.fetch(contentKey: contentKey)
-            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: type)
+            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: mediaType)
             let availability = await availabilityTask
             let tmdbSpoken = await spokenTask
-            // Guard against a title switch mid-fetch.
-            guard languageContentKey == contentKey else { return }
+            guard languageContentKey == contentKey else { return }   // title switched mid-fetch
             // VERIFY: drop a name-only AUDIO language that BOTH TMDB (not in spoken_languages) and the community
             // (no/low count) contradict -- the false-claim fix. Subtitle + community + TMDB codes are kept.
             // The chip row is horizontally scrollable now (#8), so a wider cap fits without clutter.
@@ -1702,13 +1703,13 @@ struct iOSDetailView: View {
                                                                       availability: availability,
                                                                       tmdbSpoken: tmdbSpoken,
                                                                       limit: 24)
-        }
-        // Fire-and-forget: contribute the name-parsed codes so the index learns from real users.
-        Task.detached {
-            await LanguageIndexClient.contribute(contentKey: contentKey,
-                                                 audioLangs: observed.audio,
-                                                 subLangs: observed.sub,
-                                                 provenance: "name")
+            // Fire-and-forget: contribute the name-parsed codes so the index learns from real users.
+            Task.detached {
+                await LanguageIndexClient.contribute(contentKey: contentKey,
+                                                     audioLangs: observed.audio,
+                                                     subLangs: observed.sub,
+                                                     provenance: "name")
+            }
         }
     }
 
@@ -1722,14 +1723,32 @@ struct iOSDetailView: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex() {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         guard let contentID = SourceIndexClient.contentID(imdbId: ratingsImdbID) else { return }
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
         // HOARD: report the anonymized descriptors from the UNFILTERED assembled groups (the pool should see
         // torrents even when the user hides them locally). Includes the TorBox search sources. No user data.
-        let groups = torboxSearch.merged(into: core.streamGroups())
+        // Pool-EXCLUDED: the caller's torbox-base when it already merged one, else self-merge. NEVER the
+        // Singularity-pool-inclusive set: hoarding the pool's own results back into itself would be wrong.
+        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+    }
+
+    /// Trailing-debounced driver for the movie/live add-on load storm: the raw `.onChange` fired per add-on
+    /// completion, each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst
+    /// settles, computing the torbox-base ONCE so the debrid (pool-inclusive) and hoard (pool-excluded) sets
+    /// share it. Cache awareness reads the pool-INCLUDED set (raw torrents / usenet nzbs the Direct-links-only
+    /// filter would drop are exactly what the native cache-check needs; orthogonal to the playback filter).
+    private func scheduleSourceRefresh() {
+        sourceRefreshDebounce?.cancel()
+        sourceRefreshDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
+            guard !Task.isCancelled else { return }
+            let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
+        }
     }
 
     /// Fetch cross-provider ratings for this title. Prefers the VortX ratings service (no user key
@@ -2284,6 +2303,8 @@ struct iOSDetailView: View {
             cachedHashes: debridCache.cachedHashes,
             cachedUsenetURLs: debridCache.cachedUsenetURLs,
             play: { stream, url in Task { await playLiveStream(stream, url: url) } },
+            bestStream: sourceList.best,
+            resolutionTiers: sourceList.tiers,
             isSuspended: suspended
         )
         .equatable()   // see sourceSection: skip re-diffing the list on unrelated re-renders
@@ -2642,6 +2663,8 @@ struct iOSEpisodeStreams: View {
     @State private var lastBinge: String?   // release-group of the last pick; biases the next episode's source (#3 sticky autoplay)
     @State private var settleTimedOut = false      // resolution gave up → show "No sources found", not a spinner
     @State private var torrentPrime: Task<Void, Never>?  // outstanding torrent /create retry loop, cancelled on disappear / new pick
+    @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    private static let sourceRefreshDebounceMs = 400     // trailing settle for this episode's add-on load storm
     @ObservedObject private var pinStore = SourcePinStore.shared   // pinned source for this show (#15)
     // Debrid cache awareness for THIS episode's source list. Empty (no badges, ranking unchanged) with no key.
     @StateObject private var debridCache = DebridCacheAwareness()
@@ -2692,6 +2715,8 @@ struct iOSEpisodeStreams: View {
                     play: { stream, url in Task { await play(stream, url: url) } },
                     playAuto: { stream, url in Task { await play(stream, url: url, explicit: false) } },
                     playBest: { candidates, best in Task { await playBest(candidates, labeledBest: best) } },
+                    bestStream: sourceList.best,
+                    resolutionTiers: sourceList.tiers,
                     download: episodeDownloadHandler,
                     isSuspended: presentation != nil
                 )
@@ -2729,7 +2754,7 @@ struct iOSEpisodeStreams: View {
                 core.loadMeta(type: "series", id: meta.id, streamType: "series", streamId: video.id)
             }
         }
-        .onDisappear { torrentPrime?.cancel() }
+        .onDisappear { torrentPrime?.cancel(); sourceRefreshDebounce?.cancel() }
         .task {
             try? await Task.sleep(for: .seconds(20))
             settleTimedOut = true
@@ -2737,17 +2762,10 @@ struct iOSEpisodeStreams: View {
         // Debrid cache awareness for this episode's torrents + usenet: re-check as add-ons answer (de-duped
         // by hash set in refresh). Includes the TorBox search sources so those rows badge too. No-op with
         // no debrid key.
-        .onChange(of: core.streamLoadProgress(forStreamId: video.id).loaded) { _ in
-            // Unfiltered: cache awareness needs the raw torrents the Direct-links-only filter would drop, plus
-            // the Singularity pool sources, so a pooled source RESOLVES through the user's own debrid / TorBox.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))))
-            refreshSourceIndex()   // SERVE + HOARD the community source index as this episode's sources answer
-        }
+        .onChange(of: core.streamLoadProgress(forStreamId: video.id).loaded) { _ in scheduleSourceRefresh() }
         // The Singularity pool answers asynchronously, so re-run the cache check when its streams arrive, so
         // pooled sources for this episode resolve per-user rather than only rendering.
-        .onChange(of: sourceIndex.streams.count) { _ in
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))))
-        }
+        .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
         // TorBox search-as-a-source for the show (gated on a TorBox key; de-duped by imdb id inside refresh).
         .onAppear { torboxSearch.refresh(imdbId: showImdbID); refreshSourceIndex() }
         .platformFullScreenPlayerCover(item: $presentation) { item in
@@ -3045,12 +3063,30 @@ struct iOSEpisodeStreams: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex() {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         guard let contentID = episodeContentID else { return }
         sourceIndex.refresh(contentID: contentID, isSignedIn: VortXSyncManager.shared.isSignedIn)
-        let groups = torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))
+        // Pool-EXCLUDED hoard set: the caller's episode-scoped torbox-base when it merged one, else self-merge.
+        // NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into itself is wrong.
+        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+    }
+
+    /// Trailing-debounced driver for THIS episode's add-on load storm: the raw `.onChange` fired per add-on
+    /// completion, each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst
+    /// settles, computing the episode-scoped torbox-base ONCE so the debrid (pool-inclusive) and hoard
+    /// (pool-excluded) sets share it. Cache awareness reads the pool-INCLUDED set (raw torrents the
+    /// Direct-links-only filter would drop, plus the pool sources, so pooled sources resolve per-user).
+    private func scheduleSourceRefresh() {
+        sourceRefreshDebounce?.cancel()
+        sourceRefreshDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
+            guard !Task.isCancelled else { return }
+            let torboxBase = torboxSearch.merged(into: core.streamGroups(forStreamId: video.id))   // pool-EXCLUDED
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))   // pool-INCLUDED (debrid set)
+            refreshSourceIndex(torboxMerged: torboxBase)                      // reuse the same base; no second merge
+        }
     }
 
     /// The quality this series last played in (per profile), so the episode's Watch-in pick keeps the
@@ -3167,6 +3203,16 @@ private struct iOSProgressStripe: View {
 ///
 /// It owns its own filter / collapse / picker UI state and plays a chosen source through the `play`
 /// closure handed in by `iOSDetailView` (which resolves resume + presents the native player).
+/// A stable-identity source row: a content id (`CoreStream.id`) plus an occurrence index disambiguates
+/// duplicate streams that share the same id, so the ~4/sec republish keeps each row's identity stable (Lazy
+/// diffing no longer reshuffles the list). Built bounded to the render window, so the per-row string work stays
+/// capped no matter how many thousand sources a title returns.
+private struct SourceRow: Identifiable { let id: String; let addon: String; let stream: CoreStream }
+
+/// One add-on section in the windowed render plan: the group (for its header) plus only the rows that fit the
+/// shared render budget. A collapsed group carries an empty `rows` (its header still shows the full count).
+private struct WindowedGroup: Identifiable { let id: String; let group: CoreStreamSourceGroup; let rows: [SourceRow] }
+
 struct iOSSourceList: View {
     let groups: [CoreStreamSourceGroup]
     let progress: (loaded: Int, total: Int)
@@ -3200,6 +3246,12 @@ struct iOSSourceList: View {
     /// before). The per-row taps and the Quality picker NEVER use this — a user choosing a specific row still
     /// resolves exactly that row through `play`.
     var playBest: (([CoreStream], CoreStream) -> Void)? = nil
+    /// Ranked best playable stream, computed once off-main by SourceListModel; the control bar's Watch pick.
+    /// Defaults nil so a caller that omits it keeps the Watch button hidden rather than crashing.
+    var bestStream: CoreStream? = nil
+    /// Resolution tiers, computed once off-main by SourceListModel; the control bar's Quality picker first level.
+    /// Defaults empty so an omitting caller renders no Quality menu rather than re-ranking on every body eval.
+    var resolutionTiers: [String] = []
     /// Offline download of a chosen source row (`#30`). Optional so call sites that don't support
     /// downloads (e.g. tvOS, where the whole feature is `#if !os(tvOS)`-gated) pass nil and no Download
     /// affordance renders. `url` is resolved by the caller EXACTLY as the play path resolves it.
@@ -3217,6 +3269,12 @@ struct iOSSourceList: View {
 
     @State private var sourceFilter: String? = nil      // nil = all add-ons
     @State private var showAllSources = false           // the full ranked list is revealed on demand
+    // Render only the top N ranked rows across the expanded groups; a popular title returns 4000+ sources and
+    // reassigning row identity ~4x/sec starved diffing. "Show more" grows the window by a step. Ranking +
+    // auto-pick still run over the FULL list (see controlBar); this caps RENDERING only.
+    @State private var renderLimit = Self.sourceWindowInitial
+    private static let sourceWindowInitial = 100
+    private static let sourceWindowStep = 100
     /// Rows whose per-row download was tapped this session (keyed by playable URL), so the icon flips to
     /// a check and disables; the tap used to give ZERO feedback, reading as "does nothing" (#21).
     @State private var queuedDownloads: Set<String> = []
@@ -3253,6 +3311,37 @@ struct iOSSourceList: View {
     private var loading: Bool { !settleTimedOut && (progress.total == 0 || progress.loaded < progress.total) }
     private var visibleGroups: [CoreStreamSourceGroup] {
         groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+    }
+
+    /// Windowed render plan for the grouped list: walk the visible groups, spending a shared row budget
+    /// (`renderLimit`) only on EXPANDED groups. A collapsed group emits its header but no rows and spends
+    /// nothing. Rows carry a stable content id (SourceRow), and the build is bounded to the budget, so the
+    /// per-row string work stays capped. `expandable` is the count of rows that COULD still render (visible +
+    /// not collapsed), so "Show more" is offered only when growing the window actually reveals more rows.
+    private var windowedPlan: (groups: [WindowedGroup], shown: Int, expandable: Int) {
+        var budget = renderLimit
+        var shown = 0
+        var expandable = 0
+        var out: [WindowedGroup] = []
+        for group in visibleGroups {
+            if collapsed.contains(group.addon) {
+                out.append(WindowedGroup(id: group.addon, group: group, rows: []))
+                continue
+            }
+            let streams = sortedStreams(group)
+            expandable += streams.count
+            let take = min(budget, streams.count)   // budget is never negative: take <= budget each step
+            var seen: [String: Int] = [:]
+            let rows = streams.prefix(take).map { s -> SourceRow in
+                let base = s.id
+                let n = seen[base, default: 0]; seen[base] = n + 1
+                return SourceRow(id: "\(base)#\(n)", addon: group.addon, stream: s)
+            }
+            out.append(WindowedGroup(id: group.addon, group: group, rows: Array(rows)))
+            budget -= take
+            shown += take
+        }
+        return (out, shown, expandable)
     }
 
     /// Empty result, told apart by CAUSE. If one or more add-ons actually ERRORED (fetch / timeout /
@@ -3379,6 +3468,11 @@ struct iOSSourceList: View {
                 }
             }
         }
+        // Reset the render window when the list collapses (re-expanding starts fresh at the top) or the title
+        // changes (a new title must not inherit the previous one's grown window). pinContext carries the metaId,
+        // so it flips on a title change even while this view stays mounted across a navigation.
+        .onChange(of: showAllSources) { _ in if !showAllSources { renderLimit = Self.sourceWindowInitial } }
+        .onChange(of: pinContext) { _ in renderLimit = Self.sourceWindowInitial }
     }
 
     // MARK: Controls (Watch-in-X · Quality picker · All sources)
@@ -3388,7 +3482,7 @@ struct iOSSourceList: View {
         VStack(alignment: .leading, spacing: Theme.Space.sm) {
             // Watch-in pick honors the remembered-quality continuity hint, so reopening a title lands
             // on the same quality it last played (same-release-group biased) — matching tvOS.
-            if let best = StreamRanking.best(groups, continuity: continuity, debridCachedHashes: cachedHashes), let url = best.playableURL {
+            if let best = bestStream, let url = best.playableURL {
                 HStack(spacing: Theme.Space.sm) {
                     // Watch-Now waits until every add-on has answered (or the settle timeout fired), so one
                     // press plays the best of ALL sources, not the best of whoever replied first — the tvOS
@@ -3427,7 +3521,7 @@ struct iOSSourceList: View {
     /// Others), then the flavour variants inside it (Dolby Vision · Remux, HDR · Atmos, …). A native
     /// `Menu` with submenus is the touch / Mac idiom for the tvOS two-step `confirmationDialog`.
     @ViewBuilder private var qualityMenu: some View {
-        let tiers = StreamRanking.tiers(groups)
+        let tiers = resolutionTiers
         if !tiers.isEmpty {
             Menu {
                 ForEach(tiers, id: \.self) { tier in
@@ -3492,19 +3586,24 @@ struct iOSSourceList: View {
     /// One collapsible section per add-on. LazyVStack so only on-screen rows are built — a popular
     /// title can return thousands of sources, and instantiating them all at once OOM-crashed on tvOS.
     private var groupedList: some View {
-        LazyVStack(spacing: Theme.Space.sm) {
-            ForEach(visibleGroups) { group in
+        let plan = windowedPlan
+        return LazyVStack(spacing: Theme.Space.sm) {
+            ForEach(plan.groups) { wg in
                 // Header + rows as flat SIBLINGS, NOT wrapped in `Section {} header: {}`. On macOS the
                 // LazyVStack + Section(header:) combo mis-measures section geometry during lazy realization -
                 // a not-yet-built section reserves a near-viewport-height blank, which is the reported
                 // "sources vanish / big blank gaps on scroll". Emitting them flat removes that reservation
                 // while KEEPING the LazyVStack, so a title with thousands of sources still won't OOM on tvOS.
-                sectionHeader(group)
-                if !collapsed.contains(group.addon) {
-                    ForEach(Array(sortedStreams(group).enumerated()), id: \.offset) { _, stream in
-                        streamRow(group.addon, stream)
-                    }
+                sectionHeader(wg.group)
+                if !collapsed.contains(wg.group.addon) {
+                    ForEach(wg.rows) { row in streamRow(row.addon, row.stream) }
                 }
+            }
+            if plan.shown < plan.expandable {
+                Button { renderLimit += Self.sourceWindowStep } label: {
+                    Label("Show more · \(plan.expandable - plan.shown) more", systemImage: "chevron.down")
+                }
+                .buttonStyle(ChipButtonStyle())
             }
         }
     }
@@ -3650,6 +3749,8 @@ extension iOSSourceList: Equatable {
             && lhs.cachedHashes == rhs.cachedHashes
             && lhs.cachedUsenetURLs == rhs.cachedUsenetURLs
             && lhs.states == rhs.states
+            && lhs.bestStream == rhs.bestStream
+            && lhs.resolutionTiers == rhs.resolutionTiers
             && lhs.groups == rhs.groups
     }
 }
