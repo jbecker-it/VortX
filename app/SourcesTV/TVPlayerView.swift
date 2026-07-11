@@ -279,6 +279,10 @@ struct TVPlayerView: View {
     @State private var inFlightSeekIssuedAt = 0.0
     private let inFlightSeekSettleWindow = 10.0   // seconds before stale-looking ticks are trusted again
     private let inFlightSeekSnapRadius = 5.0      // a tick this close to the target means the seek landed
+    /// Wall-clock when settled playback first ticked inside the last-10% "watched" zone, nil while
+    /// outside it (or while scrubbing). The watched marker requires a few seconds of dwell here, so a
+    /// scrub commit that merely LANDS past 90% can no longer mark the episode watched on its first tick.
+    @State private var watchedZoneSince: Double?
     private let plog = Logger(subsystem: "com.stremiox.app", category: "tvplayer")
 
     private var controlsHidden: Bool { !showInfo && !showOptions && !loadFailed }
@@ -582,9 +586,28 @@ struct TVPlayerView: View {
                         core.reportProgress(timeSeconds: d, durationSeconds: duration)   // live -> engine
                     }
                 }
-                if !markedWatched, duration > 0, d / duration >= 0.9, let m = curMeta {
-                    markedWatched = true            // ~90% in → flip the watched marker live
-                    core.markPlaybackWatched(m)
+                // ~90% in → flip the watched marker live. DWELL-GATED: a single tick past 90% is not
+                // proof of watching — a scrub commit that lands there (easy mid back-and-forth, since a
+                // held press ramps to 75s steps) used to mark the episode watched instantly, and the mark
+                // stuck even when the viewer scrubbed straight back and exited early: Continue Watching
+                // dropped the episode and the selector moved on (the same wipe as the EOF overshoot).
+                // Require a few seconds of SETTLED playback in the zone (not scrubbing, ticks flowing)
+                // before marking; leaving the zone re-arms. A natural finish is unaffected: the last 10%
+                // of any episode dwarfs the dwell, and a true EOF still marks watched via endFileEof.
+                if !markedWatched, duration > 0, d / duration >= 0.9 {
+                    let now = Date().timeIntervalSinceReferenceDate
+                    if scrubbing {
+                        watchedZoneSince = nil          // previewing, not watching: reset the dwell
+                    } else if let since = watchedZoneSince {
+                        if now - since >= 5, let m = curMeta {
+                            markedWatched = true
+                            core.markPlaybackWatched(m)
+                        }
+                    } else {
+                        watchedZoneSince = now          // entered the zone: start the dwell clock
+                    }
+                } else {
+                    watchedZoneSince = nil              // below the zone (scrubbed back out): re-arm
                 }
                 // ~60s in → the user is really watching this: auto-add to the Library (D8) + send the anon
                 // fleet watch ping (D9), once per playback. Idempotent + gated (D8 setting + per-profile dedup;
@@ -2940,6 +2963,7 @@ struct TVPlayerView: View {
         buffering = true; hasStartedPlaying = false; appliedResume = false
         loadFailed = false; currentTime = 0; duration = 0; bufferedTime = 0; lastSaved = -1; resumeSeconds = nil; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false
         inFlightSeekTarget = nil   // any pending seek belonged to the PREVIOUS episode; new media ticks are authoritative
+        watchedZoneSince = nil     // the watched-zone dwell belonged to the previous episode too
         suppressedResumeFloor = nil   // the floor belongs to the PREVIOUS title's suppressed remux resume
         // A new episode's source is a RANKED auto-pick (auto-advance) or an episode-panel pick (the user chose
         // the EPISODE, not the source), never a source-row tap. Clear the explicit flag so a slow/dead episode
@@ -3308,7 +3332,14 @@ struct TVPlayerView: View {
             scrubStep = 10                               // paused between presses → back to fine steps
         }
         lastScrubAt = now
-        scrubTarget = min(duration, max(0, scrubTarget + Double(dir) * scrubStep))
+        // Clamp an overshoot a few seconds BEFORE the end, never AT it. The accelerating ramp reaches the
+        // clamp in a few held presses, and a commit at the exact duration seeks straight into end-of-file:
+        // mpv fires EOF, the player treats that as "episode finished" — marks it watched and auto-advances
+        // — and the viewer's real progress is wiped (the "scrubbed fast, exited, progress and episode
+        // selection gone" report). Landing 5s short shows the actual ending and lets natural playback
+        // reach EOF with all the finished semantics intact; a short clip keeps the plain full-range clamp.
+        let scrubCeiling = duration > 30 ? duration - 5 : duration
+        scrubTarget = min(scrubCeiling, max(0, scrubTarget + Double(dir) * scrubStep))
         scrubThumbnails.show(time: scrubTarget)
         flashControls()
         scheduleScrubCommit()
