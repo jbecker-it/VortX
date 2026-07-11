@@ -1668,6 +1668,8 @@ struct TVPlayerView: View {
         appliedResume = false
         bufferedTime = 0   // new stream: clear the buffered-ahead band until the new demuxer reports
         buffering = true; hasStartedPlaying = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false; loadErrorMsg = ""
+        inFlightSeekTarget = nil   // any pending seek belonged to the PREVIOUS source; the new load's ticks are authoritative (mirrors play(episode:))
+        watchedZoneSince = nil     // the watched-zone dwell belonged to the previous source's playback too
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel()
         // A different rip: reset the community-subtitle session so the new fingerprint re-fetches pooled subs,
         // re-seeds its rip-matched offset, and can re-upload this rip's embedded tracks (P2/P3/P4).
@@ -2101,6 +2103,7 @@ struct TVPlayerView: View {
         // an error (mirrors iOS PlayerScreen.demoteAVPlayerToMPV).
         let reconcileResume: Double? = hasStartedPlaying ? currentTime : resumeSeconds   // capture BEFORE the reset below zeroes hasStartedPlaying
         hasStartedPlaying = false; buffering = true; appliedVolume = false; appliedResume = false; loadErrorMsg = ""
+        inFlightSeekTarget = nil   // any seek in flight died with the AVPlayer engine; mpv's fresh ticks are authoritative
         avEngineFailed = true
         startLoadTimeout()
         // R10 (ports iOS PlayerScreen.demoteAVPlayerToMPV): flipping avEngineFailed re-renders the mpv surface,
