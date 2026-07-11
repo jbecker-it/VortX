@@ -1059,11 +1059,27 @@ final class MPVMetalViewController: PlatformViewController {
         guard getFlag(MPVProperty.pause) else { return }   // belt-and-suspenders; resume cancels the work item
         pausedCacheClamped = true
         setString("demuxer-max-bytes", Self.clampedCacheCap)
-        // Freeing is the point. Dropping re-reads from the playhead on resume, which needs a seekable
-        // stream (every debrid/direct-HTTP source is); a rare non-seekable stream keeps its buffers.
-        if getFlag(MPVProperty.seekable) { command("drop-buffers") }
+        flushDemuxerCachePreservingPosition()
         mpvLog.log("paused \(Int(Self.pausedClampGraceSeconds), privacy: .public)s: demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) until resume")
         DiagnosticsLog.log("player", "long pause: mpv read-ahead clamped to \(Self.clampedCacheCap) until resume")
+    }
+
+    /// Free the demuxer cache WITHOUT moving the play head. `drop-buffers` alone is the wrong tool on a
+    /// seekable stream: it discards the cached packets but leaves the demuxer's READ position at the
+    /// buffered edge (it exists for live streams, where skipping to the edge is the point), so playback
+    /// silently continued from minutes ahead of where the viewer paused — the "jumps forward after a
+    /// minute of pause" regression reported on the first cut of this clamp. Drop, then EXACT-seek back
+    /// to the recorded play head: the RAM is freed and demuxing re-anchors at the right byte offset,
+    /// with the refill bounded by the (already lowered) cap. The exact flag re-decodes to the same
+    /// frame, so the paused picture does not visibly move. Seekable streams only — a non-seekable
+    /// stream cannot re-read, so it keeps its buffers rather than corrupting playback; and a not-yet
+    /// known position (time-pos <= 0) skips too rather than risk re-anchoring at 0.
+    private func flushDemuxerCachePreservingPosition() {
+        guard getFlag(MPVProperty.seekable) else { return }
+        let pos = getDouble(MPVProperty.timePos)
+        guard pos > 0 else { return }
+        command("drop-buffers")
+        command("seek", args: [String(format: "%.3f", pos), "absolute+exact"])
     }
 
     /// System memory warning (registered in viewDidLoad). Posted on the main thread; re-dispatch is a
@@ -1078,7 +1094,7 @@ final class MPVMetalViewController: PlatformViewController {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         setString("demuxer-max-bytes", Self.clampedCacheCap)
         setString("demuxer-max-back-bytes", "8MiB")
-        if getFlag(MPVProperty.seekable) { command("drop-buffers") }
+        flushDemuxerCachePreservingPosition()   // NOT bare drop-buffers: that moves the play head (see above)
         mpvLog.log("memory warning: demuxer cache clamped to \(Self.clampedCacheCap, privacy: .public) for the rest of this file")
         DiagnosticsLog.log("player", "memory warning: mpv cache clamped to \(Self.clampedCacheCap) + buffers dropped")
     }
