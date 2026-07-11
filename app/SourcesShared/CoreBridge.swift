@@ -1144,14 +1144,22 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Resume position (seconds) from the engine's library item for `meta`, or nil if the engine has
-    /// no entry (the caller then falls back to the account). For a series, only resume when the saved
-    /// video matches the episode being opened. (timeOffset is stored in ms.)
+    /// no entry. For a series, the saved offset only counts when the saved video matches the episode
+    /// being opened; a mismatch answers 0. (timeOffset is stored in ms.)
     ///
-    /// IMPORTANT: the series-mismatch branch returns 0, NOT nil, on purpose. For an engine-history
-    /// profile the engine IS the source of truth: it knows this title but the saved offset is for a
-    /// different episode, so the right answer is "start this episode at 0", and returning 0 (a real
-    /// value) deliberately suppresses the account fallback. Do not "simplify" this to nil, or the
-    /// caller would then resume the account's offset and play the wrong episode position.
+    /// CONTRACT (the account-fallback fix): the engine's answer is trusted only when it is a REAL
+    /// position greater than 5 seconds. Anything else (nil: no entry; 0 or near-0: "start fresh",
+    /// including the series video_id-mismatch branch) sends the caller to the account fallback
+    /// instead. The engine's library copy can lag the account: it hears TimeChanged on a throttle and
+    /// a watched/unwatched toggle can leave its video_id stale, while this device's exit save already
+    /// put the fresh position on the account, so a bare 0 here is not proof the viewer starts over.
+    /// The fallback is episode-safe by construction: account.resumeOffset does its own video_id match
+    /// and returns 0 for a different episode, so the wrong-episode resume that the old "trust the
+    /// engine's 0" rule guarded against cannot come back through it.
+    ///
+    /// PLANNED ARBITER: a later change makes engineResumeSeconds the single decision point, returning
+    /// nil to mean "consult the account fallback" and 0 to mean "genuinely start fresh". Once that
+    /// lands, the caller reverts to trusting any non-nil answer.
     func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
         // Overlay (non-owner) profile: the engine library item belongs to the owner account, so its saved
         // resume position is not this profile's. Decline here so the caller falls back to account.resumeOffset,
