@@ -510,15 +510,17 @@ final class MPVMetalViewController: PlatformViewController {
         // burst saturated the network + demuxer + decoder — so the audio output underran repeatedly,
         // heard as several seconds of crackly/distorted audio with video lagging until the cache caught
         // up. The avfoundation AO is also known upstream to drop 30+ frames each time it resumes from an
-        // underrun (mpv-player/mpv#16346), which compounds the visible lag. `cache-pause-initial` holds
-        // playback in the normal buffering state after every start/seek until `cache-pause-wait` seconds
-        // are cached, so playback resumes ONCE, cleanly, instead of stuttering through the refill; the
-        // deeper `audio-buffer` gives the AO slack to ride out the burst's CPU spikes without
-        // underrunning. tvOS-only: iOS/macOS ride the audiounit/coreaudio AOs and don't show this. The
-        // muted hero-preview instance keeps mpv defaults so its ambient clip still starts instantly.
+        // underrun (mpv-player/mpv#16346), which compounds the visible lag. Only the deeper `audio-buffer`
+        // is set globally here: it just grows a buffer, giving the AO slack to ride out the refill burst's
+        // CPU spikes without underrunning. The cache hold itself (`cache-pause-initial` +
+        // `cache-pause-wait`) is deliberately NOT set at setup: applied globally it held EVERY playback
+        // start in the buffering state and doubled every ordinary mid-play rebuffer's wait. Instead
+        // armSeekCacheHold() toggles the hold on immediately before the seeks that actually empty the
+        // cache (scrub commits and the track-change refresh-seeks), and the pausedForCache=false edge in
+        // the event drain releases it once playback has resumed. tvOS-only: iOS/macOS ride the
+        // audiounit/coreaudio AOs and don't show this. The muted hero-preview instance keeps mpv defaults
+        // so its ambient clip still starts instantly.
         if !startMuted {
-            checkError(mpv_set_option_string(mpv, "cache-pause-initial", "yes"))
-            checkError(mpv_set_option_string(mpv, "cache-pause-wait", "2"))
             checkError(mpv_set_option_string(mpv, "audio-buffer", "0.5"))
         }
 #endif
@@ -1007,6 +1009,11 @@ final class MPVMetalViewController: PlatformViewController {
         // consecutive loads are both non-live), so every post-shed load started with the shrunken
         // seek-back buffer. Live stays untouched: configureLiveMode(live) above owns its tight 8MiB.
         if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
+        #if os(tvOS)
+        // A seek cache hold armed by a seek that never dipped into pausedForCache has no release edge:
+        // drop it here so a lingering `cache-pause-initial=yes` can never hold THIS file's start.
+        releaseSeekCacheHoldIfArmed()
+        #endif
 
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
@@ -1251,13 +1258,52 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func seek(to seconds: Double) {
+        #if os(tvOS)
+        armSeekCacheHold()   // absolute jumps (scrub commits and friends) land outside the buffered window and empty the forward cache
+        #endif
         command("seek", args: [String(seconds), "absolute"])
     }
 
-    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right.
+    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
+    /// inside the buffered window, so no cache hold is armed for these.
     func seek(by seconds: Double) {
         command("seek", args: [String(format: "%.1f", seconds), "relative"])
     }
+
+    #if os(tvOS)
+    /// True while the one-shot post-seek cache hold is armed for an in-flight cache-emptying seek
+    /// (a scrub commit, or the demuxer refresh-seek an audio/subtitle track change triggers).
+    /// Main-thread only: armed from the UI's seek/track calls, released via a main hop from the
+    /// event drain (mirroring pausedStateChanged).
+    private var seekCacheHoldArmed = false
+
+    /// Arm the post-seek cache hold for the seek about to be issued: hold playback in the normal
+    /// buffering state until `cache-pause-wait` seconds are cached, so the avfoundation AO resumes
+    /// ONCE on a refilled cache instead of stuttering through the refill (the crackly/distorted
+    /// audio after scrubs and track changes; see the setupMpv comment). One-shot by design: setting
+    /// these options globally at setup held EVERY playback start and doubled every ordinary mid-play
+    /// rebuffer's wait. Released by releaseSeekCacheHoldIfArmed() once playback resumes (the
+    /// pausedForCache=false edge), and defensively by loadFile so a lingering hold can never slow a
+    /// fresh start. The muted hero-preview instance never arms, so its ambient clip keeps starting
+    /// instantly.
+    private func armSeekCacheHold() {
+        guard !startMuted, mpv != nil else { return }
+        seekCacheHoldArmed = true
+        setString("cache-pause-initial", "yes")
+        setString("cache-pause-wait", "2")
+    }
+
+    /// Put the cache-pause options back to their fast defaults once the held seek's playback has
+    /// resumed (or, from loadFile, before a fresh start: a hold armed by a seek that never dipped
+    /// into pausedForCache would otherwise linger onto the next file).
+    private func releaseSeekCacheHoldIfArmed() {
+        guard seekCacheHoldArmed else { return }
+        seekCacheHoldArmed = false
+        guard mpv != nil else { return }
+        setString("cache-pause-initial", "no")
+        setString("cache-pause-wait", "1")
+    }
+    #endif
 
     private func getDouble(_ name: String) -> Double {
         guard mpv != nil else { return 0.0 }
@@ -1330,8 +1376,18 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
-    func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
+    func setAudioTrack(_ id: Int) {
+        #if os(tvOS)
+        armSeekCacheHold()   // an aid change triggers a demuxer refresh-seek that discards + re-reads the forward cache
+        #endif
+        setString(MPVProperty.aid, id < 0 ? "no" : String(id))
+    }
+    func setSubtitleTrack(_ id: Int) {
+        #if os(tvOS)
+        armSeekCacheHold()   // a sid change triggers the same demuxer refresh-seek as an audio switch
+        #endif
+        setString(MPVProperty.sid, id < 0 ? "no" : String(id))
+    }
 
     /// Session-lived map of add-on subtitle URL -> already-downloaded LOCAL file. Once a subtitle has been
     /// fetched, re-selecting that track or re-opening the same episode hands the on-disk file straight to mpv
@@ -1771,6 +1827,14 @@ final class MPVMetalViewController: PlatformViewController {
                             VXProbeState.shared.setPlayer(buffering: buffering)
                             VXProbe.event("player", "buffering \(buffering ? "start" : "end")")
                             self.emit(propertyName, buffering)
+                            #if os(tvOS)
+                            // Seek cache hold: buffering just ended, so the held seek's refill reached
+                            // cache-pause-wait and playback resumed. Release the one-shot hold back to
+                            // the fast defaults (main hop, mirroring pausedStateChanged below).
+                            if !buffering {
+                                DispatchQueue.main.async { [weak self] in self?.releaseSeekCacheHoldIfArmed() }
+                            }
+                            #endif
                         case MPVProperty.duration:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 VXProbeState.shared.setPlayer(dur: Int(value))
