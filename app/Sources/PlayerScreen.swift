@@ -268,6 +268,13 @@ struct PlayerScreen: View {
     // the preferred language chain but an add-on does). Reset with appliedAutoTracks so a source hop /
     // episode switch re-evaluates cleanly; latched after one attempt so a failure never loops.
     @State private var autoAddonSubTried = false
+    // Set on ANY manual subtitle choice this load (panel Off / embedded / add-on / community row). Hard-stops
+    // every later ASYNC auto-select re-application, so a list that lands after a manual pick never overrides it.
+    // Reset wherever autoAddonSubTried resets. Mirror of TVPlayerView.
+    @State private var userPickedSubtitle = false
+    // One-shot latch: the tmdb->tt resolve for the add-on/pooled query id has been kicked off this load. Reset
+    // wherever autoAddonSubTried resets, so a reload can retry a failed resolve exactly once. Mirror of TVPlayerView.
+    @State private var addonSubsResolveTried = false
     @State private var warmedEpisodeID: String?      // next-episode source already warmed this episode (F6 preload)
     @State private var showShare = false             // system share sheet
     @State private var grabbedFrame: GrabbedFrame?   // a captured still, pending the share sheet (#24 frame grab)
@@ -937,12 +944,14 @@ struct PlayerScreen: View {
                 // Sleep timer set to "End of episode": this one finished, so stop here. Do NOT auto-advance,
                 // and do NOT finishedWatching (that would clear the whole series from Continue Watching).
                 sleepAtEpisodeEnd = false
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if upNextSuppressed {
                 // User chose "Watch Credits": play through to the end, then stop here instead of
                 // auto-advancing. The episode is already marked watched above, so Continue Watching
                 // rolls to the next episode on its own without yanking the viewer out of the credits.
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             } else if canNextEpisode, let i = episodeIndex, !skipEditActive {
@@ -955,7 +964,11 @@ struct PlayerScreen: View {
                 // Finished (movie or last episode): rewind the title OUT of Continue Watching. The engine
                 // keeps any item with time_offset > 0 in the rail, so without this a finished title lingers
                 // at its end position forever (the "CW never clears" report). Mirrors tvOS autoAdvance:1479.
-                if let m = curMeta { core.finishedWatching(libraryId: m.libraryId) }
+                // Guard: a series that reached EOF with NO episode list (a CW resume whose list never loaded)
+                // is a mid-season episode misread as a finale, so do NOT clear the whole series from Continue
+                // Watching here; only genuine finishes (movies, or a series with a real list) rewind it out.
+                if let m = curMeta, !(m.type == "series" && episodes.isEmpty && !hasNext) { core.finishedWatching(libraryId: m.libraryId) }
+                if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the torrent engine (no-op for direct/debrid)
                 DiskCacheSetting.clearCache()   // terminal: drop the finished title's on-disk buffer
                 onClose()
             }
@@ -1043,22 +1056,37 @@ struct PlayerScreen: View {
     /// "2:05:00"). Kept here because the raw JSON path above never decodes a full CoreMeta.
     private static func parseRuntimeSeconds(_ raw: String?) -> Double {
         guard let r = raw?.lowercased().trimmingCharacters(in: .whitespaces), !r.isEmpty else { return 0 }
+        // Twin of CoreMeta.runtimeSeconds: compute in Double and cap each field so an add-on/Cinemeta garbage
+        // value yields 0 rather than trapping on Int overflow. A field over 24h (86_400s) is rejected; the
+        // total must be finite and positive and is clamped to a 24h ceiling.
+        let maxSeconds = 86_400.0
+        func field(_ rawField: Substring) -> Double? {
+            guard let n = Double(rawField.trimmingCharacters(in: .whitespaces)),
+                  n.isFinite, n >= 0, n <= maxSeconds else { return nil }
+            return n
+        }
+        func finalize(_ seconds: Double) -> Double {
+            guard seconds.isFinite, seconds > 0 else { return 0 }
+            return min(seconds, maxSeconds)
+        }
         if r.contains(":") {
-            let p = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if p.count == 3 { return Double(p[0] * 3600 + p[1] * 60 + p[2]) }
-            if p.count == 2 { return Double(p[0] * 60 + p[1]) }
+            let p = r.split(separator: ":").compactMap { field($0) }
+            if p.count == 3 { return finalize(p[0] * 3600 + p[1] * 60 + p[2]) }
+            if p.count == 2 { return finalize(p[0] * 60 + p[1]) }
         }
         if let hRange = r.range(of: #"\d+\s*h"#, options: .regularExpression) {
-            let h = Int(r[hRange].filter(\.isNumber)) ?? 0
-            var mins = 0
+            let h = Double(r[hRange].filter(\.isNumber)) ?? 0
+            var mins = 0.0
             if let mRange = r.range(of: #"\d+\s*m"#, options: .regularExpression,
                                     range: hRange.upperBound..<r.endIndex) {
-                mins = Int(r[mRange].filter(\.isNumber)) ?? 0
+                mins = Double(r[mRange].filter(\.isNumber)) ?? 0
             }
-            return Double(h * 3600 + mins * 60)
+            guard h <= maxSeconds, mins <= maxSeconds else { return 0 }
+            return finalize(h * 3600 + mins * 60)
         }
-        let minutes = Int(r.prefix { $0.isNumber }) ?? 0
-        return Double(minutes * 60)
+        let minutes = Double(r.prefix { $0.isNumber }) ?? 0
+        guard minutes <= maxSeconds else { return 0 }
+        return finalize(minutes * 60)
     }
 
     private func maybeCaptureLocalTrickplay(at time: Double) {
@@ -1617,6 +1645,33 @@ struct PlayerScreen: View {
         return try? JSONDecoder().decode(TorrentStats.self, from: data)
     }
 
+    /// Tell the embedded server to destroy a torrent engine (GET /{hash}/remove). Each engine holds
+    /// peers, sockets, and a growing disk/RAM cache; leaving them running when we switch source, auto-fail
+    /// over, advance an episode, or close the player piled them up until the server's RSS ballooned and it
+    /// stopped answering (the 0.2.48 "torrents stopped playing, server went offline" regression). tvOS
+    /// TVPlayerView already did this; the iOS/iPad/Mac player did not, so engines leaked here across every
+    /// switch and exit. Fire-and-forget on URLSession's own queue (never blocks the main thread), guards a
+    /// 40-hex hash, and is a no-op for direct/debrid playback (no hash). Symmetric with the create/warm-up.
+    private func closeTorrent(hash: String) {
+        let h = hash.lowercased()
+        guard h.count == 40, let url = URL(string: "\(StremioServer.base)/\(h)/remove") else { return }
+        DiagnosticsLog.log("torrent", "remove engine \(h.prefix(8))")
+        URLSession.shared.dataTask(with: url).resume()
+    }
+
+    /// The 40-hex info-hash of the currently playing torrent, or nil for a direct/debrid stream. Decided by
+    /// the URL SHAPE ({server}/{40-hex-hash}/{idx}) against the ACTIVE streaming server's host:port, NOT by
+    /// the launch `recordIsTorrent` / `curIsTorrent` flag, which goes stale across engine-resolved episode
+    /// switches. curURL is built from StremioServer.base, so comparing host+port against base is exact and
+    /// also covers a custom remote server, not just a hardcoded :11470. Mirrors TVPlayerView.currentTorrentHash.
+    private var currentTorrentHash: String? {
+        guard let u = curURL, let serverBase = URL(string: StremioServer.base),
+              u.host == serverBase.host, u.port == serverBase.port,
+              u.pathComponents.count >= 2 else { return nil }
+        let hash = u.pathComponents[1]
+        return (hash.count == 40 && hash.allSatisfy(\.isHexDigit)) ? hash : nil
+    }
+
     /// One wall-clock cap over the WHOLE pre-start recovery sequence (30s timeout × retries × 4 hops
     /// would otherwise chain into minutes of spinner on a dead title). Idempotent; reset on a fresh
     /// deliberate pick and on playback actually starting. Mirrors tvOS `startRecoveryDeadline`.
@@ -1858,6 +1913,16 @@ struct PlayerScreen: View {
         srcProbe("switchStream -> host=\(newURL.host ?? "-") userInitiated=\(userInitiated) explicitPick=\(explicitPick) torrent=\(stream.isTorrent ? "Y" : "N")")
         srcProbeLoadStart = Date()   // [src-probe] a source switch is a fresh attempt: re-anchor the elapsed clock
         if userInitiated { close() }
+        // Cleanly destroy the torrent engine we're leaving BEFORE loading the next source, so engines never
+        // pile up on the embedded server (the 0.2.48 RSS-balloon regression). Every in-place transition funnels
+        // through here: a source-row pick, an auto-failover hop, and an episode advance (goToEpisode calls
+        // switchStream). Guarded on a DIFFERENT hash: a season-pack torrent shares one infoHash across every
+        // episode (only the file index differs), and destroy-then-recreate would cold-start warm-up at 0 peers,
+        // so a same-hash episode switch keeps the live engine. currentTorrentHash reads curURL, so it must be
+        // evaluated before curURL is overwritten just below. No-op for a direct/debrid source (no hash).
+        if let oldHash = currentTorrentHash, oldHash != stream.infoHash?.lowercased() {
+            closeTorrent(hash: oldHash)
+        }
         let resume = resumeOverride ?? (hasStartedPlaying ? currentTime : resumeSeconds)
         curURL = newURL
         curHeaders = stream.requestHeaders
@@ -1882,7 +1947,7 @@ struct PlayerScreen: View {
         scrubThumbnails.configure(localCacheKey: trickplayLocalCacheKey)
         lastLocalTrickplayCapture = -1000; localTrickplayCaptureInFlight = false
         configureCommunityTrickplayProvisional()
-        appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; appliedVolume = false   // re-apply saved volume to the new engine
+        appliedSize = false; appliedAutoTracks = false; autoAddonSubTried = false; userPickedSubtitle = false; addonSubsResolveTried = false; appliedVolume = false   // re-apply saved volume to the new engine
         hasStartedPlaying = false; isSeekable = true; buffering = true; loadErrorMsg = ""
         autoRetryCount = 0; reconnecting = false; autoRetryTask?.cancel(); awaitedFreshSources = false
         torrentWarmupsUsed = 0; torrentStatus = nil   // a new source is a fresh torrent → its own warm-up budget
@@ -1956,7 +2021,11 @@ struct PlayerScreen: View {
             .buttonStyle(.plain)
         }
         .padding(16)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        // Floating Up Next card over the video tail: Liquid Glass on OS 26, the frosted material on older
+        // systems. Non-interactive (the card is a surface; its own buttons stay pressable).
+        .glassChrome(in: RoundedRectangle(cornerRadius: 18, style: .continuous)) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous).fill(.ultraThinMaterial)
+        }
         .frame(maxWidth: 480)
         .padding(.horizontal, 24).padding(.bottom, 96)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
@@ -1994,7 +2063,10 @@ struct PlayerScreen: View {
             guard let es = resolved else {
                 reconnecting = false; buffering = false
                 srcProbe("goToEpisode(\(videoId)) resolve returned nil (autoAdvance=\(autoAdvance ? "Y" : "N"))")
-                if autoAdvance { onClose() }            // nothing playable on auto-advance: leave, don't hang on a spinner
+                if autoAdvance {
+                    if let h = currentTorrentHash { closeTorrent(hash: h) }   // terminal exit: free the finished episode's engine (no-op for direct/debrid)
+                    onClose()            // nothing playable on auto-advance: leave, don't hang on a spinner
+                }
                 else { loadErrorMsg = "Couldn't load that episode"; withAnimation { loadFailed = true } }   // surface it: render loadErrorOverlay instead of silently continuing the old episode
                 return
             }
@@ -2180,6 +2252,9 @@ struct PlayerScreen: View {
                 showExternalChooser = true
             }
         }
+        // The trailing transport discs sit shoulder to shoulder; group them so OS 26 blends the glass into
+        // one continuous bar instead of a run of isolated discs. Passthrough (unchanged layout) below 26.
+        .glassChromeCluster()
         .padding(.horizontal).padding(.top, 8)
     }
 
@@ -2779,7 +2854,10 @@ struct PlayerScreen: View {
     private func iconButton(_ systemName: String, label: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: systemName).font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.white).padding(11).background(.black.opacity(0.35), in: Circle())
+                .foregroundStyle(.white).padding(11)
+                // Floating transport chrome over the video: Liquid Glass on OS 26, the dark scrim disc on
+                // older systems. Interactive glass since these are pressable controls.
+                .glassChrome(in: Circle(), interactive: true) { Circle().fill(.black.opacity(0.35)) }
                 .frame(width: 44, height: 44).contentShape(Circle())   // min 44pt tap target (#30)
         }
         .accessibilityLabel(label)
@@ -2863,18 +2941,41 @@ struct PlayerScreen: View {
 
     private func fetchAddonSubtitles() {
         guard let m = curMeta else { return }
-        let key = "\(m.type):\(m.videoId)"
-        guard key != addonSubsKey else { return }
-        let addons = account.addons
         // The account's add-on collection loads async at app start; a playback that begins before it lands
-        // would latch an EMPTY list for the whole session (add-on subtitles "gone"). Leave the key unlatched
-        // so the panel-open retry (openPanel) fetches once the add-ons have arrived.
+        // would latch an EMPTY list for the whole session (add-on subtitles "gone"). Bail before touching the
+        // key so the panel-open retry (openPanel) fetches once the add-ons have arrived.
+        let addons = account.addons
         guard !addons.isEmpty else { return }
+        // A hub / TMDB-catalog play carries a `tmdb:` library id that OpenSubtitles-class add-ons cannot answer,
+        // so the raw id returns nothing and add-on subtitles never appear. Resolve tmdb -> tt ONCE (the same
+        // persistent trickplay resolver), then re-enter with the tt id. A failed resolve falls through to the
+        // raw-id path below exactly once (= today's behavior); addonSubsResolveTried keeps it loop-proof.
+        if m.libraryId.lowercased().hasPrefix("tmdb:"),
+           CommunityTrickplay.cachedIMDbID(for: m.libraryId) == nil,
+           !addonSubsResolveTried {
+            addonSubsResolveTried = true
+            Task { @MainActor in
+                _ = await CommunityTrickplay.resolveIMDbID(rawId: m.libraryId, seriesHint: m.season != nil)
+                fetchAddonSubtitles()      // cache hit now, or raw-id fallback below exactly once
+                fetchPooledSubtitles()     // re-key the pooled path under the resolved identity (see communityContentKey)
+            }
+            return
+        }
+        // Rewrite the tmdb: prefix of the query id to the resolved tt id when we have one; all other ids pass
+        // through unchanged. "tmdb:456:1:2" -> "tt789:1:2".
+        let effectiveVideoId: String = {
+            guard m.libraryId.lowercased().hasPrefix("tmdb:"),
+                  let tt = CommunityTrickplay.cachedIMDbID(for: m.libraryId),
+                  m.videoId.hasPrefix(m.libraryId) else { return m.videoId }
+            return tt + m.videoId.dropFirst(m.libraryId.count)
+        }()
+        let key = "\(m.type):\(effectiveVideoId)"
+        guard key != addonSubsKey else { return }
         addonSubsKey = key
         addonSubs = []; addedSubURLs = []
         Task { @MainActor in
-            let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: m.videoId)
-            guard addonSubsKey == key else { return }   // episode changed mid-fetch
+            let subs = await SubtitleAddonService.fetch(addons: addons, type: m.type, videoId: effectiveVideoId)
+            guard addonSubsKey == key else { return }   // episode changed / re-keyed mid-fetch
             addonSubs = subs
             VXProbe.log("subs", "add-on subtitles listed count=\(subs.count)")
             if panel == .subtitles { panelRows = rows(for: .subtitles) }
@@ -2892,7 +2993,8 @@ struct PlayerScreen: View {
     /// forced-only policies via TrackSelector.wantsExternalSubtitle, and fails SOFT: an auto-load failure just
     /// leaves subtitles off (no subtitleLoadFailed alert; the user did not ask for this download).
     private func autoSelectAddonSubtitleIfNeeded() {
-        guard appliedAutoTracks, !autoAddonSubTried, !addonSubs.isEmpty, subtitleLoadingURL == nil else { return }
+        guard appliedAutoTracks, !autoAddonSubTried, !userPickedSubtitle,
+              !(addonSubs.isEmpty && pooledSubs.isEmpty), subtitleLoadingURL == nil else { return }
         // Whether to pull an add-on sub is decided ENTIRELY by wantsExternalSubtitle (does any EMBEDDED track
         // match the preferred language chain). A stale or off-chain embedded selection must NOT short-circuit
         // this: a default English track being auto-selected while the viewer wants Turkish was latching the
@@ -2903,19 +3005,37 @@ struct PlayerScreen: View {
             autoAddonSubTried = true
             return
         }
+        // Tier 1 - installed subtitle add-ons. Walk the preference chain in priority order (same tolerant
+        // language match the embedded selector uses, so "tur"/"tr-TR" still hit a "tr" preference).
         var pick: AddonSubtitle?
         for lang in prefs.subtitleLanguages {
             if let s = addonSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pick = s; break }
         }
-        guard let sub = pick else { autoAddonSubTried = true; return }
-        autoAddonSubTried = true
-        subtitleLoadingURL = sub.url
-        coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
-            subtitleLoadingURL = nil
-            if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
-            refreshSoon()
-            VXProbe.log("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok ? "Y" : "N"))")
+        if let sub = pick {
+            autoAddonSubTried = true
+            subtitleLoadingURL = sub.url
+            coordinator.player?.addExternalSubtitle(url: sub.url, title: sub.addonName, lang: sub.lang) { ok in
+                subtitleLoadingURL = nil
+                if ok { addedSubURLs.insert(sub.url); hoardAddonSubtitle(sub) }
+                refreshSoon()
+                VXProbe.log("subs", "subs selected \(langName(sub.lang)) (add-on auto ok=\(ok ? "Y" : "N"))")
+            }
+            return
         }
+        // Tier 2 - community-pooled subtitles, when no add-on had the chain language. Same tolerant match.
+        var pooledPick: SubtitlePoolClient.PooledSubtitle?
+        for lang in prefs.subtitleLanguages {
+            if let s = pooledSubs.first(where: { TrackSelector.matches($0.lang, lang) }) { pooledPick = s; break }
+        }
+        if let sub = pooledPick {
+            autoAddonSubTried = true
+            VXProbe.log("subs", "subs selected \(langName(sub.lang)) (community auto)")
+            selectPooledSubtitle(sub, auto: true)   // shared path: moat-gated download -> addExternalSubtitle -> addedPooledIDs; no alert on auto failure
+            return
+        }
+        // No chain match. Latch only once BOTH async lists have arrived (each completion re-calls this), so a
+        // pooled list landing after an empty add-on list still gets its turn.
+        if !addonSubs.isEmpty && !pooledSubs.isEmpty { autoAddonSubTried = true }
     }
 
     // MARK: - Community subtitles (pool + sync + embedded upload)
@@ -2924,6 +3044,14 @@ struct PlayerScreen: View {
     /// Live streams and titles with no imdb id return nil, no-oping the whole community-subtitle path.
     private var communityContentKey: String? {
         guard let m = curMeta, !effectivelyLive else { return nil }
+        // A tmdb-backed play carries a `tmdb:` library id; feeding it straight into contentKey mints a bogus
+        // `tt<tmdb-number>` via the bare-digit fallback. Route those through the persistent tmdb->tt resolver
+        // cache instead: nil until it resolves (the whole community path no-ops rather than running under a wrong
+        // identity), then the correct tt key. fetchAddonSubtitles' post-resolve fetchPooledSubtitles() re-keys it.
+        if m.libraryId.lowercased().hasPrefix("tmdb:") {
+            guard let tt = CommunityTrickplay.cachedIMDbID(for: m.libraryId) else { return nil }
+            return SubtitleReleaseFingerprint.contentKey(imdbId: tt, season: m.season, episode: m.episode)
+        }
         return SubtitleReleaseFingerprint.contentKey(imdbId: m.libraryId, season: m.season, episode: m.episode)
     }
 
@@ -2967,6 +3095,9 @@ struct PlayerScreen: View {
             guard communityContentKey == contentKey else { return }   // title changed mid-fetch
             pooledSubs = result.subs
             VXProbe.log("subs", "community subtitles listed count=\(result.subs.count)")
+            // The pooled list can land AFTER autoSelectTracks already ran (and after an empty add-on list): give
+            // the language-chain auto-select its turn on these candidates too (guards above keep it safe).
+            autoSelectAddonSubtitleIfNeeded()
             // P3 seed: apply the community-learned offset ONCE (seconds). Works on BOTH engines now: libmpv
             // maps it to `sub-delay`; the AVPlayer engine applies it as the offset on the external-subtitle
             // overlay it renders itself (a no-op until an external cue set is loaded, then it lands correctly).
@@ -2984,7 +3115,9 @@ struct PlayerScreen: View {
 
     /// P2: load a pooled subtitle into the player, reusing the exact external-subtitle path (download to a
     /// local file, then mpv `sub-add`). Shows the shared Loading… row state. Fail-soft.
-    private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle) {
+    /// `auto`: a background language-chain pick (autoSelectAddonSubtitleIfNeeded tier 2), which suppresses the
+    /// subtitleLoadFailed alert on failure, matching the add-on auto path and tvOS (the user did not ask).
+    private func selectPooledSubtitle(_ sub: SubtitlePoolClient.PooledSubtitle, auto: Bool = false) {
         guard subtitleLoadingURL == nil else { return }
         let marker = sub.url.absoluteString
         subtitleLoadingURL = marker
@@ -2993,7 +3126,8 @@ struct PlayerScreen: View {
         Task { @MainActor in
             // The pool-hosted sub TEXT is moat-gated too, so pass the same account flag the fetch used.
             guard let localURL = await SubtitlePoolClient.download(sub, isSignedIn: VortXSyncManager.shared.isSignedIn) else {
-                subtitleLoadingURL = nil; subtitleLoadFailed = true
+                subtitleLoadingURL = nil
+                if !auto { subtitleLoadFailed = true }
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
                 return
             }
@@ -3001,7 +3135,7 @@ struct PlayerScreen: View {
             coordinator.player?.addExternalSubtitle(url: localURL.absoluteString, title: title, lang: sub.lang) { ok in
                 subtitleLoadingURL = nil
                 VXProbe.log("subs", "community subtitle loaded lang=\(sub.lang) ok=\(ok ? "Y" : "N")")
-                if ok { addedPooledIDs.insert(sub.id) } else { subtitleLoadFailed = true }
+                if ok { addedPooledIDs.insert(sub.id) } else if !auto { subtitleLoadFailed = true }
                 if panel == .subtitles { panelRows = rows(for: .subtitles) }
             }
         }
@@ -3225,10 +3359,12 @@ struct PlayerScreen: View {
             return rs
         case .subtitles:
             var rs: [Row] = [Row(label: String(localized: "Off"), selected: subtitleTracks.allSatisfy { !$0.selected }) {
+                userPickedSubtitle = true
                 VXProbe.log("subs", "selected track off")
                 coordinator.player?.setSubtitleTrack(-1)
             }]
             rs += groupedTrackRows(subtitleTracks) { id in
+                userPickedSubtitle = true
                 VXProbe.log("subs", "selected embedded track \(id)")
                 coordinator.player?.setSubtitleTrack(id)
             }
@@ -3245,6 +3381,7 @@ struct PlayerScreen: View {
                         // until the track arrives (or an alert surfaces if it never does). A cached subtitle
                         // reuses its on-disk file and loads instantly (no network).
                         guard subtitleLoadingURL == nil else { return }
+                        userPickedSubtitle = true
                         subtitleLoadingURL = sub.url
                         VXProbe.log("subs", "add-on subtitle selected lang=\(sub.lang) src=\(sub.addonName)")
                         if panel == .subtitles { panelRows = rows(for: .subtitles) }   // reflect Loading… in place
@@ -3266,6 +3403,7 @@ struct PlayerScreen: View {
                 for sub in pooled.prefix(30) {
                     let loading = subtitleLoadingURL == sub.url.absoluteString
                     rs.append(Row(label: pooledLabel(sub), detail: loading ? String(localized: "Loading…") : String(localized: "Community")) {
+                        userPickedSubtitle = true
                         selectPooledSubtitle(sub)
                     })
                 }
@@ -3605,6 +3743,10 @@ struct PlayerScreen: View {
             // mirroring the EOF branch; 0.9 is the engine's own CREDITS threshold.
             if let m = curMeta, currentTime / duration >= 0.9 { core.finishedWatching(libraryId: m.libraryId) }
         }
+        // Free the live torrent engine on a GENUINE user exit (this chokepoint, plus the terminal EOF
+        // finishers), never in onDisappear: a SwiftUI teardown can fire onDisappear without the user leaving,
+        // and tearing the engine down there would kill a live swarm mid-play. No-op for direct/debrid.
+        if let hash = currentTorrentHash { closeTorrent(hash: hash) }
         // Wipe the configurable on-disk streaming cache for the title that just finished/closed, so a
         // completed movie or episode never leaves its buffer on disk (the owner's clear-on-finish
         // guardrail). No-op when the disk cache is off or empty. Genuine-exit path only; additive,
@@ -3690,10 +3832,10 @@ struct PlayerScreen: View {
         guard !audio.isEmpty || !subs.isEmpty else { return }   // nothing container-derived to say
         langContributeDone = true
 
-        // A tmdb-backed play carries a `tmdb:` library id. communityContentKey must NOT be used for it: the
-        // fingerprint's bare-digit fallback turns `tmdb:12345` into a bogus `tt12345`, which would be POSTed to
-        // the language index under a wrong (and possibly colliding) key. So resolve tmdb -> tt FIRST for those,
-        // and only fall through to the direct key for real tt / other ids.
+        // A tmdb-backed play carries a `tmdb:` library id. communityContentKey is now tmdb-safe, but it only
+        // reads the resolver CACHE and returns nil on a miss. The language index wants the strongest signal even
+        // for a title seen for the first time, so resolve tmdb -> tt HERE (cache, then network) and only fall
+        // through to the direct communityContentKey for real tt / other ids.
         if let m = curMeta, !effectivelyLive, m.libraryId.lowercased().hasPrefix("tmdb:") {
             let rawId = m.libraryId
             let season = m.season, episode = m.episode

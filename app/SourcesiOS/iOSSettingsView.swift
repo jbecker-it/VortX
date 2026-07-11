@@ -41,7 +41,6 @@ struct iOSSettingsView: View {
     @State private var didCopyLAN = false
     #endif
 
-    @AppStorage("stremiox.forceSDRTonemap") private var forceSDRTonemap = false
     @AppStorage("stremiox.hdrToneMapMode") private var hdrToneMapMode = "auto"   // auto / on / off
     @AppStorage(SubtitleStyle.Key.font) private var subFont = SubtitleStyle.defaultFont
     @AppStorage(SubtitleStyle.Key.size) private var subSize = SubtitleStyle.defaultSize
@@ -214,7 +213,7 @@ struct iOSSettingsView: View {
                         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
                         let items = try LibraryPortability.decode(from: try Data(contentsOf: url))
                         let target = profiles.active?.name ?? String(localized: "this profile")
-                        Task {
+                        Task { @MainActor in
                             let result = await profiles.importLibraryItems(items)
                             var message = "\(result.applied) \(result.applied == 1 ? "title" : "titles") added to \(target)."
                             if result.skipped > 0 {
@@ -498,10 +497,10 @@ struct iOSSettingsView: View {
             #if os(iOS)
             Toggle("Landscape in player", isOn: $autoLandscapeInPlayer)
                 .tint(Theme.Palette.accent)
-            if !PlaybackSettings.directLinksOnlyForced {
-                Toggle("Keep playing in background", isOn: $keepPlayingInBackground)
-                    .tint(Theme.Palette.accent)
-            }
+            // Background playback applies to debrid and direct streams too, not only the bundled torrent
+            // engine, so it is offered whether or not this build forces direct-links-only.
+            Toggle("Keep playing in background", isOn: $keepPlayingInBackground)
+                .tint(Theme.Palette.accent)
             #endif
             if !installedExternalPlayers.isEmpty {
                 Picker("Play in", selection: $defaultExternalPlayer) {
@@ -553,11 +552,39 @@ struct iOSSettingsView: View {
                 showDiagExport = true
             }
             .tint(Theme.Palette.accent)
+            // Direct save/share of the same rolling log, with no QR and no second device: the native share
+            // sheet offers Files, AirDrop, and Mail (macOS gets the share menu). Additive to the QR path
+            // above, which stays. Offered whenever the log file has content, regardless of the toggle, so a
+            // user who turned logging off after capturing can still hand it over (matching the QR path, which
+            // serves whatever bytes are on disk). Only when no capture has ever happened does a guidance
+            // button explain how to produce a log, so we never hand over a nonexistent or empty file.
+            if let logURL = diagLogExportURL {
+                ShareLink("Save or share log", item: logURL)
+                    .tint(Theme.Palette.accent)
+            } else {
+                Button("Save or share log") {
+                    backupAlert = BackupAlert(title: String(localized: "No Diagnostic Log Yet"),
+                        message: String(localized: "Turn on Diagnostic logging, reproduce the issue, then export the log."))
+                }
+                .tint(Theme.Palette.accent)
+            }
         } header: {
             Text("Advanced (mpv options)")
         } footer: {
             Text("For power users; one option=value per line. Applied on top of VortX's defaults the next time a video starts.")
         }
+    }
+
+    /// The rolling diagnostic log to hand to the share sheet, or nil when the log is empty/missing. Keyed on
+    /// file content, not on VXProbe.enabled, so turning Diagnostic logging off after a capture still lets the
+    /// user save what was recorded (the QR export path serves the same bytes with no toggle gate). Gating on
+    /// the file size the way exportActiveLibrary guards its empty case means it never shares a nonexistent or
+    /// empty file; nil drives the guidance button instead.
+    private var diagLogExportURL: URL? {
+        let url = VXProbe.logFileURL
+        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize, size > 0 else { return nil }
+        return url
     }
 
     /// QR export sheet for the diagnostic log: the phone scans the code, downloads vortx-diag.log over the
@@ -1003,7 +1030,7 @@ struct iOSSettingsView: View {
                 Text("Twice daily").tag("twiceDaily")
                 Text("4x daily").tag("fourTimesDaily")
             }
-            NavigationLink("Reorder streaming services") { iOSReorderServicesView() }
+            NavigationLink("Streaming services") { iOSReorderServicesView() }
             NavigationLink("Discover & region") { iOSDiscoverSettingsView() }
             // Fold Search into Discover (one combined surface with a search field above the browse) so the
             // tab bar is less cluttered on mobile. Default OFF, fully reversible — Search returns as its own tab.

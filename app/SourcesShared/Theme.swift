@@ -325,11 +325,13 @@ struct CircleIconDisc: View {
             .font(.system(size: diameter * 0.42, weight: .semibold))
             .foregroundStyle(tint)
             .frame(width: diameter, height: diameter)
-            .background(
+            // Floating chrome over the hero art: Liquid Glass on OS 26, the frosted material + warm tint
+            // on older systems. The hairline and hit shape ride on top of whichever fill renders.
+            .glassChrome(in: Circle(), interactive: true) {
                 Circle()
                     .fill(.ultraThinMaterial)
                     .overlay(Circle().fill(Theme.Palette.canvas.opacity(0.28)))
-            )
+            }
             .overlay(Circle().strokeBorder(Theme.Palette.textPrimary.opacity(0.10), lineWidth: 1))
             .contentShape(Circle())
     }
@@ -414,5 +416,68 @@ struct MetaBadge: View {
                 RoundedRectangle(cornerRadius: 5, style: .continuous)
                     .strokeBorder(Theme.Palette.textTertiary.opacity(0.6), lineWidth: 1)
             )
+    }
+}
+
+// MARK: - Liquid Glass (OS 26 floating-chrome material, gated with a fallback)
+
+/// Apple's Liquid Glass belongs on CHROME that floats OVER content: the player transport buttons, the hero
+/// back / overflow discs, floating pills and cards. It never goes on scrolling content, poster art, or an
+/// opaque background. Every use here is gated to OS 26 with the app's current material / fill as the older
+/// fallback, and it stands down to that same fallback whenever Reduce Transparency is on, so the chrome
+/// stays legible. Matches the existing player-button idiom in TVPlayerView (`glassEffect(.regular, in:)`).
+struct GlassChromeModifier<GlassShape: Shape, Fallback: View>: ViewModifier {
+    let shape: GlassShape
+    let interactive: Bool
+    let fallback: Fallback
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), !reduceTransparency {
+            if interactive {
+                // Interactive glass reacts to touch / pointer. tvOS drives chrome from the remote, not a
+                // cursor, so it keeps the plain regular variant that the existing player buttons use.
+                #if os(tvOS)
+                content.glassEffect(.regular, in: shape)
+                #else
+                content.glassEffect(.regular.interactive(), in: shape)
+                #endif
+            } else {
+                content.glassEffect(.regular, in: shape)
+            }
+        } else {
+            content.background { fallback }
+        }
+    }
+}
+
+/// Groups adjacent glass chrome so OS 26 blends the panes into one continuous glass surface instead of a
+/// run of isolated discs. Passthrough (no layout change) below OS 26 and under Reduce Transparency.
+struct GlassChromeClusterModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @ViewBuilder func body(content: Content) -> some View {
+        if #available(iOS 26.0, tvOS 26.0, macOS 26.0, *), !reduceTransparency {
+            GlassEffectContainer { content }
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Swap a floating-chrome element's MATERIAL layer for Liquid Glass on OS 26, keeping `fallback`
+    /// (the element's current material / fill, already shaped) on older systems and under Reduce
+    /// Transparency. `interactive` opts a pressable control into the interactive glass variant.
+    func glassChrome<GlassShape: Shape, Fallback: View>(
+        in shape: GlassShape,
+        interactive: Bool = false,
+        @ViewBuilder fallback: () -> Fallback
+    ) -> some View {
+        modifier(GlassChromeModifier(shape: shape, interactive: interactive, fallback: fallback()))
+    }
+
+    /// Wrap a row of adjacent glass chrome so the panes blend on OS 26. No-op below OS 26.
+    func glassChromeCluster() -> some View {
+        modifier(GlassChromeClusterModifier())
     }
 }

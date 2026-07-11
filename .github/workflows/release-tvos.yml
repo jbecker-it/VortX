@@ -144,23 +144,105 @@ jobs:
       - name: Generate the Xcode project
         run: cd app && xcodegen generate
 
+      # Derive the masked edge secret and inject it into every app build.
+      #
+      # WHY THE APP GETS A MASKED BLOB WHILE THE WORKERS HOLD RAW HEX. The VortX edge workers
+      # (skip / trickplay / ratings / ...) authenticate a request with HMAC-SHA256 whose key is the
+      # UTF-8 bytes of a 64-char hex string, so they hold the RAW hex. The app must not ship that hex
+      # as a findable literal, so VortXEdgeAuth carries a MASKED blob (XOR with a code-assembled mask,
+      # then base64) in Info.plist and de-masks it at launch. That is two encodings of ONE secret, for
+      # two different consumers.
+      #
+      # We keep a SINGLE source of truth: the VORTX_EDGE_SECRET repo secret holds the raw hex, and CI
+      # derives the masked blob here by compiling the app's OWN VortXEdgeAuth.swift with a tiny driver,
+      # so the derivation can never drift from the runtime de-mask. The value is derived, never stored
+      # twice. A fork or PR build has no secret: the driver reports EMPTY, we inject nothing, and request
+      # signing stays a harmless observe-mode no-op (the workers accept unsigned requests today). An
+      # already-masked stored value is detected and passed through unchanged; a value that is neither
+      # 64-hex nor a valid masked blob falls back to an empty secret with a warning, never failing the
+      # build. The derived blob is add-masked before it reaches $GITHUB_OUTPUT so it never hits the log.
+      - name: Derive the masked edge secret
+        id: edge_secret
+        env:
+          VORTX_EDGE_SECRET: ${{ secrets.VORTX_EDGE_SECRET }}
+        run: |
+          cat > "$RUNNER_TEMP/vxmask_driver.swift" <<'SWIFT'
+          import Foundation
+          // Reads the candidate edge secret from the environment, classifies its stored form, and prints
+          // two lines: FORM (EMPTY | RAW | MASKED | INVALID) then the masked blob to inject (empty for
+          // EMPTY / INVALID). Compiling against the app's own VortXEdgeAuth keeps this in lockstep with
+          // the runtime de-mask.
+          @main
+          enum VXMaskDriver {
+              static func isHex64(_ s: String) -> Bool {
+                  return s.count == 64 && s.allSatisfy { $0.isHexDigit }
+              }
+              // Recover the 32-byte mask through the app's own maskedValue(): it XORs the UTF-8 bytes of
+              // its input with the repeating mask, so feeding 32 NUL bytes yields base64(mask) exactly.
+              // The mask is private in the source; reconstructing it via the public helper means the
+              // derivation cannot drift from the runtime.
+              static func recoverMask() -> [UInt8] {
+                  let zeros = String(repeating: "\u{0}", count: 32)
+                  guard let data = Data(base64Encoded: VortXEdgeAuth.maskedValue(for: zeros)) else { return [] }
+                  return Array(data)
+              }
+              // Reproduce the runtime de-mask: base64-decode, XOR with the repeating mask, UTF-8 decode.
+              static func demask(_ masked: String) -> String? {
+                  guard let blob = Data(base64Encoded: masked), !blob.isEmpty else { return nil }
+                  let mask = recoverMask()
+                  guard !mask.isEmpty else { return nil }
+                  var out = [UInt8](); out.reserveCapacity(blob.count)
+                  for (i, b) in blob.enumerated() { out.append(b ^ mask[i % mask.count]) }
+                  return String(bytes: out, encoding: .utf8)
+              }
+              static func main() {
+                  let raw = (ProcessInfo.processInfo.environment["VORTX_EDGE_SECRET"] ?? "")
+                      .trimmingCharacters(in: .whitespacesAndNewlines)
+                  if raw.isEmpty {
+                      print("EMPTY"); print("")
+                  } else if isHex64(raw) {
+                      print("RAW"); print(VortXEdgeAuth.maskedValue(for: raw))
+                  } else if let demasked = demask(raw), isHex64(demasked) {
+                      print("MASKED"); print(raw)
+                  } else {
+                      print("INVALID"); print("")
+                  }
+              }
+          }
+          SWIFT
+          swiftc -O app/SourcesShared/VortXEdgeAuth.swift "$RUNNER_TEMP/vxmask_driver.swift" -o "$RUNNER_TEMP/vxmask"
+          "$RUNNER_TEMP/vxmask" > "$RUNNER_TEMP/vxmask.out"
+          FORM="$(sed -n '1p' "$RUNNER_TEMP/vxmask.out")"
+          MASKED="$(sed -n '2p' "$RUNNER_TEMP/vxmask.out")"
+          case "$FORM" in
+            EMPTY)   echo "edge secret: none provided, building with empty secret (request signing disabled, observe-safe)" ;;
+            RAW)     echo "edge secret: raw-hex form detected, deriving masked value" ;;
+            MASKED)  echo "edge secret: masked form detected, passing through" ;;
+            *)       echo "::warning::edge secret is neither 64-hex nor a valid masked blob; building with empty secret, request signing will be disabled" ;;
+          esac
+          if [ -n "$MASKED" ]; then echo "::add-mask::$MASKED"; fi
+          echo "masked=$MASKED" >> "$GITHUB_OUTPUT"
+
       - name: Build tvOS (Full)
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTV \
             -configuration Release -destination 'generic/platform=tvOS' \
-            -derivedDataPath app/build/ci CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath app/build/ci CODE_SIGNING_ALLOWED=NO \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
 
       - name: Build tvOS (Lite)
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXTVLite \
             -configuration Release -destination 'generic/platform=tvOS' \
-            -derivedDataPath app/build/ci-lite CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath app/build/ci-lite CODE_SIGNING_ALLOWED=NO \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
 
       - name: Build iOS
         run: |
           xcodebuild -project app/VortX.xcodeproj -scheme VortXiOSNative \
             -configuration Release -destination 'generic/platform=iOS' \
-            -derivedDataPath app/build/ci-ios CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath app/build/ci-ios CODE_SIGNING_ALLOWED=NO \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
 
       - name: Build macOS
         run: |
@@ -171,7 +253,8 @@ jobs:
           xcodebuild -project app/VortX.xcodeproj -scheme VortXMac \
             -configuration Release -destination 'platform=macOS,arch=arm64' \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath app/build/ci-mac CODE_SIGNING_ALLOWED=NO \
+            VORTX_EDGE_SECRET="${{ steps.edge_secret.outputs.masked }}" build
 
       - name: Package the IPAs
         run: |

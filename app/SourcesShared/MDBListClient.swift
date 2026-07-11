@@ -15,11 +15,13 @@ struct MDBListRatings: Equatable {
     let imdb: Double?
     /// Rotten Tomatoes critics percentage 0-100 (MDBList source "tomatoes"), when present.
     let rottenTomatoes: Int?
+    /// Metacritic metascore 0-100 (MDBList source "metacritic"), when present.
+    let metacritic: Int?
     /// TMDB user score percentage 0-100, when present.
     let tmdb: Int?
 
     /// True when at least one provider rating is present, i.e. there is something to render.
-    var hasAny: Bool { imdb != nil || rottenTomatoes != nil || tmdb != nil }
+    var hasAny: Bool { imdb != nil || rottenTomatoes != nil || metacritic != nil || tmdb != nil }
 }
 
 enum MDBListClient {
@@ -50,6 +52,7 @@ enum MDBListClient {
             let ratings = MDBListRatings(
                 imdb: bySource["imdb"],
                 rottenTomatoes: bySource["tomatoes"].map { Int($0.rounded()) },
+                metacritic: bySource["metacritic"].map { Int($0.rounded()) },
                 tmdb: bySource["tmdb"].map { Int($0.rounded()) }
             )
             return ratings.hasAny ? ratings : nil

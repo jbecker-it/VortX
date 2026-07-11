@@ -69,6 +69,18 @@ final class MPVMetalViewController: PlatformViewController {
     /// The forward-cache cap (`demuxer-max-bytes`, option-string form) loadFile applied for the CURRENT
     /// file, so the paused-cache clamp can restore it on resume. nil until the first load.
     private var activeReadAheadCap: String?
+    /// The back-buffer cap (`demuxer-max-back-bytes`) every file starts with on this platform: the
+    /// setupMpv pre-load default. shedForMemoryPressure drops the live option to 8MiB for the rest of the
+    /// CURRENT file, and nothing else re-applied it for LATER files on the same instance (loadFile's clamp
+    /// reset only restored the forward cap, and configureLiveMode(false) skips its write when consecutive
+    /// loads are both non-live), so every post-shed load inherited the shrunken seek-back buffer. loadFile
+    /// re-applies this default per non-live file in its clamp-reset block; live keeps configureLiveMode's
+    /// own tight value.
+    #if os(macOS)
+    private let defaultBackBufferCap = "64MiB"
+    #else
+    private let defaultBackBufferCap = "24MiB"
+    #endif
     /// Pending "still paused after the grace period" cache clamp; cancelled on resume / new load / stop.
     private var pausedCacheClampWork: DispatchWorkItem?
     /// True while the paused clamp holds `demuxer-max-bytes` at the small floor (restored on resume).
@@ -376,7 +388,7 @@ final class MPVMetalViewController: PlatformViewController {
         if !startMuted { configureAudioSession() }
         mpv = mpv_create()
         if mpv == nil {
-            print("failed creating context\n")
+            mpvLog.error("failed creating mpv context")
             exit(1)
         }
 
@@ -465,13 +477,13 @@ final class MPVMetalViewController: PlatformViewController {
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "300"))
 #if os(macOS)
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "64MiB"))
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", defaultBackBufferCap))
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "256MiB"))
 #else
         // iOS/tvOS: the server is in-process and jetsam-bound and its RSS includes these mpv buffers, so
         // keep the back-buffer (already-played, for seek-back) small. The per-file demuxer-max-bytes below
         // overrides the forward cache; this init is just the pre-load default.
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", "24MiB"))
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", defaultBackBufferCap))
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", "128MiB"))
 #endif
 
@@ -498,15 +510,17 @@ final class MPVMetalViewController: PlatformViewController {
         // burst saturated the network + demuxer + decoder — so the audio output underran repeatedly,
         // heard as several seconds of crackly/distorted audio with video lagging until the cache caught
         // up. The avfoundation AO is also known upstream to drop 30+ frames each time it resumes from an
-        // underrun (mpv-player/mpv#16346), which compounds the visible lag. `cache-pause-initial` holds
-        // playback in the normal buffering state after every start/seek until `cache-pause-wait` seconds
-        // are cached, so playback resumes ONCE, cleanly, instead of stuttering through the refill; the
-        // deeper `audio-buffer` gives the AO slack to ride out the burst's CPU spikes without
-        // underrunning. tvOS-only: iOS/macOS ride the audiounit/coreaudio AOs and don't show this. The
-        // muted hero-preview instance keeps mpv defaults so its ambient clip still starts instantly.
+        // underrun (mpv-player/mpv#16346), which compounds the visible lag. Only the deeper `audio-buffer`
+        // is set globally here: it just grows a buffer, giving the AO slack to ride out the refill burst's
+        // CPU spikes without underrunning. The cache hold itself (`cache-pause-initial` +
+        // `cache-pause-wait`) is deliberately NOT set at setup: applied globally it held EVERY playback
+        // start in the buffering state and doubled every ordinary mid-play rebuffer's wait. Instead
+        // armSeekCacheHold() toggles the hold on immediately before the seeks that actually empty the
+        // cache (scrub commits and the track-change refresh-seeks), and the pausedForCache=false edge in
+        // the event drain releases it once playback has resumed. tvOS-only: iOS/macOS ride the
+        // audiounit/coreaudio AOs and don't show this. The muted hero-preview instance keeps mpv defaults
+        // so its ambient clip still starts instantly.
         if !startMuted {
-            checkError(mpv_set_option_string(mpv, "cache-pause-initial", "yes"))
-            checkError(mpv_set_option_string(mpv, "cache-pause-wait", "2"))
             checkError(mpv_set_option_string(mpv, "audio-buffer", "0.5"))
         }
 #endif
@@ -695,7 +709,14 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     #if canImport(UIKit)
+    /// Whether playback was actually playing when we backgrounded, so `enterForeground` resumes only a title
+    /// that was playing and never un-pauses one the user paused (or one that never started).
+    private var wasPlayingBeforeBackground = false
+
     @objc public func enterBackground() {
+        // Remember the play state BEFORE we pause below, so foregrounding does not silently resume a
+        // user-paused title.
+        wasPlayingBeforeBackground = mpv != nil && !getFlag(MPVProperty.pause)
         // Always drop video decode (fixes the black screen on return and saves GPU). On iOS, whether
         // AUDIO keeps going is the keep-alive choice (#74): continuing audio holds the AVAudioSession
         // active so iOS won't suspend the app and freeze the embedded streaming server mid-stream; opting
@@ -713,15 +734,19 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     @objc public func enterForeground() {
-        // Reclaim the session in case another app deactivated it while we were backgrounded,
-        // then re-evaluate the audio route (it may have changed off-screen).
-        do { try AVAudioSession.sharedInstance().setActive(true) } catch {
-            mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
+        // A silent hero preview never claimed the audio session (setupMpv skips configureAudioSession when
+        // startMuted), so it must not reactivate the session or reapply the channel policy here either.
+        if !startMuted {
+            // Reclaim the session in case another app deactivated it while we were backgrounded,
+            // then re-evaluate the audio route (it may have changed off-screen).
+            do { try AVAudioSession.sharedInstance().setActive(true) } catch {
+                mpvLog.error("AVAudioSession reactivate on foreground failed: \(error.localizedDescription, privacy: .public)")
+            }
+            applyChannelPolicy()
         }
-        applyChannelPolicy()
         checkError(mpv_set_property_string(mpv, "vid", "auto"))   // runtime toggle: property, not option (no-op post-init)
         applyVideoSize { self.setString($0, $1) }   // re-apply size after the rebuild
-        play()
+        if wasPlayingBeforeBackground { play() }   // only resume a title that was actually playing
     }
 
     /// The (channels, sampleRate) last pushed to mpv, so a route-change storm does not reinit the
@@ -839,7 +864,6 @@ final class MPVMetalViewController: PlatformViewController {
         var playURL = url
         var sidecar = audioSidecar
         var args = [playURL.absoluteString]
-        var options = [String]()
 
         args.append("replace")
 
@@ -979,10 +1003,17 @@ final class MPVMetalViewController: PlatformViewController {
         pausedCacheClampWork?.cancel(); pausedCacheClampWork = nil
         pausedCacheClamped = false
         memoryCacheClamped = false
-
-        if !options.isEmpty {
-            args.append(options.joined(separator: ","))
-        }
+        // Restore the back-buffer for the new file too. shedForMemoryPressure dropped
+        // `demuxer-max-back-bytes` to 8MiB and, unlike the forward cap re-applied above, nothing put it
+        // back for later files on this instance (configureLiveMode(false) skips its write when
+        // consecutive loads are both non-live), so every post-shed load started with the shrunken
+        // seek-back buffer. Live stays untouched: configureLiveMode(live) above owns its tight 8MiB.
+        if !live { setString("demuxer-max-back-bytes", defaultBackBufferCap) }
+        #if os(tvOS)
+        // A seek cache hold armed by a seek that never dipped into pausedForCache has no release edge:
+        // drop it here so a lingering `cache-pause-initial=yes` can never hold THIS file's start.
+        releaseSeekCacheHoldIfArmed()
+        #endif
 
         // Log only scheme://host/path: debrid and direct-CDN URLs carry API tokens / signed queries in the
         // userinfo and query string, which must not land in the device's persistent unified log.
@@ -1227,13 +1258,52 @@ final class MPVMetalViewController: PlatformViewController {
     }
 
     func seek(to seconds: Double) {
+        #if os(tvOS)
+        armSeekCacheHold()   // absolute jumps (scrub commits and friends) land outside the buffered window and empty the forward cache
+        #endif
         command("seek", args: [String(seconds), "absolute"])
     }
 
-    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right.
+    /// Relative seek (e.g. -10 / +10), used by the tvOS remote's left/right. Small hops usually stay
+    /// inside the buffered window, so no cache hold is armed for these.
     func seek(by seconds: Double) {
         command("seek", args: [String(format: "%.1f", seconds), "relative"])
     }
+
+    #if os(tvOS)
+    /// True while the one-shot post-seek cache hold is armed for an in-flight cache-emptying seek
+    /// (a scrub commit, or the demuxer refresh-seek an audio/subtitle track change triggers).
+    /// Main-thread only: armed from the UI's seek/track calls, released via a main hop from the
+    /// event drain (mirroring pausedStateChanged).
+    private var seekCacheHoldArmed = false
+
+    /// Arm the post-seek cache hold for the seek about to be issued: hold playback in the normal
+    /// buffering state until `cache-pause-wait` seconds are cached, so the avfoundation AO resumes
+    /// ONCE on a refilled cache instead of stuttering through the refill (the crackly/distorted
+    /// audio after scrubs and track changes; see the setupMpv comment). One-shot by design: setting
+    /// these options globally at setup held EVERY playback start and doubled every ordinary mid-play
+    /// rebuffer's wait. Released by releaseSeekCacheHoldIfArmed() once playback resumes (the
+    /// pausedForCache=false edge), and defensively by loadFile so a lingering hold can never slow a
+    /// fresh start. The muted hero-preview instance never arms, so its ambient clip keeps starting
+    /// instantly.
+    private func armSeekCacheHold() {
+        guard !startMuted, mpv != nil else { return }
+        seekCacheHoldArmed = true
+        setString("cache-pause-initial", "yes")
+        setString("cache-pause-wait", "2")
+    }
+
+    /// Put the cache-pause options back to their fast defaults once the held seek's playback has
+    /// resumed (or, from loadFile, before a fresh start: a hold armed by a seek that never dipped
+    /// into pausedForCache would otherwise linger onto the next file).
+    private func releaseSeekCacheHoldIfArmed() {
+        guard seekCacheHoldArmed else { return }
+        seekCacheHoldArmed = false
+        guard mpv != nil else { return }
+        setString("cache-pause-initial", "no")
+        setString("cache-pause-wait", "1")
+    }
+    #endif
 
     private func getDouble(_ name: String) -> Double {
         guard mpv != nil else { return 0.0 }
@@ -1306,8 +1376,18 @@ final class MPVMetalViewController: PlatformViewController {
         }
     }
 
-    func setAudioTrack(_ id: Int) { setString(MPVProperty.aid, id < 0 ? "no" : String(id)) }
-    func setSubtitleTrack(_ id: Int) { setString(MPVProperty.sid, id < 0 ? "no" : String(id)) }
+    func setAudioTrack(_ id: Int) {
+        #if os(tvOS)
+        armSeekCacheHold()   // an aid change triggers a demuxer refresh-seek that discards + re-reads the forward cache
+        #endif
+        setString(MPVProperty.aid, id < 0 ? "no" : String(id))
+    }
+    func setSubtitleTrack(_ id: Int) {
+        #if os(tvOS)
+        armSeekCacheHold()   // a sid change triggers the same demuxer refresh-seek as an audio switch
+        #endif
+        setString(MPVProperty.sid, id < 0 ? "no" : String(id))
+    }
 
     /// Session-lived map of add-on subtitle URL -> already-downloaded LOCAL file. Once a subtitle has been
     /// fetched, re-selecting that track or re-opening the same episode hands the on-disk file straight to mpv
@@ -1747,6 +1827,14 @@ final class MPVMetalViewController: PlatformViewController {
                             VXProbeState.shared.setPlayer(buffering: buffering)
                             VXProbe.event("player", "buffering \(buffering ? "start" : "end")")
                             self.emit(propertyName, buffering)
+                            #if os(tvOS)
+                            // Seek cache hold: buffering just ended, so the held seek's refill reached
+                            // cache-pause-wait and playback resumed. Release the one-shot hold back to
+                            // the fast defaults (main hop, mirroring pausedStateChanged below).
+                            if !buffering {
+                                DispatchQueue.main.async { [weak self] in self?.releaseSeekCacheHoldIfArmed() }
+                            }
+                            #endif
                         case MPVProperty.duration:
                             if let value = UnsafePointer<Double>(OpaquePointer(property.data))?.pointee {
                                 VXProbeState.shared.setPlayer(dur: Int(value))
@@ -1856,8 +1944,11 @@ final class MPVMetalViewController: PlatformViewController {
                         if !text.isEmpty { self.mpvLog.log("[\(prefix, privacy: .public)/\(level, privacy: .public)] \(text, privacy: .private)") }
                     }
                 default:
-                    let eventName = mpv_event_name(event!.pointee.event_id )
-                    print("event: \(String(cString: (eventName)!))");
+                    #if DEBUG
+                    let eventName = mpv_event_name(event!.pointee.event_id)
+                    print("event: \(String(cString: eventName!))")
+                    #endif
+                    break
                 }
                 
             }
@@ -1867,7 +1958,7 @@ final class MPVMetalViewController: PlatformViewController {
     
     private func checkError(_ status: CInt) {
         if status < 0 {
-            print("MPV API error: \(String(cString: mpv_error_string(status)))\n")
+            mpvLog.error("MPV API error: \(String(cString: mpv_error_string(status)), privacy: .public)")
         }
     }
     

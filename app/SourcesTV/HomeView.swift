@@ -29,6 +29,13 @@ struct HomeView: View {
     }
 
     var body: some View {
+        homeChangeHandlers
+    }
+
+    /// The Home shell: the hero backdrop, the rail strip, and the header overlay. Split out of
+    /// `body` so the change-handler chain applied over it (see `homeChangeHandlers`) type-checks
+    /// as its own expression.
+    private var homeShell: some View {
         NavigationStack {
             ZStack {
                 // The living backdrop: whichever poster is focused fills the screen with its
@@ -129,11 +136,29 @@ struct HomeView: View {
             }
             .background(Theme.Palette.canvas.ignoresSafeArea())
         }
+    }
+
+    // The `.onAppear` plus nine `.onChange` handlers used to hang off `body` as one chain, which
+    // overran the SwiftUI type checker's budget. They are applied in two passes across `some View`
+    // boundaries below so each group type-checks as its own expression; triggers and closures are
+    // unchanged, and the pass order preserves the original modifier order.
+
+    /// First pass: initial seed on appear, plus the row / Continue Watching / profile re-seed triggers.
+    private var homeSeedHandlers: some View {
+        homeShell
         .onAppear { configureMetaSources(); seed(); refreshTopPicks(); refreshReleaseCalendar(); if showCollectionsHub { collectionsHub.load() } }
         .onChange(of: showCollectionsHub) { show in if show { collectionsHub.load() } }   // no clear() on toggle-off: render is gated on showCollectionsHub, and clear() blanked the shared hub for Discover too
         .onChange(of: core.boardRows.first?.id) { seed() }
         .onChange(of: core.continueWatching.first?.id) { seed(); refreshTopPicks() }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems`, not the engine, so its own
+        // plays must also re-seed the hero and Top Picks (the engine-CW onChange above never fires for them).
+        .onChange(of: profiles.cwItems.first?.id) { seed(); refreshTopPicks() }
         .onChange(of: profiles.activeID) { seed(); refreshTopPicks() }
+    }
+
+    /// Second pass: the release-calendar / meta-source triggers and the focus-settled hero trailer.
+    private var homeChangeHandlers: some View {
+        homeSeedHandlers
         // Rebuild "Upcoming Episodes" when the library changes (a new follow) or the meta add-ons hydrate
         // — the same two inputs the model sweeps over. The bases come from `account.addons`, which loads
         // async after sign-in, so key on its count too (matching the notification sweep's input set).
@@ -475,8 +500,9 @@ struct CoreContinueWatchingRow: View {
                     // provenance so the play-record re-stores it and the NEXT resume can reresolve again.
                     NSLog("[cw-probe] tv directResume: svc=%@ hash=%@ fileIdx=%@ reresolve=FRESH path=exact-source", service.rawValue, hashShort, entry.fileIdx.map(String.init) ?? "-")
                     bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
+                    let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
                     presenter.request = PlaybackRequest(
-                        url: resolvedURL, title: entry.title, meta: meta, episodes: [],
+                        url: resolvedURL, title: entry.title, meta: meta, episodes: eps,
                         sourceHint: entry.qualityText, torrent: false,
                         bingeGroup: entry.bingeGroup, headers: entry.headers,
                         debridRef: DebridPlaybackRef(url: resolvedURL, service: service, infoHash: hash,
@@ -495,12 +521,29 @@ struct CoreContinueWatchingRow: View {
                 if bridge.metaDetails?.meta?.id != item.id || bridge.streamGroups(forStreamId: entry.videoId).isEmpty {
                     bridge.loadMeta(type: entry.type, id: item.id, streamType: entry.type, streamId: entry.videoId)
                 }
+                let eps = await prefetchEpisodes(bridge, itemID: item.id, entryType: entry.type)
                 presenter.request = PlaybackRequest(
                     url: resolvedURL, title: entry.title, meta: meta,
-                    episodes: [], sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
+                    episodes: eps, sourceHint: entry.qualityText, torrent: entry.torrent ?? false,
                     headers: entry.headers, wasResume: true)
             }
         }
+    }
+
+    /// Direct-resume episode prefetch (mirrors iOSRootView's CW-resume prefetch): hand the player its
+    /// episode list BEFORE it mounts so auto-advance never depends on the in-player backfill race.
+    /// Bounded ~1.5s; a miss returns [] and playback starts exactly as today (the player's own loader
+    /// plus the EOF last-chance retry remain the backstop). The raw unsorted videos are byte-equivalent
+    /// to what the in-player backfill sets (loadedEpisodes = vids), the proven 0.3.11 behavior.
+    @MainActor
+    private func prefetchEpisodes(_ bridge: CoreBridge, itemID: String, entryType: String) async -> [CoreVideo] {
+        guard entryType == "series" else { return [] }
+        for _ in 0 ..< 6 {
+            if let meta = bridge.metaDetails?.meta, meta.id == itemID,
+               let vids = meta.videos, !vids.isEmpty { return vids }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return []
     }
 }
 

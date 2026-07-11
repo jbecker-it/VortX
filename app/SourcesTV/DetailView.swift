@@ -35,6 +35,8 @@ struct DetailView: View {
     /// `features.languageIndex`, rendered only when non-empty. `langChipsKey` de-dupes the compute.
     @State private var langChips: [(code: String, label: String)] = []
     @State private var langChipsKey = ""
+    @State private var langChipsDebounce: Task<Void, Never>? = nil
+    private static let langChipsDebounceMs = 400   // settle window before the off-main name/regex parse, mirrors coalesceMs intent
     /// yt-direct: the ambient hero trailer's ATTEMPTED device-direct resolve, keyed by meta id so a stale
     /// resolve never paints over another title. `url == nil` = attempted, no direct stream (mount the /yt
     /// worker URL). The layer waits for the attempt so the clip never remounts mid-play on a late resolve.
@@ -110,6 +112,7 @@ struct DetailView: View {
             refreshLanguageChips()
         }
         .onDisappear {
+            langChipsDebounce?.cancel()
             // Scrolling the series episode list auto-hides the tab bar at the UIKit level. When the
             // user presses Back the NavigationStack pops but the bar can stay hidden at its scroll-
             // suppressed position. Heal it the same way the player-close path does.
@@ -153,29 +156,35 @@ struct DetailView: View {
         // Gate the whole compute (incl. the TMDB spoken_languages verify fetch) on the master feature flag, so
         // it is a hard no-op when off rather than relying only on the per-client internal no-ops.
         guard LanguageIndexClient.isEnabled, let contentKey = languageContentKey else { return }
-        // AGGREGATE across EVERY loaded source (all add-ons), scanning BOTH `name` AND `description` per stream:
-        // add-ons split the release name and the audio/sub language tags across the two fields, so `name ??
-        // description` under-labelled a lazy add-on. Taking both widens the union of tokens (MULTI, DUAL,
-        // KOR+ENG, audio/sub tags) we can see for this title.
-        let names: [String] = core.streamGroups()
-            .flatMap { $0.streams }
-            .flatMap { [$0.name, $0.description] }
-            .compactMap { $0 }
-            .filter { !$0.isEmpty }
-        let key = "\(contentKey)#\(names.count)"
+        // Cheap main-thread dedup: an integer stream count, NO per-stream string/regex work. The O(N) name
+        // flatten + the ~10^5-regex audioSubCodes parse both move off the main thread below, so this gate can
+        // no longer stall the render even when it fires per loaded tick.
+        let snapshot = core.streamGroups()                     // value-type COW snapshot, O(1)
+        let streamCount = snapshot.reduce(0) { $0 + $1.streams.count }
+        let key = "\(contentKey)#\(streamCount)"
         guard key != langChipsKey else { return }
         langChipsKey = key
-
-        // Split into AUDIO vs SUBTITLE claims per stream context: a bare release-name language word is an audio
-        // claim (verified below); a code from a subtitle-marked string (vostfr, "ESubs", ...) is a subtitle
-        // claim (kept). This split is what lets the verify drop a FALSE audio claim without dropping real subs.
-        let observed = LanguageIndexClient.audioSubCodes(fromNames: names)
         let imdb = ratingsImdbID
-        Task { @MainActor in
+        let mediaType = type
+        langChipsDebounce?.cancel()                            // supersede any in-flight settle
+        langChipsDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.langChipsDebounceMs))
+            guard !Task.isCancelled, languageContentKey == contentKey else { return }   // title switched during settle
+            // AGGREGATE across EVERY loaded source (all add-ons), scanning BOTH `name` AND `description` per
+            // stream, then split into AUDIO vs SUBTITLE claims. The heavy flatten + regex parse runs OFF the
+            // main thread; audioSubCodes is pure/static so it is safe to call from the detached task.
+            let observed = await Task.detached(priority: .utility) { () -> (audio: [String], sub: [String]) in
+                let names = snapshot.flatMap { $0.streams }
+                    .flatMap { [$0.name, $0.description] }
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                return LanguageIndexClient.audioSubCodes(fromNames: names)
+            }.value
+            guard languageContentKey == contentKey else { return }
             // Community index + TMDB spoken_languages fetched in PARALLEL: the two verification sources. Both
             // fail soft to nil (no signal), so a missing source never falsely contradicts an audio claim.
             async let availabilityTask = LanguageIndexClient.fetch(contentKey: contentKey)
-            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: type)
+            async let spokenTask = TMDBClient.spokenLanguages(imdbID: imdb, type: mediaType)
             let availability = await availabilityTask
             let tmdbSpoken = await spokenTask
             guard languageContentKey == contentKey else { return }   // title switched mid-fetch
@@ -186,12 +195,12 @@ struct DetailView: View {
                                                                       observedSub: observed.sub,
                                                                       availability: availability,
                                                                       tmdbSpoken: tmdbSpoken)
-        }
-        Task.detached {
-            await LanguageIndexClient.contribute(contentKey: contentKey,
-                                                 audioLangs: observed.audio,
-                                                 subLangs: observed.sub,
-                                                 provenance: "name")
+            Task.detached {
+                await LanguageIndexClient.contribute(contentKey: contentKey,
+                                                     audioLangs: observed.audio,
+                                                     subLangs: observed.sub,
+                                                     provenance: "name")
+            }
         }
     }
 
@@ -247,8 +256,20 @@ struct DetailView: View {
     private func loadRatings() {
         guard !LiveTypes.contains(type), let imdb = ratingsImdbID, mdbRatings == nil else { return }
         Task {
-            let r = await MDBListClient.ratings(imdbID: imdb, type: type)
-            await MainActor.run { mdbRatings = r }
+            // VortX's keyless ratings service first (IMDb / RT / Metacritic / TMDB, no user key needed), then
+            // reach for the user's own MDBList key ONLY to fill what VortX did not return. Mirrors iOS so both
+            // surfaces show the same ratings row for every user, keyed or not (tvOS previously showed nothing
+            // unless an MDBList key was set).
+            let vx = await VortXRatingsClient.ratings(imdbID: imdb, type: type)
+            let needsMore = vx == nil || vx?.rottenTomatoes == nil || vx?.metacritic == nil
+            let mdb = needsMore ? await MDBListClient.ratings(imdbID: imdb, type: type) : nil
+            let merged = MDBListRatings(
+                imdb: vx?.imdb ?? mdb?.imdb,
+                rottenTomatoes: vx?.rottenTomatoes ?? mdb?.rottenTomatoes,
+                metacritic: vx?.metacritic ?? mdb?.metacritic,
+                tmdb: vx?.tmdb ?? mdb?.tmdb
+            )
+            await MainActor.run { mdbRatings = merged.hasAny ? merged : nil }
         }
     }
 
@@ -304,7 +325,9 @@ struct DetailView: View {
         let metaResident = core.metaDetails?.meta?.id == id
         guard metaResident || id.hasPrefix("tt") else { return }
         let streamId = movieStreamId
-        let hasStreams = core.metaDetails?.streams.contains { $0.request.path.id == streamId } ?? false
+        // Either surface counts as resident: meta-embedded streams (metaStreams, #122) are keyed by the
+        // same stream path id, and their presence means the engine already selected this id.
+        let hasStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == streamId } ?? false
         guard !hasStreams else { return }
         if effectiveType != type { NSLog("[detail] stream type corrected: hub-guess=%@ -> meta=%@ id=%@", type, effectiveType, id) }
         core.loadMeta(type: effectiveType, id: id, streamType: effectiveType, streamId: streamId)
@@ -398,12 +421,18 @@ struct DetailView: View {
                     HStack(spacing: Theme.Space.md) {
                         ForEach(avail.providers) { provider in
                             VStack(spacing: 6) {
+                                // TMDB watch-provider marks are dark / brand-hued app icons that read as
+                                // "very dark" drawn straight on the app's dark chrome (#95). Sit each mark on
+                                // the shared warm near-white plate (the same treatment the Streaming Services
+                                // tiles and RemoteLogo use) with a small inset, so a dark logo stays legible
+                                // and whole instead of blending into the background.
                                 AsyncImage(url: URL(string: provider.logoURL ?? "")) { img in
-                                    img.resizable().scaledToFit()
+                                    img.resizable().scaledToFit().padding(56 * BundledLogo.plateInsetFraction)
                                 } placeholder: {
                                     RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous).fill(Theme.Palette.surface1)
                                 }
                                 .frame(width: 56, height: 56)
+                                .background(BundledLogo.plateFill)
                                 .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
                                 Text(provider.name)
                                     .font(Theme.Typography.label)
@@ -489,6 +518,14 @@ struct DetailView: View {
     /// DOWN past the action band. This is the standard first-party tvOS detail pattern; it fixes the cut-off
     /// Watch button (H12) and removes the upward focus trap (H15) because the first screen's focus chain is
     /// fixed. The focus engine itself is untouched: only layout containers and a Spacer were added.
+    ///
+    /// 5a/6a (build 171): the bottom-anchor only holds while the first-screen content fits one viewport; a
+    /// long synopsis grew the block past `firstScreenHeight`, collapsed the flexible Spacer, and pushed the
+    /// Watch band DOWN (owner: "the button moves") AND scrolled the band into a region tvOS could not project
+    /// focus back UP from, re-trapping the path to the tab bar (the H15 regression). The description is now
+    /// clamped to a FIXED reserved line count, so its length can no longer change where the band lands: the
+    /// Watch button holds one position across titles and the first-screen focus chain (Watch -> tab bar
+    /// upward) stays fixed. Still non-focusable, so the focus engine is untouched.
     private func moviePage(_ m: CoreMetaItem) -> some View {
         ZStack {
             FullBleedBackdrop(url: m.background ?? m.poster)
@@ -507,10 +544,16 @@ struct DetailView: View {
                             financialsRow()
                             releaseDatesRow()
                             if let d = m.description, !d.isEmpty {
+                                // 5a/6a (build 171): reserve space for a FIXED 3 lines (was an elastic 4)
+                                // so a short synopsis occupies the SAME height as a long one. The block above
+                                // the action band is now length-independent, so the bottom-anchored Watch
+                                // button holds one position across every title and the first screen can no
+                                // longer overflow into a scrolled state that traps the upward focus path.
+                                // Non-focusable, so Watch keeps default focus and the up-path is untouched.
                                 Text(d)
                                     .font(Theme.Typography.body)
                                     .foregroundStyle(Theme.Palette.textSecondary)
-                                    .lineLimit(4).lineSpacing(2)
+                                    .lineLimit(3, reservesSpace: true).lineSpacing(2)
                                     .frame(maxWidth: 1000, alignment: .leading)
                             }
                         }
@@ -520,7 +563,8 @@ struct DetailView: View {
                             languageChips
                             HStack(spacing: Theme.Space.sm) { trailerChip(m) }
                             CoreStreamList(title: m.name,
-                                           meta: PlaybackMeta(libraryId: m.id, videoId: m.id, type: type,
+                                           meta: PlaybackMeta(libraryId: m.id, videoId: m.id,
+                                                              type: m.type.isEmpty ? effectiveType : m.type,
                                                               name: m.name, poster: m.poster,
                                                               season: nil, episode: nil),
                                            imdbId: ratingsImdbID)
@@ -900,9 +944,10 @@ struct DetailView: View {
         .foregroundStyle(Theme.Palette.textSecondary)
     }
 
-    /// Compact MDBList ratings row ("IMDb 8.5  ·  RT 92%  ·  TMDB 78%"), shown only when the user has set
-    /// an MDBList key AND ratings came back. Renders nothing otherwise (no error UI). Same typography as
-    /// metaRow so it reads as a second fact line under the title.
+    /// Compact cross-provider ratings row ("IMDb 8.5  ·  RT 92%  ·  MC 81  ·  TMDB 78%"), fed by the VortX
+    /// ratings service (no user key needed), with the user's MDBList key filling any gap. Shown only when
+    /// ratings came back; renders nothing otherwise (no error UI). Non-focusable, same typography as metaRow
+    /// so it reads as a second fact line under the title and never disturbs the first-screen focus chain.
     @ViewBuilder private func ratingsRow() -> some View {
         if let text = mdbRatings.flatMap(Self.ratingsText), !text.isEmpty {
             Text(text)
@@ -916,6 +961,7 @@ struct DetailView: View {
         var parts: [String] = []
         if let v = r.imdb { parts.append("IMDb \(imdbFmt.string(from: NSNumber(value: v)) ?? String(v))") }
         if let v = r.rottenTomatoes { parts.append("RT \(v)%") }
+        if let v = r.metacritic { parts.append("MC \(v)") }
         if let v = r.tmdb { parts.append("TMDB \(v)%") }
         return parts.isEmpty ? nil : parts.joined(separator: "  ·  ")
     }
@@ -1074,6 +1120,7 @@ struct CoreSeasonedEpisodes: View {
     @EnvironmentObject private var presenter: PlayerPresenter   // observe the player closing (#7 return-to-episode)
     @State private var season: Int = 1
     @State private var didApplyInitial = false   // once the initial-season hint lands (or the user taps a season), stop re-applying it
+    @State private var seasonClampPending = false   // the next season change is the programmatic validity clamp, not a real pick, so it must not lock the hint
     @FocusState private var focusedEpisode: String?   // drives focus (and tvOS auto-scroll) to the current episode
     // Cached so a re-render (watch-state updates arrive often) does not re-filter and
     // re-sort the episode list every time. seasons depends only on the immutable
@@ -1157,9 +1204,12 @@ struct CoreSeasonedEpisodes: View {
             DispatchQueue.main.async { focusedEpisode = id }
         }
         .onChange(of: season) {
-            // Any season change (a manual tap, OR our own programmatic apply below) locks the auto-pick, so a
-            // later videos-arrived pass never clobbers the season you chose.
-            didApplyInitial = true
+            // A manual tap or the programmatic preferred-season apply locks the auto-pick, so a later
+            // videos-arrived pass never clobbers the season you chose. The validity CLAMP below is exempt:
+            // it is a stopgap while episodes stream in, and locking on it would shut out a not-yet-loaded
+            // Continue-Watching hint before it can land.
+            if seasonClampPending { seasonClampPending = false }
+            else { didApplyInitial = true }
             recomputeEpisodes()
         }
         // A series' `videos` often stream in AFTER this panel first renders, so the season/episode lists built
@@ -1180,7 +1230,10 @@ struct CoreSeasonedEpisodes: View {
                 season = preferred   // triggers onChange(season) -> didApplyInitial = true
             }
         }
-        if !seasons.contains(season) { season = seasons.first { $0 > 0 } ?? seasons.first ?? 1 }
+        if !seasons.contains(season) {
+            let clamped = seasons.first { $0 > 0 } ?? seasons.first ?? 1
+            if clamped != season { seasonClampPending = true; season = clamped }
+        }
         recomputeEpisodes()
     }
 
@@ -1327,7 +1380,7 @@ struct CoreEpisodeStreams: View {
                         }
                     }
                     CoreStreamList(title: "\(meta.name) · S\(season)·E\(video.episode ?? 0)",
-                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: "series",
+                                   meta: PlaybackMeta(libraryId: meta.id, videoId: video.id, type: meta.type,
                                                       name: meta.name, poster: meta.poster,
                                                       season: video.season, episode: video.episode),
                                    episodes: episodes,
@@ -1409,6 +1462,12 @@ struct FullBleedBackdrop: View {
 
 /// The per-addon stream list from the engine: source filter chips + each addon's streams shown
 /// exactly as the addon labelled them (name + full description), with direct/debrid vs torrent.
+/// A stable-identity source row: a content id (`CoreStream.id`) plus an occurrence index disambiguates
+/// duplicate streams that share the same id, so the ~4/sec republish no longer reassigns every row's identity
+/// (which stranded the tvOS focus handle and defeated Lazy diffing). Built bounded to the render window, so the
+/// per-row string work stays capped no matter how many thousand sources a title returns.
+private struct SourceRow: Identifiable { let id: String; let addon: String; let stream: CoreStream }
+
 struct CoreStreamList: View {
     let title: String
     var meta: PlaybackMeta? = nil
@@ -1420,7 +1479,15 @@ struct CoreStreamList: View {
     @EnvironmentObject private var core: CoreBridge
     @EnvironmentObject private var theme: ThemeManager
     @State private var sourceFilter: String? = nil
+    @State private var sourceRefreshDebounce: Task<Void, Never>? = nil
+    private static let sourceRefreshDebounceMs = 400   // trailing settle for the add-on load storm, mirrors coalesceMs intent
     @State private var showAllSources = false   // the full ranked list is revealed on demand (Watch-Now first)
+    // Render only the top N ranked rows at a time; a popular title returns 4000+ sources and instantiating
+    // every row (even lazily) plus reassigning identity ~4x/sec starved the tvOS focus engine. "Show more"
+    // grows the window by a step. Ranking + auto-pick still run over the FULL list; this caps RENDERING only.
+    @State private var sourceRenderLimit = Self.sourceWindowInitial
+    private static let sourceWindowInitial = 100
+    private static let sourceWindowStep = 100
     @State private var showQualityPicker = false   // level 1: pick a resolution tier
     @State private var qualityTier: String? = nil  // level 2: pick a flavor inside that tier
     @State private var settleTimedOut = false      // opens the Watch-Now gate even if an add-on hangs
@@ -1510,6 +1577,24 @@ struct CoreStreamList: View {
         let best = sourceList.best
         let streamCount = groups.reduce(0) { $0 + $1.streams.count }
         let visible = groups.filter { sourceFilter == nil || $0.addon == sourceFilter }
+        // Window the RENDERED rows: build at most `sourceRenderLimit` stable-id rows from the visible groups,
+        // stopping the moment the budget is hit (bounded string work, no matter how many thousand sources land).
+        // Ranking + auto-pick (playBest below) still read the FULL `groups`, never these windowed rows, so
+        // Watch-Now always picks the GLOBAL best, not the best of the first 100.
+        var seen: [String: Int] = [:]
+        var rows: [SourceRow] = []
+        rows.reserveCapacity(sourceRenderLimit)
+        buildRows: for g in visible {
+            for s in g.streams {
+                let base = s.id
+                let n = seen[base, default: 0]; seen[base] = n + 1
+                rows.append(SourceRow(id: "\(base)#\(n)", addon: g.addon, stream: s))
+                if rows.count >= sourceRenderLimit { break buildRows }
+            }
+        }
+        let shownRows = rows
+        let visibleCount = visible.reduce(0) { $0 + $1.streams.count }   // total in the filtered view, for "Show more"
+        let hasMore = visibleCount > shownRows.count
         let addons = core.streamLoadProgress()                       // (loaded, total) stream add-ons
         let loadingAddons = addons.total == 0 || addons.loaded < addons.total
 
@@ -1545,7 +1630,6 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(PrimaryActionStyle())
                     .opacity(watchReady ? 1 : 0.55)
-                    .contextMenu { resolutionMenu(groups) }
                     .focused($watchFocused)   // FIX H: target of the page's default focus
 
                     // The visible quality dropdown, two levels: resolution tier first (4K / 1080p /
@@ -1555,7 +1639,7 @@ struct CoreStreamList: View {
                     }
                     .buttonStyle(ChipButtonStyle())
                     .confirmationDialog("Pick a quality", isPresented: $showQualityPicker, titleVisibility: .visible) {
-                        ForEach(StreamRanking.tiers(groups), id: \.self) { tier in
+                        ForEach(sourceList.tiers, id: \.self) { tier in
                             Button(tier) {
                                 Task { @MainActor in
                                     try? await Task.sleep(nanoseconds: 250_000_000)   // let level 1 dismiss first
@@ -1604,15 +1688,22 @@ struct CoreStreamList: View {
                 }
                 if showAllSources {
                     if groups.count > 1 { filterBar(groups, total: streamCount) }
-                    // LazyVStack so only on-screen rows are built: a popular title can return 2000+ sources,
-                    // and a plain VStack instantiated them all at once, OOM-crashing the Apple TV mid-load.
+                    // LazyVStack so only on-screen rows are built; the window caps how many rows exist at all,
+                    // keeping the focus tree small. Rows carry a stable content id (SourceRow), so the ~4/sec
+                    // republish no longer reshuffles the focus handle mid-scroll.
                     LazyVStack(spacing: Theme.Space.sm) {
-                        ForEach(visible) { group in
-                            ForEach(Array(group.streams.enumerated()), id: \.offset) { _, stream in
-                                streamRow(group.addon, stream)
+                        ForEach(shownRows) { row in streamRow(row.addon, row.stream) }
+                        if hasMore {
+                            Button { sourceRenderLimit += Self.sourceWindowStep } label: {
+                                Label("Show more · \(visibleCount - shownRows.count) more", systemImage: "chevron.down")
                             }
+                            .buttonStyle(ChipButtonStyle())
                         }
                     }
+                    // The source column is its own focus section, so "Show more" stays reachable and a press
+                    // can't dump focus to the tab bar. The Watch-Now default-focus seat sits ABOVE this section,
+                    // outside it, so seating is unaffected.
+                    .focusSection()
                 }
             } else if loadingAddons {
                 // Searching: a focusable, primary-styled loading button (focus can't escape to the tab bar
@@ -1658,19 +1749,15 @@ struct CoreStreamList: View {
         // Debrid cache awareness: as add-ons answer (the load count climbs), check which raw torrents the
         // user's debrid account has cached. `refresh` de-dups by the hash set, so this only hits a provider
         // when the torrents change; with no debrid key it returns an empty set and nothing renders or re-ranks.
-        .onChange(of: core.streamLoadProgress().loaded) { _ in
-            // Unfiltered: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
-            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
-            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-            refreshSourceIndex()   // SERVE + HOARD the community source index as more sources answer
-        }
+        .onChange(of: core.streamLoadProgress().loaded) { _ in scheduleSourceRefresh() }
         // The Singularity pool answers asynchronously (a network fetch), so re-run the debrid cache check when
         // its streams arrive: this is what lets a pooled torrent's infoHash be checked against the user's own
         // debrid account (and a pooled nzb against their TorBox) and then RESOLVE per-user, not just render.
-        .onChange(of: sourceIndex.streams.count) { _ in
-            debridCache.refresh(from: sourceIndex.merged(into: torboxSearch.merged(into: core.streamGroups())))
-        }
+        .onChange(of: sourceIndex.streams.count) { _ in scheduleSourceRefresh() }
+        // Reset the render window when the list collapses (so re-expanding starts fresh at the top) or the
+        // title changes (a new list should not inherit the previous title's expanded window).
+        .onChange(of: showAllSources) { _ in if !showAllSources { sourceRenderLimit = Self.sourceWindowInitial } }
+        .onChange(of: meta?.libraryId) { _ in sourceRenderLimit = Self.sourceWindowInitial }
         // TorBox search-as-a-source: fetch the extra usenet/torrent sources (gated on a TorBox key + de-duped
         // by imdb id inside refresh). Live channels pass nil, so this no-ops for them. Also wires the
         // source-list model to this screen's sources (idempotent; nudges a refresh on re-appear).
@@ -1679,6 +1766,7 @@ struct CoreStreamList: View {
             torboxSearch.refresh(imdbId: imdbId)
             refreshSourceIndex()
         }
+        .onDisappear { sourceRefreshDebounce?.cancel() }
         // First-download storage-eviction warning (#30). Apple TV has no user-visible file system and the
         // OS can reclaim app storage under pressure, so a saved download may be removed by the system. Show
         // this once; on confirm we remember the ack and run the queued download, on cancel we drop it.
@@ -1762,13 +1850,6 @@ struct CoreStreamList: View {
         return DebridEpisode(season: s, episode: e)
     }
 
-    /// Resolution dropdown for the Watch button (long-press): the best source at each available quality.
-    @ViewBuilder private func resolutionMenu(_ groups: [CoreStreamSourceGroup]) -> some View {
-        ForEach(StreamRanking.resolutionOptions(groups), id: \.label) { opt in
-            Button { play(opt.stream) } label: { Label("Watch in \(opt.label)", systemImage: "play.fill") }
-        }
-    }
-
     /// The pool `content_id` for this list: the title's imdb id, plus `:S:E` when the `PlaybackMeta` carries
     /// a season + episode (a series episode list). nil when no imdb id is known (e.g. a live channel).
     private var sourceContentID: String? {
@@ -1783,13 +1864,33 @@ struct CoreStreamList: View {
     /// token that un-gates `sources.vortx.tv` is minted from the VortX session bearer (`VortXSyncManager`), so
     /// a Stremio-only sign-in mints no token and the worker returns an empty `login_required` list. Gate on the
     /// same identity that mints the token so a signed-in VortX user actually sees pooled sources.
-    private func refreshSourceIndex() {
+    private func refreshSourceIndex(torboxMerged: [CoreStreamSourceGroup]? = nil) {
         guard let contentID = sourceContentID else { return }
         let vortxSignedIn = VortXSyncManager.shared.isSignedIn
         sourceIndex.refresh(contentID: contentID, isSignedIn: vortxSignedIn)
-        let groups = torboxSearch.merged(into: core.streamGroups())
+        // Pool-EXCLUDED hoard set: the caller's torbox-base when it already merged one (avoids a second walk),
+        // else self-merge. NEVER the Singularity-pool-inclusive set: hoarding the pool's own results back into
+        // itself would be wrong.
+        let groups = torboxMerged ?? torboxSearch.merged(into: core.streamGroups())
         guard !groups.isEmpty else { return }
         Task.detached { await SourceIndexClient.hoard(contentID: contentID, groups: groups) }
+    }
+
+    /// Trailing-debounced driver for the add-on load storm: the raw `.onChange` fired per add-on completion,
+    /// each doing full O(N) merge walks on main. Coalesce to one pass ~400 ms after the burst settles, and
+    /// compute the torbox-base ONCE so the debrid (pool-inclusive) and hoard (pool-excluded) sets share it.
+    private func scheduleSourceRefresh() {
+        sourceRefreshDebounce?.cancel()
+        sourceRefreshDebounce = Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(Self.sourceRefreshDebounceMs))
+            guard !Task.isCancelled else { return }
+            let torboxBase = torboxSearch.merged(into: core.streamGroups())   // pool-EXCLUDED (hoard set)
+            // Pool-INCLUDED: cache awareness needs the raw torrents / usenet nzbs the Direct-links-only filter
+            // would drop, plus the TorBox search AND Singularity pool sources, so those rows badge AND resolve
+            // through the user's OWN debrid (torrent -> debrid, usenet -> TorBox). Orthogonal to the filter.
+            debridCache.refresh(from: sourceIndex.merged(into: torboxBase))
+            refreshSourceIndex(torboxMerged: torboxBase)   // reuse the same base; no second merge walk
+        }
     }
 
     /// Play a stream by handing a request to the root, which swaps the whole shell out for the player
@@ -1869,7 +1970,7 @@ struct CoreStreamList: View {
                                                     debridRef: DebridPlaybackRef(url: url, service: service,
                                                         infoHash: hash, torrentId: entry.debridTorrentId,
                                                         fileId: entry.debridFileId, fileIdx: entry.fileIdx),
-                                                    wasExplicitPick: true)
+                                                    wasExplicitPick: true, wasResume: true)
                 return
             }
         }

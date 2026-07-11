@@ -1,15 +1,23 @@
 import Foundation
 
 /// A thread-safe, forward-only growing byte buffer for the DV-for-MKV streaming remux (Phase 1). The remux
-/// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the resource
-/// loader (`VortXRemuxResourceLoader`) reads byte ranges out of it to feed AVPlayer.
+/// thread (`VortXMKVRemuxStream`) appends muxed fragmented-MP4 bytes as they are produced; the local HLS
+/// server (`VortXRemuxHLSServer`, the default delivery) reads closed-segment byte ranges out of it, and the
+/// legacy progressive loader (`VortXRemuxResourceLoader`, the rollback path) reads it sequentially.
 ///
 /// Design notes:
-/// - APPEND-ONLY at the head. Bytes are only ever added at the end; nothing already produced is rewritten. This
-///   matches a forward-only stream-copy remux, where the muxer writes fMP4 fragments in order.
-/// - BOUNDED SLIDING WINDOW at the tail. Because the resource loader advertises NO byte-range access
-///   (`isByteRangeAccessSupported = false`), AVPlayer streams the asset strictly sequentially from offset 0 via
-///   one open-ended request, so once a byte has been read it is never re-requested. We therefore drop bytes that
+/// - APPEND-ONLY at the head, with ONE narrow exception. Bytes are almost always added only at the end, matching
+///   a forward-only stream-copy remux that writes fMP4 fragments in order. The exception is `overwrite(at:)`: the
+///   mov muxer (movenc) writes every box with a 32-bit size PLACEHOLDER and later seeks back to patch it once the
+///   box length is known. When a box (chiefly the init `moov`) outgrows the muxer's AVIO buffer, that backpatch
+///   cannot be done in the muxer's own unflushed buffer and must rewrite bytes already stored here. `overwrite`
+///   patches those already-produced bytes in place; it never grows the stream and never advances `producedCount`.
+///   It is only ever used to correct box-size fields the muxer already emitted, so a reader that has not yet been
+///   handed those bytes (the init segment is not served until it is fully indexed) always sees the corrected value.
+/// - BOUNDED SLIDING WINDOW at the tail. Both deliveries consume the stream front-to-back: the legacy loader
+///   advertises NO byte-range access (`isByteRangeAccessSupported = false`) so AVPlayer streams strictly
+///   sequentially from offset 0, and the HLS server only serves CLOSED segments of an append-only EVENT
+///   playlist, so once a byte has been read it is essentially never re-requested. We therefore drop bytes that
 ///   sit well below the reader's low-water mark, keeping only a small re-read floor plus a bounded producer
 ///   lead (the producer BLOCKS in `append` once resident bytes hit floor + lead, so a slow/paused reader can
 ///   never let it run away). This caps RAM at roughly (floor + producer lead) instead of the whole
@@ -39,14 +47,24 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Total bytes produced so far across the whole session (monotonic; NOT storage.count once eviction starts).
     private(set) var producedCount: Int = 0
 
-    /// The re-read floor: how many already-delivered bytes to keep behind the reader's low-water mark before
-    /// evicting. Kept small (a fragment or two) so a benign re-read at the current position still succeeds while
-    /// RAM stays flat. Sourced from RemoteConfig so the fleet can widen it (e.g. for a future seek lane) without
-    /// an app update; clamped to a sane floor here so a bad remote value can never make the window degenerate.
-    private static var windowFloorBytes: Int {
-        let mib = max(4, RemoteConfig.snapshot.dvRemuxWindowMiB)   // never below 4 MiB
-        return mib * 1024 * 1024
-    }
+    /// Design minimum for the re-read window, in MiB: two full HLS segments' worth, i.e. 2 x
+    /// VortXMKVRemuxStream.hlsMaxSegmentBytes (2 x 32 MiB = 64). Keep in lockstep with that constant. This is the
+    /// worst-case concurrent two-segment read skew, so any floor below it can evict a range that is still being
+    /// served on an open connection: the reader's next request then falls below `storageBase`, the HLS
+    /// connection is cut, and AVPlayer demotes Dolby Vision to HDR10. The shipped RemoteConfig default
+    /// (`dvRemuxWindowMiB` = 64) is exactly this value, so this constant is a fleet no-op today; it exists only
+    /// so a pathological remote value can never starve the window below the two-segment minimum.
+    private static let windowFloorMinMiB = 64
+
+    /// The re-read floor (bytes): how many already-delivered bytes to keep behind the reader's low-water mark
+    /// before evicting. Kept small (a fragment or two) so a benign re-read at the current position still
+    /// succeeds while RAM stays flat. Captured ONCE at buffer creation, NOT read per fragment: reading it live
+    /// took `RemoteConfig.snapshot`'s process-wide lock and copied the whole config struct on the DV hot path
+    /// (append per fMP4 fragment, evict per read), contending with the RemoteConfig refresh writer. A mid-play
+    /// fleet dial change only ever took effect on the NEXT playback anyway, so capturing at init changes nothing
+    /// observable. Floored at the two-segment design minimum so a bad remote value can never degenerate the
+    /// window.
+    private let windowFloorBytes: Int = max(VortXRemuxBuffer.windowFloorMinMiB, RemoteConfig.snapshot.dvRemuxWindowMiB) * 1024 * 1024
 
     /// Producer-lead budget on top of the re-read floor. This is the slack the remux thread is allowed to run
     /// ahead of the reader before `append` blocks. Without it the producer (a stream-copy that muxes as fast as
@@ -68,7 +86,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     func append(_ bytes: UnsafePointer<UInt8>, count: Int) {
         guard count > 0 else { return }
         condition.lock()
-        let ceiling = Self.windowFloorBytes + Self.producerLeadBytes
+        let ceiling = windowFloorBytes + Self.producerLeadBytes
         while residentCount >= ceiling && !isFinished {
             condition.wait(until: Date().addingTimeInterval(0.25))
         }
@@ -80,6 +98,34 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         producedCount += count
         condition.signal()
         condition.unlock()
+    }
+
+    /// Patch `count` already-stored bytes at absolute `offset` in place (the muxer's box-size backpatch). Used
+    /// ONLY by the remux thread's seekable custom AVIO: movenc seeks back to a box's start and rewrites its
+    /// 32-bit size once the box length is known, which for a box larger than the muxer's AVIO buffer targets
+    /// bytes that have already been flushed into `storage`. Returns true iff the WHOLE `[offset, offset+count)`
+    /// range is still resident (at/above `storageBase`, at/below `producedCount`) and was patched; false if any
+    /// of it was already evicted below the sliding window, in which case the caller drops the patch, which
+    /// reproduces the pre-seek behaviour exactly (movenc ignored the failed seek and the bytes were never
+    /// written). NEVER appends and NEVER changes `producedCount`: a backpatch only corrects bytes already
+    /// produced. Nothing is served until the init segment is indexed, so every backpatch that matters (the moov
+    /// and its children, all patched before the init is published) is still fully resident when it lands.
+    func overwrite(at offset: Int, bytes: UnsafePointer<UInt8>, count: Int) -> Bool {
+        guard count > 0 else { return true }
+        condition.lock()
+        defer { condition.unlock() }
+        // Must lie fully within the resident, already-produced window. storage always spans exactly
+        // [storageBase, producedCount) (eviction only drops BELOW storageBase, appends only grow the top), so
+        // this bound alone guarantees the byte range is present.
+        guard offset >= storageBase, offset + count <= producedCount else { return false }
+        // `withUnsafeMutableBytes` exposes the LOGICAL content 0-based (it hides `storage.startIndex`), so the
+        // byte at absolute `offset` maps to local index `offset - storageBase`, never a bare `startIndex` add.
+        let local = offset - storageBase
+        storage.withUnsafeMutableBytes { raw in
+            // local + count <= raw.count is guaranteed by the bound above (raw.count == producedCount - storageBase).
+            raw.baseAddress!.advanced(by: local).copyMemory(from: bytes, byteCount: count)
+        }
+        return true
     }
 
     /// Mark the stream complete (the remux loop wrote its trailer). Readers waiting past the end return the
@@ -109,11 +155,25 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         var failure: String?    // non-nil if the remux failed OR the range fell below the evicted window
     }
 
-    /// Snapshot of stream state without blocking. Used by the loader to answer a content-information request
-    /// and to decide whether a data request can be served immediately.
+    /// Snapshot of stream state without blocking. Used by the HLS server's poll loops to detect a remux
+    /// failure, and by the loader to answer a content-information request / decide whether a data request
+    /// can be served immediately.
     func status() -> (produced: Int, finished: Bool, failure: String?) {
         condition.lock(); defer { condition.unlock() }
         return (producedCount, isFinished, failureMessage)
+    }
+
+    /// Copy the first `length` produced bytes, or nil if they are not (or no longer) fully resident from absolute
+    /// offset 0. Used ONCE to publish the HLS init segment (ftyp+moov) after the muxer has backpatched the moov
+    /// size: at that moment nothing has been served yet, so nothing below offset 0 has been evicted and the whole
+    /// init (any size, no fixed-buffer ceiling) is guaranteed present. Non-blocking; the caller treats nil as a
+    /// fail-soft abort of the init scan (the start-watchdog then demotes to libmpv like any other dead mount).
+    func snapshotPrefix(length: Int) -> Data? {
+        guard length > 0 else { return nil }
+        condition.lock(); defer { condition.unlock() }
+        guard storageBase == 0, producedCount >= length, storage.count >= length else { return nil }
+        let lo = storage.startIndex
+        return storage.subdata(in: lo..<(lo + length))
     }
 
     /// Read up to `length` bytes starting at absolute `offset`, BLOCKING until either enough bytes are
@@ -176,7 +236,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
     /// Drop already-delivered bytes so only a `windowFloorBytes` re-read floor remains behind `readHead`.
     /// Caller holds the lock. Keeps `storageBase` and `storage` consistent (storage[0] == absolute storageBase).
     private func evictBelow(_ readHead: Int) {
-        let keepFrom = max(storageBase, readHead - Self.windowFloorBytes)
+        let keepFrom = max(storageBase, readHead - windowFloorBytes)
         let dropCount = keepFrom - storageBase
         guard dropCount > 0, dropCount <= storage.count else { return }
         storage.removeFirst(dropCount)
@@ -187,7 +247,7 @@ final class VortXRemuxBuffer: @unchecked Sendable {
         // Apple TV this class exists to protect. Once the reclaimable prefix reaches the floor, compact:
         // `subdata` copies the retained window into a fresh 0-based buffer and frees the old backing.
         // Amortized ~1x (one window-sized copy per window-sized advance) and it keeps `startIndex` bounded.
-        if storage.startIndex >= Self.windowFloorBytes {
+        if storage.startIndex >= windowFloorBytes {
             storage = storage.subdata(in: storage.startIndex..<storage.endIndex)
         }
         // Resident bytes dropped: wake a producer parked on the high-water mark in `append`.

@@ -256,6 +256,10 @@ final class CoreBridge: ObservableObject {
             // account) keep it. On the next real ctx event refreshAddons re-derives from the tombstone set
             // identically, so this is a pure local echo, not a divergent source of truth.
             refreshAddons()
+            // Also rebuild the board now: no engine event fires on this path, and buildBoardRows filters
+            // the removed add-on's rows via the tombstone set (#121), so the rebuild drops its Home rows
+            // (and the catalog manager entries, which read `allCatalogs`) immediately.
+            rebuildBoardRows()
         }
     }
 
@@ -518,6 +522,9 @@ final class CoreBridge: ObservableObject {
     /// republishes the rail. No-op for overlay profiles (their history never touches the engine).
     func syncLibraryNow() {
         guard ProfileStore.shared.activeUsesEngineHistory else { return }
+        // Signed-out (and anonymous) engines have no authenticated session for SyncLibraryWithAPI to
+        // pull from, so the dispatch was dead weight on every player exit. Skip it.
+        guard isLoggedIn() else { return }
         dispatchCtx(["action": "SyncLibraryWithAPI"])
     }
 
@@ -666,7 +673,11 @@ final class CoreBridge: ObservableObject {
     /// (Engine-lane follow-up: a dedicated typed live-catalog load would avoid hydrating the whole Home
     /// board here, see [[vortx-engine-needs]] #7 IPTV + the source-registry.)
     func ensureLiveCatalogsLoaded() {
-        let needed = allCatalogs.count   // total catalogs across enabled add-ons; live ones can be last
+        // RAW count (tombstoned AND per-profile disabled add-ons included): both kinds of catalog
+        // still occupy engine board indices, so the widen bound must cover them or trailing live
+        // catalogs that sit behind them would never range-load. Rendering is unaffected: the
+        // disabled / tombstone filters still apply where rows are built and listed.
+        let needed = installedCatalogs(includeTombstoned: true, includeDisabled: true).count
         if boardRows.isEmpty {
             loadBoard(rows: max(needed, 30))
             return
@@ -857,17 +868,47 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups() -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
+        return assembleStreamGroups(details, streamId: nil)
+    }
+
+    /// Shared assembly for both `streamGroups` overloads: walk the meta-embedded stream groups
+    /// (`metaStreams`) FIRST, then the stream-resource responses, mirroring the engine's own
+    /// `[meta_streams, streams]` concat. This is the #122 fix: add-ons that serve plain HTTP / HLS links
+    /// usually embed them in the meta's videos instead of implementing a `stream` resource; the engine
+    /// surfaces those under `metaStreams`, which this layer previously never read, so every such add-on
+    /// showed zero sources. The disabled-add-on and tombstone guards apply identically to both surfaces.
+    /// An add-on that answers via BOTH surfaces merges into ONE group (two same-id groups would collide in
+    /// the list's ForEach identity), dropping only EXACT repeats (full Equatable match).
+    @MainActor
+    private func assembleStreamGroups(_ details: CoreMetaDetails, streamId: String?) -> [CoreStreamSourceGroup] {
         let names = addonNamesByBase()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
         let removed = AddonTombstones.all()                        // durable removal set, hoisted once
         var groups: [CoreStreamSourceGroup] = []
-        for group in details.streams {
+        var indexByBase: [String: Int] = [:]
+        for group in details.allStreamGroups {
+            if let streamId, group.request.path.id != streamId { continue }
             guard !disabledAddons.contains(group.request.base) else { continue }
             guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
             guard let streams = group.content?.ready, !streams.isEmpty else { continue }
-            groups.append(CoreStreamSourceGroup(id: group.request.base,
-                                                addon: names[group.request.base] ?? "Add-on",
-                                                streams: streams))
+            if let i = indexByBase[group.request.base] {
+                // Dedupe by FULL Equatable containment, not CoreStream.id: the id fingerprint excludes
+                // behaviorHints and fileIdx, so keying on it could conflate two genuinely different
+                // streams (a shared infoHash split into episodes only by fileIdx, or one URL carried on
+                // both surfaces with different proxy headers) and silently drop one. Containment is
+                // O(n^2) over the merged group, which is fine here: it runs only on a same-base
+                // collision (rare), and a single add-on's group is tens of streams.
+                var merged = groups[i].streams
+                for stream in streams where !merged.contains(stream) {
+                    merged.append(stream)
+                }
+                groups[i] = CoreStreamSourceGroup(id: groups[i].id, addon: groups[i].addon, streams: merged)
+            } else {
+                indexByBase[group.request.base] = groups.count
+                groups.append(CoreStreamSourceGroup(id: group.request.base,
+                                                    addon: names[group.request.base] ?? "Add-on",
+                                                    streams: streams))
+            }
         }
         return groups
     }
@@ -893,14 +934,18 @@ final class CoreBridge: ObservableObject {
     /// to tell users whether to keep waiting or whether loading has stalled.
     func streamLoadProgress() -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
+        // Count the meta-embedded groups too (they land Ready the moment the meta resolves), so a title
+        // whose ONLY sources are embedded HTTP/HLS streams settles at loaded == total instead of hanging
+        // the UI on the `total == 0` "still loading" state forever.
+        let all = details.allStreamGroups
         var loaded = 0
-        for group in details.streams {
+        for group in all {
             switch group.content {
             case .some(.ready), .some(.err): loaded += 1
             default: break   // .loading or nil → not done yet
             }
         }
-        return (loaded, details.streams.count)
+        return (loaded, all.count)
     }
 
     /// Ready stream groups for a specific stream/episode id, matched on the stream request's own
@@ -910,26 +955,14 @@ final class CoreBridge: ObservableObject {
     @MainActor
     func streamGroups(forStreamId streamId: String) -> [CoreStreamSourceGroup] {
         guard let details = metaDetails else { return [] }
-        let names = addonNamesByBase()
-        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
-        let removed = AddonTombstones.all()                        // durable removal set (see streamGroups())
-        var groups: [CoreStreamSourceGroup] = []
-        for group in details.streams where group.request.path.id == streamId {
-            guard !disabledAddons.contains(group.request.base) else { continue }
-            guard removed.isEmpty || !isTombstonedAddonBase(group.request.base, removed: removed) else { continue }
-            guard let streams = group.content?.ready, !streams.isEmpty else { continue }
-            groups.append(CoreStreamSourceGroup(id: group.request.base,
-                                                addon: names[group.request.base] ?? "Add-on",
-                                                streams: streams))
-        }
-        return groups
+        return assembleStreamGroups(details, streamId: streamId)
     }
 
     /// Stream-addon load progress for one stream/episode id (see `streamLoadProgress`).
     func streamLoadProgress(forStreamId streamId: String) -> (loaded: Int, total: Int) {
         guard let details = metaDetails else { return (0, 0) }
         var loaded = 0, total = 0
-        for group in details.streams where group.request.path.id == streamId {
+        for group in details.allStreamGroups where group.request.path.id == streamId {
             total += 1
             switch group.content {
             case .some(.ready), .some(.err): loaded += 1
@@ -1141,14 +1174,22 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Resume position (seconds) from the engine's library item for `meta`, or nil if the engine has
-    /// no entry (the caller then falls back to the account). For a series, only resume when the saved
-    /// video matches the episode being opened. (timeOffset is stored in ms.)
+    /// no entry. For a series, the saved offset only counts when the saved video matches the episode
+    /// being opened; a mismatch answers 0. (timeOffset is stored in ms.)
     ///
-    /// IMPORTANT: the series-mismatch branch returns 0, NOT nil, on purpose. For an engine-history
-    /// profile the engine IS the source of truth: it knows this title but the saved offset is for a
-    /// different episode, so the right answer is "start this episode at 0", and returning 0 (a real
-    /// value) deliberately suppresses the account fallback. Do not "simplify" this to nil, or the
-    /// caller would then resume the account's offset and play the wrong episode position.
+    /// CONTRACT (the account-fallback fix): the engine's answer is trusted only when it is a REAL
+    /// position greater than 5 seconds. Anything else (nil: no entry; 0 or near-0: "start fresh",
+    /// including the series video_id-mismatch branch) sends the caller to the account fallback
+    /// instead. The engine's library copy can lag the account: it hears TimeChanged on a throttle and
+    /// a watched/unwatched toggle can leave its video_id stale, while this device's exit save already
+    /// put the fresh position on the account, so a bare 0 here is not proof the viewer starts over.
+    /// The fallback is episode-safe by construction: account.resumeOffset does its own video_id match
+    /// and returns 0 for a different episode, so the wrong-episode resume that the old "trust the
+    /// engine's 0" rule guarded against cannot come back through it.
+    ///
+    /// PLANNED ARBITER: a later change makes engineResumeSeconds the single decision point, returning
+    /// nil to mean "consult the account fallback" and 0 to mean "genuinely start fresh". Once that
+    /// lands, the caller reverts to trusting any non-nil answer.
     func engineResumeSeconds(for meta: PlaybackMeta) -> Double? {
         // Overlay (non-owner) profile: the engine library item belongs to the owner account, so its saved
         // resume position is not this profile's. Decline here so the caller falls back to account.resumeOffset,
@@ -1169,11 +1210,26 @@ final class CoreBridge: ObservableObject {
     func removeFromLibrary(id: String) {
         guard ProfileStore.shared.activeUsesEngineHistory else {
             // Overlay profile: dismissing CW must touch only the profile's private history,
-            // never the owner account's library.
+            // never the owner account's library. That path is already tombstone-safe via ProfileStore,
+            // so it must NOT enter the account-scoped LibraryTombstones set.
             ProfileStore.shared.removeWatchEntry(metaId: id)
             return
         }
+        // Record the durable cross-device removal BEFORE the dispatch, the library analogue of
+        // uninstallAddon's AddonTombstones.tombstone: vortxSummary pushes the set into
+        // doc.vortx.deletedLibrary and SUBTRACTS it from the doc.vortx.library UNION, and syncDown re-folds
+        // it on peers, so a title removed here can never be resurrected by a peer's union hydrate or the
+        // cold-device library recovery (the Continue-Watching resurrection fix).
+        LibraryTombstones.tombstone(id)
         dispatchCtx(["action": "RemoveFromLibrary", "args": id])
+        // Propagate the removal to your other devices PROMPTLY. A bare background push can be lost if a
+        // sideload UPDATE kills the process before the unextended background Task's 2-round-trip push
+        // completes (the exact race that resurrected removed titles). Kick an immediate, non-debounced push
+        // so the tombstone lands in doc.vortx.deletedLibrary right away, mirroring uninstallAddon.
+        Task {
+            let ok = await VortXSyncManager.shared.pushThisDevice()
+            NSLog("[library] removal of %@ pushed to sync immediately (ok=%@)", id, ok ? "yes" : "no")
+        }
     }
 
     /// Mark a library item watched / unwatched by id. `LibraryItemMarkAsWatched` acts on the existing
@@ -1211,6 +1267,11 @@ final class CoreBridge: ObservableObject {
             return
         }
         dispatchCtx(["action": "RewindLibraryItem", "args": libraryId])
+        // A rewind is NOT a removal (the library entry stays), so no tombstone applies; but its pushed
+        // t/d=0 must survive an imminent sideload-update process kill, or the title comes back with stale
+        // pre-finish progress. Kick an immediate best-effort push so the rewound position lands in the
+        // account doc right away instead of only on the next unextended background sync.
+        Task { _ = await VortXSyncManager.shared.pushThisDevice() }
     }
 
     /// Whether the open detail page's title is saved to the library proper (present,
@@ -1249,6 +1310,10 @@ final class CoreBridge: ObservableObject {
             if let loadable = entry["content"] as? [String: Any],
                loadable["type"] as? String == "Ready",
                let meta = loadable["content"] as? [String: Any] {
+                // An explicit add supersedes any prior removal tombstone for this id, so the freshly-added
+                // title is not later suppressed by the recovery skip / union subtract and the next push stops
+                // carrying the stale removal. Mirrors installAddon's AddonTombstones.forget on a fresh install.
+                if let addedId = meta["id"] as? String { LibraryTombstones.forget(addedId) }
                 dispatchCtx(["action": "AddToLibrary", "args": meta])
                 NSLog("[CoreBridge] AddToLibrary dispatched for %@", (meta["id"] as? String) ?? "?")
                 return
@@ -1269,6 +1334,7 @@ final class CoreBridge: ObservableObject {
             return
         }
         guard let raw = rawMetaPreview(forId: metaId) else { return }
+        LibraryTombstones.forget(metaId)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": raw])
     }
 
@@ -1285,6 +1351,7 @@ final class CoreBridge: ObservableObject {
                                                 poster: meta["poster"] as? String)
             return
         }
+        LibraryTombstones.forget(id)   // explicit add supersedes a prior removal tombstone (see addDetailToLibrary)
         dispatchCtx(["action": "AddToLibrary", "args": meta])
     }
 
@@ -1298,13 +1365,19 @@ final class CoreBridge: ObservableObject {
     /// on the next play. `@discardableResult` keeps fire-and-forget callers unchanged.
     @MainActor
     @discardableResult
-    func addCatalogItemToAccount(id: String, type: String) async -> Bool {
+    func addCatalogItemToAccount(id: String, type: String, stampIntent: Bool = true) async -> Bool {
         let safeType = (type == "series") ? "series" : "movie"
         let safeId = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
         guard let url = URL(string: "https://v3-cinemeta.strem.io/meta/\(safeType)/\(safeId).json"),
               let (data, _) = try? await URLSession.shared.data(from: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let meta = obj["meta"] as? [String: Any], (meta["id"] as? String)?.isEmpty == false else { return false }
+        // An explicit user/dashboard add-to-library targeting the owner stamps the add so it supersedes a prior
+        // removal on every device (stampIntent: true, the default). The cold-device library recovery passes
+        // stampIntent: false: recovery is a machine re-add of account-owned titles, and stamping an addedAt
+        // there could mint a machine timestamp that beats a real removal this device has not folded yet,
+        // durably resurrecting a removed title.
+        if stampIntent { LibraryTombstones.forget(id) }
         dispatchCtx(["action": "AddToLibrary", "args": meta])
         return true
     }
@@ -1386,6 +1459,13 @@ final class CoreBridge: ObservableObject {
             "subtitlesPath": NSNull(),
         ]
         dispatch(action: ["action": "Load", "args": ["model": "Player", "args": selected]], field: "player")
+    }
+
+    /// Tear down the engine Player so a stale Player from a previous title cannot absorb the next title's
+    /// TimeChanged ticks (downloads, paste-a-link, and direct CW resume play without loading their own
+    /// Player). Call ONLY from a player cover's onClose, never a load path. Mirrors `unloadMeta`.
+    func unloadEnginePlayer() {
+        dispatch(action: ["action": "Unload"], field: "player")
     }
 
     private func streamMatches(_ raw: [String: Any], _ stream: CoreStream) -> Bool {
@@ -1661,8 +1741,8 @@ final class CoreBridge: ObservableObject {
                         // Count ready streams across every source group so the log shows when streams
                         // actually ARRIVED (not just that meta_details re-emitted). On a non-zero arrival
                         // also stamp the heartbeat via note("streams N"). Ready-only pass, no per-item log.
-                        let readyStreams = (details?.streams ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
-                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.streams.count ?? 0) streams=\(readyStreams)")
+                        let readyStreams = (details?.allStreamGroups ?? []).reduce(0) { $0 + ($1.content?.ready?.count ?? 0) }
+                        VXProbe.log("engine", "metaDetails changed meta=\(details?.meta?.id ?? "nil") streamGroups=\(details?.allStreamGroups.count ?? 0) streams=\(readyStreams)")
                         if readyStreams > 0 { VXProbeState.shared.note("streams \(readyStreams)") }
                     }
                     DispatchQueue.main.async { [weak self] in
@@ -1709,7 +1789,10 @@ final class CoreBridge: ObservableObject {
             || (current.watchedVideoIds?.count ?? 0) != (next.watchedVideoIds?.count ?? 0) {
             return true
         }
-        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+        // Signature over BOTH stream surfaces: the meta-embedded groups (metaStreams, the HTTP/HLS
+        // add-on shape, #122) land on the meta republish, and without them in the diff that arrival
+        // looked like "nothing changed" and the source list never rebuilt.
+        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
     }
 
     /// True when a republish changed something the SOURCE LIST derives from: presence, the loaded
@@ -1719,7 +1802,8 @@ final class CoreBridge: ObservableObject {
     private static func metaDetailsStreamsChanged(current: CoreMetaDetails?, next: CoreMetaDetails?) -> Bool {
         guard let current, let next else { return (current != nil) != (next != nil) }
         if current.meta?.id != next.meta?.id { return true }
-        return streamSetSignature(current.streams) != streamSetSignature(next.streams)
+        // Both surfaces, matching metaDetailsNeedsRepublish: a metaStreams arrival must bump streamsEpoch.
+        return streamSetSignature(current.allStreamGroups) != streamSetSignature(next.allStreamGroups)
     }
 
     /// A cheap signature of the ready streams per source group: the group's path id plus its ready
@@ -1784,10 +1868,15 @@ final class CoreBridge: ObservableObject {
         guard let board = decode(CoreBoardState.self, field: "board") else { return [] }
         let titles = catalogTitleMap()
         let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        // Removed-but-engine-retained add-ons (see `tombstonedBases`): their rows must not render on
+        // Home, matching the catalog manager filter, or a removed add-on's rows would ghost with no
+        // manager entry left to hide them (#121).
+        let ghostBases = Self.tombstonedBases(in: decode(CoreCtx.self, field: "ctx")?.profile.addons ?? [])
         var rows: [CoreBoardRow] = []
         for (engineIndex, catalog) in board.catalogs.enumerated() {
             guard let request = catalog.first?.request else { continue }
             guard !disabledAddons.contains(request.base) else { continue }
+            guard !ghostBases.contains(AddonTombstones.normalize(request.base)) else { continue }
             let items = catalog.compactMap { $0.content?.ready }.flatMap { $0 }
             guard !items.isEmpty else { continue }
             let key = Self.catalogKey(base: request.base, type: request.path.type, id: request.path.id)
@@ -1812,13 +1901,45 @@ final class CoreBridge: ObservableObject {
     }
 
     /// Every catalog the installed add-ons provide (deduped by key), titled the same way the board is.
+    /// Excludes the catalogs of REMOVED add-ons the engine still holds (see `tombstonedBases`), so the
+    /// catalog manager never lists a ghost entry for an add-on the user uninstalled (#121).
     var allCatalogs: [CatalogInfo] {
+        installedCatalogs(includeTombstoned: false, includeDisabled: false)
+    }
+
+    /// Normalized transport URLs of engine-ctx add-ons the user REMOVED (durable `AddonTombstones`)
+    /// that are still present in the engine collection. In the pull-only default (mirror OFF with a
+    /// live Stremio session) `uninstallAddon`/`refreshAddons` intentionally leave the engine collection
+    /// (and the user's Stremio account) intact and only suppress the add-on from the published `addons`
+    /// list, so every other ctx-derived read surface (the Home board rows, the catalog manager list)
+    /// must subtract this set too, or a removed add-on's catalogs ghost forever (#121). Read-side only:
+    /// stored hide/order prefs for a ghost key stay intact, so a genuine reinstall gets the user's old
+    /// catalog prefs back. Official/protected stubs are never suppressed, mirroring `refreshAddons`.
+    private static func tombstonedBases(in addons: [CoreDescriptor]) -> Set<String> {
+        let removed = AddonTombstones.all()
+        guard !removed.isEmpty else { return [] }
+        var out = Set<String>()
+        for addon in addons where !addon.isOfficial && !addon.isProtected {
+            let key = AddonTombstones.normalize(addon.transportUrl)
+            if removed.contains(key) { out.insert(key) }
+        }
+        return out
+    }
+
+    /// The enumeration behind `allCatalogs`. `includeTombstoned: true` keeps the catalogs of removed
+    /// add-ons the engine still holds, and `includeDisabled: true` keeps the catalogs of add-ons the
+    /// active profile disabled: `ensureLiveCatalogsLoaded` needs that RAW count because both kinds of
+    /// catalog still occupy engine board indices, so widening the board by a filtered count could
+    /// leave trailing live catalogs outside the range-loaded window.
+    private func installedCatalogs(includeTombstoned: Bool, includeDisabled: Bool) -> [CatalogInfo] {
         guard let ctx = decode(CoreCtx.self, field: "ctx") else { return [] }
         var out: [CatalogInfo] = []
         var seen = Set<String>()
-        let disabledAddons = ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let disabledAddons: Set<String> = includeDisabled ? [] : ProfileStore.activeDisabledAddons()   // per-profile add-on set, hoisted once
+        let ghostBases: Set<String> = includeTombstoned ? [] : Self.tombstonedBases(in: ctx.profile.addons)
         for addon in ctx.profile.addons {
             guard !disabledAddons.contains(addon.transportUrl) else { continue }
+            guard !ghostBases.contains(AddonTombstones.normalize(addon.transportUrl)) else { continue }
             for catalog in addon.manifest.catalogs {
                 let key = Self.catalogKey(base: addon.transportUrl, type: catalog.type, id: catalog.id)
                 guard seen.insert(key).inserted else { continue }

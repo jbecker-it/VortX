@@ -110,11 +110,22 @@ struct LibraryView: View {
             ForEach(items) { item in
                 PosterCard(title: item.name, poster: item.poster, type: item.type, id: item.id,
                            progress: item.progress > 0 ? item.progress : nil,
+                           isWatched: isWatched(item),
                            width: kPosterWidth, landscapeWidth: kLandscapeCardWidth, menu: .library,
                            onFocus: { focusModel.focus(item.focusedHero) })
             }
         }
         .padding(.horizontal, Theme.Space.screenEdge).padding(.top, Theme.Space.sm)
+    }
+
+    /// Watched badge for a Library tile, honoring the per-profile history invariant:
+    /// the owner profile reads the engine's own watched bookkeeping (timesWatched);
+    /// overlay profiles read only their private overlay (a whole-title mark records the
+    /// metaId itself, episode finishes record episode ids), never the account's state.
+    private func isWatched(_ item: CoreCWItem) -> Bool {
+        profiles.activeUsesEngineHistory
+            ? item.isWatched
+            : !profiles.watchedVideoIds(forMeta: item.id).isEmpty
     }
 
     private func hint(_ text: String) -> some View {

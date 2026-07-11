@@ -37,6 +37,10 @@ struct StremioXiOSApp: App {
     #endif
 
     init() {
+        // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
+        // The owner cannot easily pull .ips reports off a sideloaded device, so the app writes its own: a
+        // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
+        VortXCrashReporter.install()
         // Gated diagnostic logging: starts the once-a-second heartbeat only when VORTX_PROBE=1 or the
         // Settings toggle is on, then narrates the boot. No-op (and no cost) otherwise.
         VXProbeHeartbeat.start()
@@ -55,7 +59,8 @@ struct StremioXiOSApp: App {
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
         // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
-        DiskCacheSetting.clearCache()
+        // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
+        Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
         CoreBridge.shared.start()
         NSLog("[StremioX-iOS] stremio-core schema version = \(CoreBridge.shared.schemaVersion)")
     }
@@ -66,6 +71,12 @@ struct StremioXiOSApp: App {
                 .onChange(of: scenePhase) { phase in   // iOS 16 single-parameter form
                     if phase == .active {
                         UpdateChecker.shared.checkIfStale()
+                        #if !STREMIOX_NO_EMBEDDED_SERVER && !os(macOS)
+                        // Heal a drifted embedded-server session without visiting Settings: one GET that
+                        // latches the real bound port if server.js fell back off 11470 while suspended.
+                        // macOS is excluded: MacNodeServer reclaims and rebinds 11470 reliably.
+                        Task.detached(priority: .utility) { _ = await StremioServer.isOnline() }
+                        #endif
                         Task {
                             await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                             // Account-owns-everything: if the engine is degraded (no stream add-on),
@@ -80,7 +91,9 @@ struct StremioXiOSApp: App {
                     }
                     if phase == .background {
                         VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
-                        Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                        // push profiles + settings under a background-task grace window so a just-made library
+                        // removal / rewind survives a sideload-update process kill (CW resurrection fix).
+                        VortXSyncManager.shared.syncUpOnBackground()
                     }
                 }
                 .onAppear {

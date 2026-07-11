@@ -77,6 +77,14 @@ struct CoreCWItem: Decodable, Identifiable {
         if inProgress { return false }
         return watchedToEnd || state.flaggedWatched > 0 || state.timesWatched > 0
     }
+
+    /// The engine's own "has been watched" predicate (upstream `LibraryItem::watched()`:
+    /// `times_watched > 0`), driving the Library poster badge (DESIGN.md "PosterCard —
+    /// Watched state"). `LibraryItemMarkAsWatched` and every finished play/episode bump
+    /// `timesWatched`; unmark resets it to 0. `flaggedWatched` is deliberately NOT consulted:
+    /// upstream documents it as a per-video "watched event sent" latch, not the indicator.
+    /// Distinct from `isFinished`, which answers the Continue-Watching prune question.
+    var isWatched: Bool { state.timesWatched > 0 }
 }
 
 struct CoreLibState: Decodable {
@@ -402,10 +410,21 @@ enum LiveTypes {
 struct CoreMetaDetails: Decodable {
     let metaItems: [CoreMetaEntry]
     let streams: [CoreStreamGroup]
+    /// Streams EMBEDDED in the meta itself (`MetaDetails.meta_streams`): the engine lifts the selected
+    /// video's `video.streams` array into this parallel surface. Catalog add-ons that serve plain HTTP or
+    /// HLS links usually inline them in the meta's videos instead of implementing a separate `stream`
+    /// resource, so official clients list `metaStreams` alongside `streams`. Ignoring this field made every
+    /// such add-on show zero sources (#122). Optional so an older payload without it still decodes.
+    let metaStreams: [CoreStreamGroup]?
     /// The engine's library entry for this title (its state.timeOffset drives resume), if saved.
     let libraryItem: CoreCWItem?
     /// Watched episode ids, computed engine-side from the WatchedBitField (which isn't itself in JSON).
     let watchedVideoIds: [String]?
+
+    /// Meta-embedded stream groups plus the stream-resource responses, in the engine's own
+    /// `[meta_streams, streams]` concat order. The single source every stream surface should walk, so a
+    /// meta-embedded HTTP/HLS source is never invisible to a path that only read `streams`.
+    var allStreamGroups: [CoreStreamGroup] { (metaStreams ?? []) + streams }
 
     /// First fully-loaded meta (addons are queried in order; take the first that resolved).
     var meta: CoreMetaItem? { metaItems.compactMap { $0.content?.ready }.first }
@@ -452,25 +471,41 @@ struct CoreMetaItem: Decodable {
     /// real mpv duration later refines the bucket. Returns nil when no number can be read.
     var runtimeSeconds: Double? {
         guard let r = runtime?.lowercased() else { return nil }
+        // `runtime` is add-on-supplied, so everything below computes in Double and caps each field: a garbage
+        // value like "3000000000000000:00:00" must yield nil, not trap on Int overflow or poison the community
+        // trickplay duration bucket. A single field over 24h (86_400s) is dropped; the final total must be
+        // finite and positive and is clamped to a 24h ceiling.
+        let maxSeconds = 86_400.0
+        func field(_ raw: Substring) -> Double? {
+            guard let n = Double(raw.trimmingCharacters(in: .whitespaces)),
+                  n.isFinite, n >= 0, n <= maxSeconds else { return nil }
+            return n
+        }
+        func finalize(_ seconds: Double) -> Double? {
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            return min(seconds, maxSeconds)
+        }
         // "h:mm:ss" or "mm:ss" colon form first.
         if r.contains(":") {
-            let parts = r.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
-            if parts.count == 3 { return Double(parts[0] * 3600 + parts[1] * 60 + parts[2]) }
-            if parts.count == 2 { return Double(parts[0] * 60 + parts[1]) }
+            let parts = r.split(separator: ":").compactMap { field($0) }
+            if parts.count == 3 { return finalize(parts[0] * 3600 + parts[1] * 60 + parts[2]) }
+            if parts.count == 2 { return finalize(parts[0] * 60 + parts[1]) }
         }
         // "1h 32m" / "1 h 32 min" form: sum hours + minutes when an explicit hour marker is present.
-        var totalMinutes = 0
+        var totalMinutes = 0.0
         var matched = false
         let scanner = Scanner(string: r)
         scanner.charactersToBeSkipped = CharacterSet.alphanumerics.inverted
         while !scanner.isAtEnd {
-            guard let n = scanner.scanInt() else { break }
+            guard let n = scanner.scanInt(), n >= 0 else { break }
+            let value = Double(n)
+            guard value <= maxSeconds else { return nil }
             let unit = scanner.scanCharacters(from: CharacterSet.lowercaseLetters) ?? ""
-            if unit.hasPrefix("h") { totalMinutes += n * 60; matched = true }
-            else { totalMinutes += n; matched = true }   // bare number or "min" -> minutes
+            if unit.hasPrefix("h") { totalMinutes += value * 60; matched = true }
+            else { totalMinutes += value; matched = true }   // bare number or "min" -> minutes
         }
-        guard matched, totalMinutes > 0 else { return nil }
-        return Double(totalMinutes * 60)
+        guard matched else { return nil }
+        return finalize(totalMinutes * 60)
     }
     var imdbRating: String? {
         (links ?? []).first { $0.category.caseInsensitiveCompare("imdb") == .orderedSame }?.name

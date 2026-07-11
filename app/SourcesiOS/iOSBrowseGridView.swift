@@ -146,6 +146,49 @@ enum iOSPillMetrics {
     }
 }
 
+/// A catalog-tile image backed by the shared `PosterImageLoader` (dedicated large URLCache, bounded
+/// concurrency, OFF-MAIN ImageIO decode) rather than `AsyncImage` + `URLSession.shared`, which decoded
+/// full-size art on the main actor per tile and thrashed the tiny shared cache. Paints instantly from the
+/// decoded-memory cache on a warm scroll; a scroll-away cancel retries on the next appear, so a transient
+/// miss never latches a blank tile. Mirrors `AsyncImage`'s success/placeholder shape so a caller keeps its
+/// own placeholder (a gradient base, or the service-tile name fallback).
+private struct iOSTileImage<Placeholder: View>: View {
+    let url: String?
+    var maxPixel: CGFloat = 900
+    var contentMode: ContentMode = .fill
+    @ViewBuilder var placeholder: () -> Placeholder
+    @State private var image: VXPosterImage?
+
+    private var synchronousCache: VXPosterImage? {
+        guard let raw = url, let u = URL(string: raw) else { return nil }
+        return PosterImageLoader.cached(u)
+    }
+
+    var body: some View {
+        Group {
+            if let image = image ?? synchronousCache {
+                imageView(image).resizable().aspectRatio(contentMode: contentMode)
+            } else {
+                placeholder()
+            }
+        }
+        .task(id: url) { await load() }
+    }
+
+    private func imageView(_ img: VXPosterImage) -> Image {
+        #if canImport(UIKit)
+        Image(uiImage: img)
+        #else
+        Image(nsImage: img)
+        #endif
+    }
+
+    private func load() async {
+        image = nil   // clear so a recycled tile with a changed URL never shows stale art; warm cells repaint from synchronousCache
+        if let img = await PosterImageLoader.load(url, maxPixel: maxPixel) { image = img }
+    }
+}
+
 struct iOSDiscoverCard: View {
     let list: DiscoverList
     /// Representative movie backdrop for this card (resolved + daily-cached by CollectionsHubModel). The
@@ -156,8 +199,8 @@ struct iOSDiscoverCard: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: list.gradient, startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let backdrop, let url = URL(string: backdrop) {
-                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
+            if let backdrop {
+                iOSTileImage(url: backdrop, maxPixel: 900, contentMode: .fill) { Color.clear }
             }
             // Bottom-up scrim like iOSGenreTile so the title/subtitle stay legible over real artwork.
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.25), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
@@ -242,9 +285,7 @@ struct iOSServiceTile: View {
                     .fill(BundledLogo.plateFill)
                     .frame(width: plateWidth, height: plateHeight)
                     .overlay(
-                        AsyncImage(url: url) { img in
-                            img.resizable().aspectRatio(contentMode: .fit)
-                        } placeholder: {
+                        iOSTileImage(url: url.absoluteString, maxPixel: 300, contentMode: .fit) {
                             // While the logo streams in (or on failure), show the provider FULL NAME so the tile
                             // is never a blank box and NEVER a bare single letter (owner: "show the provider full
                             // name, e.g. Hulu / Peacock, when there is no logo"). Dark ink on the warm near-white
@@ -292,8 +333,8 @@ struct iOSGenreTile: View {
     var body: some View {
         ZStack(alignment: .bottomLeading) {
             LinearGradient(colors: [genre.tint.opacity(0.9), genre.tint.opacity(0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            if let backdrop, let url = URL(string: backdrop) {
-                AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fill) } placeholder: { Color.clear }
+            if let backdrop {
+                iOSTileImage(url: backdrop, maxPixel: 900, contentMode: .fill) { Color.clear }
             }
             LinearGradient(colors: [.black.opacity(0.0), .black.opacity(0.2), .black.opacity(0.7)], startPoint: .top, endPoint: .bottom)
             HStack(spacing: 6) {
@@ -348,6 +389,9 @@ struct iOSCategoryBrowse: View {
     @State private var lastPush = Date.distantPast
     /// In-flight guard for the async tmdb:->tt resolve so a slow (>0.6s) resolve cannot be pushed twice.
     @State private var resolving = false
+    /// The async tmdb:->tt resolve task, held so onDisappear can cancel it: a slow resolve otherwise appends
+    /// to the NavigationPath after the user has already left, force-pushing a detail page behind them.
+    @State private var resolveTask: Task<Void, Never>?
 
     /// The persistent cinematic hero at the top of the browse screen - the same ambient billboard Home /
     /// Discover use, seeded from the selected pill's top items. tvOS's TVCategoryBrowse already has a hero
@@ -386,7 +430,9 @@ struct iOSCategoryBrowse: View {
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { if selectedID.isEmpty, let first = subs.first { select(first.id) } }
-        .onDisappear { loadTask?.cancel() }
+        // Stop the hero's rotation/wake tasks and cancel the resolve so a popped browse leaves nothing looping
+        // in the background and never pushes a detail page after the user has left.
+        .onDisappear { loadTask?.cancel(); resolveTask?.cancel(); hero.stop() }
     }
 
     private var pills: some View {
@@ -426,9 +472,12 @@ struct iOSCategoryBrowse: View {
         // letting a second tap push the same detail twice. Gate the async path on a dedicated in-flight flag.
         guard !resolving else { return }
         resolving = true
-        Task { @MainActor in
+        resolveTask = Task { @MainActor in
             let tt = await TMDBClient.imdbID(forCatalogID: item.id, type: item.type)
             resolving = false
+            // The user may have popped this screen during a cold-cache resolve; don't append a detail page
+            // behind them (onDisappear cancels this task).
+            guard !Task.isCancelled else { return }
             path.append(tt.map { item.withResolvedIMDbID($0) } ?? item)
         }
     }
@@ -466,54 +515,124 @@ struct iOSCategoryBrowse: View {
     }
 }
 
-// MARK: - Reorder streaming services (Settings)
+// MARK: - Streaming services picker (Settings)
 
-/// Settings screen to reorder the streaming-service tiles (owner: "Prime first, Netflix last"). A standard
-/// drag-to-reorder List; iOS forces edit mode on, macOS reorders by native row drag. Persists immediately.
+/// Settings screen to CHOOSE and reorder the streaming-service tiles on Home and Discover. "Your services"
+/// drag-reorders (iOS edit mode / macOS native drag) and removes; "All services" is a searchable list to add
+/// any service TMDB knows, even one outside the viewer's region. With nothing chosen the hub shows every
+/// service in the region (AUTO), exactly as before. Rows load through PosterImageLoader (dedicated cache,
+/// bounded concurrency, off-main decode), so this screen never re-introduces the AsyncImage main-thread decode.
 struct iOSReorderServicesView: View {
     @ObservedObject private var model = CollectionsHubModel.shared
+    @State private var allServices: [TMDBClient.ProviderTile] = []
+    @State private var loadingAll = true
+    @State private var search = ""
+
+    private var selectedIDs: Set<Int> { Set(model.providers.map(\.providerID)) }
+    private var addable: [TMDBClient.ProviderTile] {
+        let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+        return allServices.filter { !selectedIDs.contains($0.providerID) && (q.isEmpty || $0.name.lowercased().contains(q)) }
+    }
 
     var body: some View {
         List {
-            ForEach(model.providers) { provider in
-                HStack(spacing: Theme.Space.md) {
-                    ZStack {
-                        // The warm near-white plate (#95) so a dark provider mark is legible in the reorder
-                        // list too, matching the plated tiles on Home/Discover rather than a dark-on-dark chip.
-                        BundledLogo.plateFill
-                        if let logo = provider.logoURL, let url = URL(string: logo) {
-                            AsyncImage(url: url) { img in img.resizable().aspectRatio(contentMode: .fit) } placeholder: { Color.clear }
-                                .padding(7)
-                        }
-                    }
-                    .frame(width: 52, height: 34)
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                    Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
-                    Spacer()
-                    Image(systemName: "line.3.horizontal").foregroundStyle(Theme.Palette.textTertiary)
+            Section {
+                ForEach(model.providers) { provider in
+                    serviceRow(provider)
+                        .listRowBackground(Theme.Palette.surface1)
+                        .listRowSeparator(.hidden)
                 }
-                .padding(.vertical, 6)
-                .listRowBackground(Theme.Palette.surface1)
-                .listRowSeparator(.hidden)
+                .onMove(perform: move)
+                .onDelete(perform: remove)
+            } header: {
+                Text("Your services")
+            } footer: {
+                // Honest per platform: iOS forces edit mode (swipe + the leading minus); macOS List has no swipe,
+                // so the row carries an explicit trailing minus button instead.
+                #if os(macOS)
+                Text("Drag to reorder, tap the minus to remove. With none chosen, every service in your region shows.")
+                #else
+                Text("Drag to reorder, swipe or tap the minus to remove. With none chosen, every service in your region shows.")
+                #endif
             }
-            .onMove(perform: move)
+
+            Section {
+                if addable.isEmpty {
+                    Text(loadingAll ? "Loading services..." : "No more services to add.")
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                        .listRowBackground(Theme.Palette.surface1)
+                } else {
+                    ForEach(addable) { provider in
+                        HStack(spacing: Theme.Space.md) {
+                            serviceLogo(provider)
+                            Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+                            Spacer(minLength: 0)
+                            Button { model.addService(provider.providerID) } label: {
+                                Image(systemName: "plus.circle.fill").foregroundStyle(Theme.Palette.accent)
+                            }
+                            .buttonStyle(.borderless)   // stays tappable while the list is in edit mode
+                        }
+                        .listRowBackground(Theme.Palette.surface1)
+                        .listRowSeparator(.hidden)
+                    }
+                }
+            } header: {
+                Text("All services")
+            }
         }
         .scrollContentBackground(.hidden)
         .background(Theme.Palette.canvas.ignoresSafeArea())
-        // iOS-only: a macOS navigationTitle on this pushed reorder list crashes the shared NSToolbar.
+        .searchable(text: $search, prompt: "Search services")
+        // iOS-only: a macOS navigationTitle on this pushed list crashes the shared NSToolbar.
         #if os(iOS)
-        .navigationTitle("Reorder Services")
+        .navigationTitle("Streaming services")
         .navigationBarTitleDisplayMode(.inline)
         .environment(\.editMode, .constant(.active))
         #endif
         .macBackAffordance()   // macOS in-content Back + Esc / Cmd-[ (no toolbar back exists)
         .onAppear { model.load() }
+        .task { allServices = await model.allServices(); loadingAll = false }
+    }
+
+    @ViewBuilder private func serviceRow(_ provider: TMDBClient.ProviderTile) -> some View {
+        HStack(spacing: Theme.Space.md) {
+            serviceLogo(provider)
+            Text(provider.name).font(Theme.Typography.cardTitle).foregroundStyle(Theme.Palette.textPrimary)
+            Spacer(minLength: 0)
+            // macOS List has no swipe-to-delete and edit mode is not forced here, so `.onDelete` gives no
+            // affordance. Provide an explicit remove control (like the tvOS row) wired to the same removal path.
+            // iOS keeps its native swipe / edit-mode minus and never shows this button.
+            #if os(macOS)
+            Button { model.removeService(provider.providerID) } label: {
+                Image(systemName: "minus.circle.fill").foregroundStyle(Theme.Palette.accent)
+            }
+            .buttonStyle(.borderless)
+            #endif
+        }
+    }
+
+    /// The warm near-white plate (#95) so a dark provider mark is legible in the list, matching the plated
+    /// Home/Discover tiles. The mark loads through PosterImageLoader, not AsyncImage.
+    private func serviceLogo(_ provider: TMDBClient.ProviderTile) -> some View {
+        ZStack {
+            BundledLogo.plateFill
+            if let logo = provider.logoURL {
+                iOSTileImage(url: logo, maxPixel: 300, contentMode: .fit) { Color.clear }.padding(7)
+            }
+        }
+        .frame(width: 52, height: 34)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     private func move(from: IndexSet, to: Int) {
         var tiles = model.providers
         tiles.move(fromOffsets: from, toOffset: to)
         model.reorder(to: tiles.map(\.providerID))
+    }
+
+    private func remove(at offsets: IndexSet) {
+        let ids = offsets.map { model.providers[$0].providerID }
+        for id in ids { model.removeService(id) }
     }
 }
 

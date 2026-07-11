@@ -117,11 +117,42 @@ struct iOSRootView: View {
     /// Search tab is dropped from the bar and Discover hosts an inline search field; OFF keeps them separate.
     @AppStorage("vortx.mergeDiscoverSearch") private var mergeDiscoverSearch = false
     @Environment(\.openURL) private var openURL
+    /// The profile roster + launch-picker gate, shared with every surface. When the roster has more than
+    /// one profile and none has been chosen this launch, the "Who's watching?" picker is owed at cold
+    /// start (and re-presented from Settings' Switch Profile), exactly as tvOS RootView drives it.
+    @EnvironmentObject private var profiles: ProfileStore
+    /// Process-wide "a fullscreen player is up" signal. The tvOS launch picker gates on
+    /// `presenter.request == nil`; on touch / Mac the player presents from within the shell, so this is
+    /// the equivalent "no player cover is presented" guard.
+    @ObservedObject private var playbackGate = FullscreenPlaybackGate.shared
 
     /// Whether a tab's screen should be mounted: only after its first selection (#24). The active tab
     /// is always mounted (covers the initial Home and any programmatic switch before onChange lands).
     private func isMounted(_ item: Tab) -> Bool {
         tab == item || visitedTabs.contains(item.rawValue)
+    }
+
+    /// The launch "Who's watching?" picker is owed when the roster has more than one profile and none has
+    /// been chosen this launch (ProfileStore.needsPicker), with no fullscreen player up. The tvOS gate is
+    /// `splashDone && needsPicker && presenter.request == nil`; iOSRootView has no splash of its own (the
+    /// brand splash lives one level up in StremioXiOSApp), so per the shared design it gates on needsPicker
+    /// alone here rather than inventing a splash flag.
+    private var pickerOwed: Bool { profiles.needsPicker && !playbackGate.playerActive }
+
+    /// The main shell is visible only once a profile has settled: while the picker is owed it is hidden
+    /// behind brand canvas so no main-profile content (Continue Watching, Library) shows before a viewer is
+    /// chosen. On Mac the picker presents as a centered sheet, so hiding the shell here is what keeps the
+    /// owner's rails from showing around it too. Mirrors tvOS RootView.shellVisible.
+    private var shellVisible: Bool { !pickerOwed }
+
+    /// Presentation binding for the launch picker: shown while it is owed; dismissing it by any means marks
+    /// the launch as picked (pickedThisLaunch), so it never re-appears until Settings' Switch Profile asks.
+    /// Mirrors tvOS RootView.pickerPresented.
+    private var pickerPresented: Binding<Bool> {
+        Binding(
+            get: { pickerOwed },
+            set: { presented in if !presented { profiles.pickedThisLaunch = true } }
+        )
     }
 
     var body: some View {
@@ -160,6 +191,12 @@ struct iOSRootView: View {
             VXProbe.event("nav", "tab \(newTab.probeName)")
         }
         .safeAreaInset(edge: .top, spacing: 0) { updateBanner }
+        // Hide the whole shell (screens, tab bar, update banner) behind brand canvas while the launch
+        // "Who's watching?" picker is owed, so none of the main profile's rails leak before a viewer is
+        // chosen. The canvas background below stays fully opaque behind the faded shell. tvOS twin:
+        // RootView wraps RootTabView in the same opacity + disabled gate (shellVisible).
+        .opacity(shellVisible ? 1 : 0)
+        .disabled(!shellVisible)
         .background(Theme.Palette.canvas.ignoresSafeArea())
         .tint(Theme.Palette.accent)
         .animation(.easeOut(duration: 0.25), value: updates.available?.build)
@@ -195,6 +232,14 @@ struct iOSRootView: View {
             tab = dest
         }
         #endif
+        // Launch "Who's watching?" picker: a real modal at cold start when the roster has more than one
+        // profile and none has been chosen this launch (ProfileStore.needsPicker), re-presented whenever
+        // Settings' Switch Profile flips pickedThisLaunch back to false. `.platformFullScreenCover` is a
+        // real fullScreenCover on iPhone / iPad and a sheet on Mac (which has no fullScreenCover). The
+        // shell is hidden behind canvas while it is owed (opacity gate above), so nothing of the main
+        // profile leaks behind it, matching the tvOS RootView flow. Selecting a profile goes through
+        // ProfileStore.select via the shared ProfilePickerView, honoring the per-profile history invariant.
+        .platformFullScreenCover(isPresented: pickerPresented) { ProfilePickerView() }
     }
 
     #if os(macOS)
@@ -759,10 +804,46 @@ struct iOSHomeView: View {
             if showCuratedRails { curated.load() }
             if showCollectionsHub { collectionsHub.load() }
         }
-        // Hero reseeds are gated on the visible tab: `seed` re-arms the rotation timer, which would
-        // defeat the hidden-tab pause above on every engine re-emit. The isActive onChange reseeds on return.
-        .onChange(of: core.revision) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks(); refreshReleaseCalendar() }
-        .onChange(of: profiles.activeID) { _ in refreshTopPicks() }
+        // Key Home refreshes off COARSE signals instead of `core.revision`, which bumps on EVERY NewState
+        // (background sync, catalog paging, search echoes, meta_details bursts) and so re-ran Top Picks, the
+        // Upcoming Episodes calendar, and the hero reseed on idle engine churn.
+        //
+        // THE RULE per signal: a BOUNDED collection is keyed on its EXACT ordered id set (zero missed changes);
+        // an UNBOUNDED one is keyed on a "<first id>#<count>" FINGERPRINT plus a documented bound, because an
+        // exact id key would be O(collection) work on EVERY body evaluation, the very storm this removes.
+        //   - `profiles.cwItems` is BOUNDED (hard-capped at 30 in Profiles.cwItems `.prefix(30)`), so it keys on
+        //     the exact ordered id set joined by a control char no id contains: insert, remove, reorder, AND an
+        //     interior swap all fire; a pure progress tick does not.
+        //   - `core.continueWatching` is UNBOUNDED: it is the engine `continue_watching_preview`, i.e. every
+        //     in-progress library title, bounded only by the (unbounded) library, with no in-app cap. So it
+        //     keeps the fingerprint. `core.library` (whole library) is the same case.
+        //   - `core.boardRows` is small in practice but keeps the fingerprint too, DELIBERATELY: it feeds only
+        //     the hero pool, where a miss is cosmetic and self-heals on the next distinguishing change, so the
+        //     cheap key is worth the asymmetry with cwItems.
+        // DOCUMENTED BOUND for the fingerprinted signals: a same-count interior swap in a SINGLE emit (one title
+        // replaced by another at a non-head position) leaves first-id and count unchanged and does not fire; a
+        // per-body content hash is deliberately avoided (this body re-evaluates far too often to hash an
+        // unbounded collection each pass). The next real CW / board / profile change, or an app foreground,
+        // reconciles it. No key fires on a pure progress tick (the set is unchanged), so the refresh models
+        // still no-op and `hero.seed` ignores the no-op reseed. hero.seed stays gated on the visible tab
+        // (`isActive`): `seed` re-arms the rotation timer, which a hidden (opacity-switched) Home must not do;
+        // the isActive onChange reseeds on return.
+        .onChange(of: "\(core.boardRows.first?.id ?? "-")#\(core.boardRows.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }
+        }
+        .onChange(of: "\(core.continueWatching.first?.id ?? "-")#\(core.continueWatching.count)") { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        // An overlay profile draws its Continue Watching from `profiles.cwItems` (bounded, exact id-set key
+        // above), not the engine, so its own plays must also re-seed the hero and Top Picks (the engine-CW
+        // onChange never fires for them).
+        .onChange(of: profiles.cwItems.map(\.id).joined(separator: "\u{1}")) { _ in
+            if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks()
+        }
+        .onChange(of: profiles.activeID) { _ in if isActive { hero.seed(heroCandidates, reduceMotion: reduceMotion) }; refreshTopPicks() }
+        // Library membership drives both Top Picks (its seed set includes the library) and Upcoming Episodes.
+        // Unbounded, so keyed on catalog.count with the same-count-swap bound documented above.
+        .onChange(of: core.library?.catalog.count ?? 0) { _ in refreshTopPicks(); refreshReleaseCalendar() }
         // The Upcoming Episodes bases come from `account.addons`, which loads async after sign-in; rebuild
         // once they arrive (same input set as the notification sweep).
         .onChange(of: account.addons.count) { _ in refreshReleaseCalendar() }
@@ -1202,7 +1283,7 @@ struct iOSLibraryDownloadsPill: View {
                     Text("Downloads")
                         .font(Theme.Typography.cardTitle)
                         .foregroundStyle(Theme.Palette.textPrimary)
-                    Text(count == 1 ? "1 item saved offline" : "\(count) items saved offline")
+                    Text(count == 1 ? "1 item" : "\(count) items")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(Theme.Palette.textSecondary)
                 }
@@ -1847,7 +1928,10 @@ extension View {
                     guard let meta = item.meta else { return }
                     Task { [weak account] in await account?.saveProgress(for: meta, positionSeconds: pos, durationSeconds: dur) }
                 },
-                onClose: { launch.wrappedValue = nil }
+                onClose: {
+                    core.unloadEnginePlayer()
+                    launch.wrappedValue = nil
+                }
             )
             .ignoresSafeArea()
         }
@@ -1953,7 +2037,9 @@ private func iOSDirectResume(for item: RailItem, core: CoreBridge,
         // Load the series meta (for the episode list) AND the CURRENT episode's streams, so the in-player
         // Sources button has this episode's alternates. Loading meta-only here had wiped the resident
         // episode streams the Sources list relied on — the "Sources button gone from CW resume" regression.
-        let hasEpStreams = core.metaDetails?.streams.contains { $0.request.path.id == entry.videoId } ?? false
+        // Both stream surfaces count as resident: an episode whose sources are meta-embedded (metaStreams,
+        // the HTTP/HLS add-on shape, #122) must not force a redundant re-dispatch here.
+        let hasEpStreams = core.metaDetails?.allStreamGroups.contains { $0.request.path.id == entry.videoId } ?? false
         if core.metaDetails?.meta?.id != item.id || (core.metaDetails?.meta?.videos?.isEmpty ?? true) || !hasEpStreams {
             core.loadMeta(type: "series", id: item.id, streamType: "series", streamId: entry.videoId)
             for _ in 0 ..< 6 {
@@ -3111,7 +3197,9 @@ private struct MacBackAffordance: ViewModifier {
                         .foregroundStyle(Theme.Palette.textPrimary)
                         .padding(.horizontal, Theme.Space.sm)
                         .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
+                        // Floating Back chrome over the detail content: Liquid Glass on macOS 26, the frosted
+                        // material below. Interactive since it is a pressable control.
+                        .glassChrome(in: Capsule(), interactive: true) { Capsule().fill(.ultraThinMaterial) }
                 }
                 .buttonStyle(.plain)
                 .padding(.leading, Theme.Space.md)

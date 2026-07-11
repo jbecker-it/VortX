@@ -8,6 +8,10 @@ struct StremioTVApp: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // Self-capture crashes into the exportable diagnostic log FIRST, before anything else can fault.
+        // A sideloaded Apple TV cannot hand its .ips reports to the owner, so the app writes its own: a
+        // crash records a marker, the next launch folds it into the exportable log. See VortXCrashReporter.
+        VortXCrashReporter.install()
         // Embed Stremio's streaming server on :11470 (nodejs-mobile retargeted to tvOS), so
         // torrent / non-web-ready streams the server must fetch & remux can play on Apple TV.
         // On by default; -stremiox-no-server disables it for isolation testing.
@@ -26,7 +30,8 @@ struct StremioTVApp: App {
         // Safety sweep: clear any leftover libmpv on-disk streaming cache from a previous run. The
         // player wipes it on a genuine exit, but a crash mid-playback could leave bytes behind — this
         // guarantees a fresh, bounded start so the configurable cache can never accumulate unbounded.
-        DiskCacheSetting.clearCache()
+        // Detached so the directory scan + delete (multi-GB after a crash) never blocks launch.
+        Task.detached(priority: .utility) { DiskCacheSetting.clearCache() }
         // Boot the native stremio-core engine (hydrates library/profile from storage, starts the
         // event loop). The schema-version log is an end-to-end smoke check of the Rust⇄Swift FFI.
         CoreBridge.shared.start()
@@ -55,6 +60,11 @@ struct StremioTVApp: App {
                 DiagnosticsLog.log("app", "scenePhase → \(String(describing: phase))")
                 if phase == .active {
                     UpdateChecker.shared.checkIfStale()
+                    #if !STREMIOX_NO_EMBEDDED_SERVER
+                    // Heal a drifted embedded-server session without visiting Settings: one GET that latches
+                    // the real bound port if server.js fell back off 11470 while we were suspended.
+                    Task.detached(priority: .utility) { _ = await StremioServer.isOnline() }
+                    #endif
                     Task {
                         await VortXSyncManager.shared.syncDown()      // pull other devices' changes on foreground
                         // Account-owns-everything: if the engine is degraded (no stream add-on), hydrate the
@@ -75,7 +85,9 @@ struct StremioTVApp: App {
                 }
                 if phase == .background {
                     VortXSyncManager.shared.stopRealtime()   // drop the socket + poll while suspended
-                    Task { await VortXSyncManager.shared.syncUp() }   // push profiles + settings
+                    // push profiles + settings under a background-task grace window so a just-made library
+                    // removal / rewind survives a sideload-update process kill (CW resurrection fix).
+                    VortXSyncManager.shared.syncUpOnBackground()
                 }
             }
             .onAppear {

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin   // sockets (waitForPortFree) + rlimit (RLIMIT_NOFILE raise) before node boots
 import NodeMobile
 
 /// Runs Stremio's streaming server (server.js) inside the app via nodejs-mobile,
@@ -11,12 +12,68 @@ enum NodeServer {
     /// nodejs-mobile limitation); only an app relaunch brings the server back.
     private(set) static var exitCode: Int32?
 
+    // MARK: - Discovered-port latch
+    //
+    // server.js targets 11470 but SILENTLY falls back to 11471-11474 on EADDRINUSE (a fast-relaunch
+    // race), and Swift used to hardcode 11470 -- so a drifted port stranded the whole session (badge
+    // Offline, every torrent request refused). The preload's console sniffer (A2) writes the ACTUAL
+    // bound port to a small file; this latch caches it so StremioServer.embedded follows it. The
+    // Settings probe scan (StremioServer.isOnline) also latches a live port it finds.
+    private static let portLock = NSLock()
+    /// THIS boot's bound port, cached once the preload has written the port file. AUTHORITATIVE: it always
+    /// wins in discoveredPort, so once this boot's server binds, its real port beats any stale scan latch.
+    private static var fileLatchedPort: Int?
+    /// A port found by the Settings reachability scan (StremioServer.isOnline). Only a FALLBACK, never
+    /// allowed to shadow this boot's own preload file: a scan can transiently reach a DYING previous
+    /// instance still answering on a drifted port. Cleared on each boot in startIfNeeded().
+    private static var scanLatchedPort: Int?
+    /// The port the embedded server ACTUALLY bound, or nil if not yet known. Prefers THIS boot's preload
+    /// file (via the fileLatchedPort cache, else a fresh read) over a scan latch, so a recovery boot that
+    /// binds 11470 is never shadowed by a stale 11471 latched from a previous, dying session. Validated to
+    /// the 11470-11474 fallback range.
+    static var discoveredPort: Int? {
+        portLock.lock(); defer { portLock.unlock() }
+        if let p = fileLatchedPort { return p }
+        let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        let path = (caches as NSString).appendingPathComponent("stremio-server.port")
+        if let s = try? String(contentsOfFile: path, encoding: .utf8),
+           let p = Int(s.trimmingCharacters(in: .whitespacesAndNewlines)), (11470...11474).contains(p) {
+            fileLatchedPort = p; return p
+        }
+        return scanLatchedPort
+    }
+    /// Latch a port discovered by the Settings reachability scan (bounded to the fallback range). Only a
+    /// fallback: this boot's preload file (fileLatchedPort) always wins in discoveredPort.
+    static func latch(port: Int) {
+        guard (11470...11474).contains(port) else { return }
+        portLock.lock(); scanLatchedPort = port; portLock.unlock()
+    }
+
     /// One-line state for the Settings diagnostics.
     static var statusDescription: String {
         if PlaybackSettings.torrentsDisabled { return "Disabled by Direct Links Only" }
         if !started { return "Not started (server.js missing from the bundle)" }
         if let code = exitCode { return "Server exited with code \(code). Relaunch the app to restart it." }
+        // The preload heartbeat writes the log every ~1s; a much older last-write while the process is
+        // still alive means the node event loop has stalled (froze rather than exited). Surface that so
+        // Settings can distinguish a wedged loop from a healthy one.
+        if let age = lastLogTickAge(), age > 10 {
+            return "Server process running, but its event loop last ticked \(Int(age))s ago. Restart the app."
+        }
         return "Server process running"
+    }
+
+    /// Age in seconds of the server log's last write. The preload heartbeat writes every ~1s, so a value
+    /// well past that (while the process is alive) means the event loop has frozen. Best-effort, nil when
+    /// the log is absent/unreadable, in which case the caller falls back to the plain running state.
+    private static func lastLogTickAge() -> TimeInterval? {
+        let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        let path = (caches as NSString).appendingPathComponent("stremio-server.log")
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date else { return nil }
+        return Date().timeIntervalSince(mtime)
     }
 
     /// The last lines of the server's own log (console output + crashes are teed to a file), so a
@@ -36,6 +93,14 @@ enum NodeServer {
             return
         }
         started = true
+        // Fresh-boot the discovered-port state synchronously, BEFORE the node thread starts: clear last
+        // session's port file AND both in-memory latches, so a stale file or a scan latch from a dying
+        // previous instance can never shadow the port THIS boot is about to bind. runNode also clears the
+        // file (belt and braces); doing it here too closes the window before any foreground/isOnline probe.
+        let portCaches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
+            ?? NSTemporaryDirectory()
+        try? FileManager.default.removeItem(atPath: (portCaches as NSString).appendingPathComponent("stremio-server.port"))
+        portLock.lock(); fileLatchedPort = nil; scanLatchedPort = nil; portLock.unlock()
         let thread = Thread { runNode(serverJs) }
         thread.name = "stremio-node-server"
         thread.stackSize = 8 * 1024 * 1024   // Node requires a large stack
@@ -44,10 +109,42 @@ enum NodeServer {
     }
 
     private static func runNode(_ scriptPath: String) {
-        // The server writes a cache (torrent pieces, settings), point it at a writable
-        // sandbox dir. It reads HOME for its app-data path.
+        // Resolve the writable cache dir + log path up front and stamp a fresh BOOT marker into the log
+        // BEFORE the (up-to-10s) port wait and node boot. This keeps the log's mtime current from the very
+        // start of the boot, so statusDescription's stale-loop check (log mtime age) cannot false-alarm off
+        // the PREVIOUS session's last write during the pre-boot window. We keep the tail of the previous
+        // boot's log instead of wiping it, so a crash that took the whole app down leaves its last lines
+        // readable after relaunch. Capped so it can't grow without bound.
         let caches = NSSearchPathForDirectoriesInDomains(.cachesDirectory, .userDomainMask, true).first
             ?? NSTemporaryDirectory()
+        let logPath = (caches as NSString).appendingPathComponent("stremio-server.log")
+        let prior = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+        let keptTail = prior.count > 48_000 ? String(prior.suffix(48_000)) : prior
+        try? (keptTail + "\n===== BOOT =====\n").write(toFile: logPath, atomically: true, encoding: .utf8)
+
+        // Wait for :11470 to become bindable before node boots, so server.js's silent EADDRINUSE
+        // fallback (11471-11474, invisible to Swift) never engages on a fast relaunch. This runs on
+        // the node thread, so it delays only node boot, never the UI.
+        Self.waitForPortFree(11470, timeout: 10)
+
+        // Raise the soft fd limit to the hard cap before node opens its torrent sockets. The iOS/tvOS
+        // default is 256; one process runs node (24 peer sockets per engine + announce bursts to
+        // 40-150 trackers + piece-cache files) alongside mpv + URLSession. On EMFILE, libuv
+        // accept-and-closes incoming connections: mpv gets an INSTANT "error loading failed" and the
+        // Settings probe reads Offline while the process is perfectly alive. Standard POSIX, sandbox-legal.
+        var lim = rlimit()
+        if getrlimit(RLIMIT_NOFILE, &lim) == 0 {
+            // min(OPEN_MAX, rlim_max): if rlim_max is "unlimited" (all-ones) the min clamps to OPEN_MAX; if it is
+            // finite we take it. Avoids referencing RLIM_INFINITY (a C macro not imported into Swift on this SDK).
+            let want = min(rlim_t(OPEN_MAX), lim.rlim_max)
+            if lim.rlim_cur < want {
+                lim.rlim_cur = want
+                if setrlimit(RLIMIT_NOFILE, &lim) == 0 { NSLog("StremioX: RLIMIT_NOFILE raised to \(want)") }
+            }
+        }
+
+        // The server writes a cache (torrent pieces, settings), point it at a writable
+        // sandbox dir (`caches`, resolved above). It reads HOME for its app-data path.
         let serverData = (caches as NSString).appendingPathComponent("stremio-server")
         try? FileManager.default.createDirectory(atPath: serverData, withIntermediateDirectories: true)
         setenv("HOME", caches, 1)
@@ -96,14 +193,21 @@ enum NodeServer {
         // read-ahead buffer and the binge preload are separate from this and unaffected.
         FileManager.default.changeCurrentDirectoryPath(caches)
 
-        // node's stdout/stderr aren't surfaced by nodejs-mobile, so tee console + uncaught
-        // errors to a log file we can read (essential for debugging the torrent engine).
-        let logPath = (caches as NSString).appendingPathComponent("stremio-server.log")
+        // node's stdout/stderr aren't surfaced by nodejs-mobile, so we tee console + uncaught errors to
+        // `logPath` (resolved and BOOT-stamped at the top of this function) via the preload below.
+        // The preload writes the ACTUAL bound port here once server.js logs "EngineFS server started
+        // at ..."; NodeServer.discoveredPort reads it and StremioServer.embedded follows it. Clear any
+        // stale value from a previous boot so a drifted port is never trusted across launches (the file
+        // is rewritten the moment this boot's server binds).
+        let portPath = (caches as NSString).appendingPathComponent("stremio-server.port")
+        try? FileManager.default.removeItem(atPath: portPath)
         let preloadPath = (caches as NSString).appendingPathComponent("stremiox-preload.js")
         let preload = """
-        const fs=require('fs'),L=\(jsString(logPath));
-        const w=(t,a)=>{try{fs.appendFileSync(L,t+' '+Array.prototype.map.call(a,String).join(' ')+'\\n')}catch(e){}};
-        console.log=function(){w('[log]',arguments)};console.error=function(){w('[err]',arguments)};
+        const fs=require('fs'),L=\(jsString(logPath)),PORTF=\(jsString(portPath));
+        let LFD=null; try{LFD=fs.openSync(L,'a')}catch(e){}
+        const w=(t,a)=>{try{var line=new Date().toISOString().slice(11,19)+' '+t+' '+Array.prototype.map.call(a,String).join(' ')+'\\n';if(LFD!==null){fs.writeSync(LFD,line)}else{fs.appendFileSync(L,line)}}catch(e){}};
+        console.log=function(){try{var s=Array.prototype.join.call(arguments,' ');var m=s.match(/EngineFS server started at http:\\/\\/127\\.0\\.0\\.1:(\\d{4,5})/);if(m){try{fs.writeFileSync(PORTF,m[1])}catch(e){}}}catch(e){}w('[log]',arguments)};
+        console.error=function(){w('[err]',arguments)};
         console.warn=function(){w('[warn]',arguments)};
         process.on('uncaughtException',function(e){w('[uncaught]',[e&&e.stack||e])});
         process.on('unhandledRejection',function(e){w('[rej]',[e&&e.stack||e])});
@@ -236,12 +340,8 @@ enum NodeServer {
         })();
         """
         try? preload.write(toFile: preloadPath, atomically: true, encoding: .utf8)
-        // Keep the tail of the previous boot's log instead of wiping it, so a crash that
-        // takes the whole app (and this server) down leaves its last lines readable after
-        // relaunch. Capped so it can't grow without bound.
-        let prior = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
-        let keptTail = prior.count > 48_000 ? String(prior.suffix(48_000)) : prior
-        try? (keptTail + "\n===== BOOT =====\n").write(toFile: logPath, atomically: true, encoding: .utf8)
+        // (The log was already tail-kept + BOOT-stamped at the top of this function, so its mtime is fresh
+        // from boot start; nothing to rewrite here.)
 
         NSLog("StremioX: starting node streaming server (HOME=\(caches), log=\(logPath))")
         var argv: [UnsafeMutablePointer<CChar>?] =
@@ -252,6 +352,33 @@ enum NodeServer {
         let rc = node_start(4, &argv)
         exitCode = rc
         NSLog("StremioX: node server exited rc=\(rc)")
+    }
+
+    /// tvOS/iOS cannot see or kill a stale previous instance holding 11470 (no lsof/kill in the sandbox,
+    /// unlike MacNodeServer.reclaimStalePort). Instead WAIT for the port to become bindable before starting
+    /// node, so server.js's silent EADDRINUSE fallback (11471-11474, invisible to Swift) never engages on a
+    /// fast relaunch. The stale holder is always a DYING previous process; it frees the port within moments.
+    private static func waitForPortFree(_ port: UInt16, timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            guard fd >= 0 else { return }
+            var yes: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = port.bigEndian
+            addr.sin_addr = in_addr(s_addr: INADDR_ANY)
+            let rc = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+            close(fd)
+            if rc == 0 { return }   // bindable: previous holder is gone
+            NSLog("StremioX: 11470 still held by a dying instance, waiting")
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        NSLog("StremioX: 11470 not freed within \(timeout)s; node may fall back to 11471+ (latch will follow it)")
     }
 
     /// JSON-encode a string for safe embedding in the preload JS literal.
