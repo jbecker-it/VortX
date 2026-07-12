@@ -55,6 +55,9 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.DEBUG gates the design-system gallery screen (S02: ui/gallery/GalleryScreen.kt)
+        // behind debug builds only, via a Settings row -- no separate launcher activity/manifest entry.
+        buildConfig = true
     }
 
     // Baseline lint config (S01 gradle hygiene): keep real errors failing CI, but silence checks that

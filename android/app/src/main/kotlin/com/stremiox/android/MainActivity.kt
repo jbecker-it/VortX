@@ -5,7 +5,6 @@ import android.animation.AnimatorListenerAdapter
 import android.animation.ObjectAnimator
 import android.graphics.Color
 import android.os.Bundle
-import android.provider.Settings
 import android.util.Log
 import android.view.animation.AnticipateInterpolator
 import androidx.activity.ComponentActivity
@@ -17,6 +16,7 @@ import com.stremiox.android.data.CatalogRepository
 import com.stremiox.android.data.PreviewCatalogRepository
 import com.stremiox.android.engine.EngineStremioRepository
 import com.stremiox.android.ui.StremioXApp
+import com.stremiox.android.ui.theme.isAnimatorScaleZero
 
 /// Android + Android TV entry point. The five-tab Compose shell in [StremioXApp] matches the iOS and
 /// Apple TV structure. It now runs on the shared stremio-core engine (over JNI, the same engine the
@@ -42,9 +42,10 @@ class MainActivity : ComponentActivity() {
         )
 
         // Reduced motion (Settings.Global.ANIMATOR_DURATION_SCALE == 0, the same system signal the
-        // Android-native translation table in ANDROID-PLAN.md §0 calls out): skip the custom
+        // Android-native translation table in ANDROID-PLAN.md §0 calls out, now the one shared
+        // ui/theme/Motion.kt utility every reduced-motion check in the app reads): skip the custom
         // fade-out and let the splash view disappear immediately instead of animating it off.
-        if (!animationsReduced()) {
+        if (!isAnimatorScaleZero()) {
             splashScreen.setOnExitAnimationListener { view ->
                 ObjectAnimator.ofFloat(view.view, "alpha", 1f, 0f).apply {
                     duration = 220L
@@ -59,9 +60,6 @@ class MainActivity : ComponentActivity() {
 
         setContent { StremioXApp(repo = engineRepository()) }
     }
-
-    private fun animationsReduced(): Boolean =
-        Settings.Global.getFloat(contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
 
     /// Build the real engine repository, backed by [com.stremiox.android.engine.StremioXCore] (native
     /// lib load + engine init happen inside its constructor). This is the boundary where the native
