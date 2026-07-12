@@ -12,3 +12,6 @@ local.properties
 # cargo-ndk output (android/app/build.gradle.kts writes it under build/, already covered by the root
 # **/build/ glob, but the jniLibs staging dir name is called out here for clarity).
 captures/
+
+# Kotlin compiler scratch/cache dir (regenerated per build; never committed).
+.kotlin/
