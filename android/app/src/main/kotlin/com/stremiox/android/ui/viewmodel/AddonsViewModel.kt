@@ -31,17 +31,28 @@ class AddonsViewModel(private val repo: CatalogRepository) : ViewModel() {
     private val _installMessage = MutableStateFlow<Pair<String, Boolean>?>(null)
     val installMessage: StateFlow<Pair<String, Boolean>?> = _installMessage.asStateFlow()
 
+    private var everLoaded = false
+
+    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): re-reads the installed list on every
+    /// ctx change (an install/remove from this screen, but also a sign-in pulling in the account's own
+    /// add-ons), not just this ViewModel's own [install]/[remove] actions -- so a sign-in that happens
+    /// while this screen is open shows the account's add-ons live instead of needing a restart. The
+    /// FIRST tick (fired immediately, see [CatalogRepository.ctxUpdates]) is the screen's normal
+    /// entry-point load, replacing the old `init { load() }`.
     init {
-        load()
+        viewModelScope.launch {
+            repo.ctxUpdates().collect { load(showLoading = !everLoaded) }
+        }
     }
 
-    fun load() {
+    fun load(showLoading: Boolean = true) {
         viewModelScope.launch {
-            _state.value = UiState.Loading
+            if (showLoading) _state.value = UiState.Loading
             repo.installedAddons().fold(
                 onSuccess = { _state.value = UiState.Success(it) },
                 onFailure = { _state.value = UiState.Error(it.message ?: "Couldn't load your add-ons.") },
             )
+            everLoaded = true
         }
     }
 

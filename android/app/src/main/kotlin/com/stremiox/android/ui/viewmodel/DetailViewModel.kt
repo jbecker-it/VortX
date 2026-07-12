@@ -64,7 +64,20 @@ class DetailViewModel(
     private val _mutationError = MutableStateFlow<String?>(null)
     val mutationError: StateFlow<String?> = _mutationError.asStateFlow()
 
+    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
+    /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
+    /// long-press elsewhere, another Detail instance in the backstack -- not only this ViewModel's own
+    /// [toggleLibrary]/[setWatched] calls (device finding 1b: "Detail's Saved chip stays stale until an
+    /// app restart"). [repo.peekMeta] is a pure local snapshot (no re-dispatch), so this is cheap enough
+    /// to run on every tick; it only replaces [_meta] once the initial load (below) has already
+    /// succeeded, so it can never race ahead of or clobber the first load.
     init {
+        viewModelScope.launch {
+            repo.ctxUpdates().collect {
+                if (_meta.value !is UiState.Success) return@collect
+                repo.peekMeta(type, id)?.let { fresh -> _meta.value = UiState.Success(fresh) }
+            }
+        }
         viewModelScope.launch {
             if (type == MediaType.SERIES) {
                 // A series' hero Watch/Resume target depends on which episode + watched state the meta
@@ -166,27 +179,45 @@ class DetailViewModel(
     // (see [CatalogRepository]'s S05 doc comment) so ticks/progress/the library chip update live; a
     // failure is surfaced via [mutationError] instead of clobbering the loaded page with [UiState.Error].
 
-    /// Mark the whole title (movie, or every episode of a series) watched/unwatched. Unwatching a series
-    /// clears every episode's tick explicitly (`MarkAsWatched(false)` alone does not, mirroring the
-    /// engine quirk Apple's `CoreBridge.markWatched` documents); watching only needs the aggregate action.
+    /// Mark the whole title (movie, or every episode of a series) watched/unwatched.
+    ///
+    /// ROOT CAUSE of the device-round "first invocation did nothing" bug: the engine's aggregate
+    /// `MarkAsWatched(bool)` action (see `LibraryItem::mark_as_watched` in the vendored stremio-core
+    /// crate, `types/library/library_item.rs`) only flips `timesWatched`/`lastWatched` on the library
+    /// item -- it NEVER touches the per-video `WatchedBitField` a series' episode ticks
+    /// ([MetaDetail.watchedVideoIds]) are derived from. That bitfield is written ONLY by
+    /// `MarkVideoAsWatched`/`MarkSeasonAsWatched`. So dispatching `MarkAsWatched(true)` on a series
+    /// silently updated the (invisible) aggregate flag while every episode tick stayed exactly as it
+    /// was -- indistinguishable from "did nothing" to the user watching the episode list. Unwatching
+    /// already iterated per-video (see the loop below) for the same reason Apple's `CoreBridge.markWatched`
+    /// documents, so only the `true` branch was affected.
+    ///
+    /// Fix: BOTH directions iterate every video, every season (sorted, deterministic order -- not the
+    /// engine's raw JSON order, which is not guaranteed stable) via `MarkVideoAsWatched`, so every tick
+    /// updates the instant this returns; then re-dispatch the aggregate `MarkAsWatched` too (best-effort)
+    /// so the movie-style `timesWatched`/resume-target metadata the hero button reads stays in sync. Each
+    /// dispatch is a synchronous engine call immediately re-read (see [CatalogRepository]'s S05 doc
+    /// comment), so the loop can never race itself -- the final [applyMutation] snapshot already reflects
+    /// every prior step in the same sequence.
     fun setWatched(isWatched: Boolean) {
         val current = (_meta.value as? UiState.Success)?.data ?: return
         viewModelScope.launch {
-            val result = if (isWatched || current.videos.isEmpty()) {
+            val result = if (current.videos.isEmpty()) {
                 repo.setWatched(type, id, isWatched)
             } else {
                 var last: Result<MetaDetail> = Result.success(current)
-                for (video in current.videos) {
+                for (video in sortedEpisodes(current.videos)) {
                     last = repo.setVideoWatched(
                         type = type,
                         id = id,
                         videoId = video.id,
                         season = video.season.takeIf { it > 0 },
                         episode = video.episode.takeIf { it > 0 },
-                        isWatched = false,
+                        isWatched = isWatched,
                     )
                     if (last.isFailure) break
                 }
+                if (last.isSuccess) last = repo.setWatched(type, id, isWatched)
                 last
             }
             applyMutation(result)

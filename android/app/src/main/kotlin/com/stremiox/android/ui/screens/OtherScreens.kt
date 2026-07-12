@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -67,7 +68,7 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
     val filters = (state as? UiState.Success<DiscoverResult>)?.data?.filters
 
     Column(modifier = modifier.fillMaxSize()) {
-        DiscoverFilterChips(filters = filters, onSelect = viewModel::select)
+        DiscoverFilterChips(filters = filters, onSelect = { viewModel.select(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
@@ -87,27 +88,38 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
 
 /// The type/catalog/genre chip rows above Discover's grid. No-ops while [filters] is null (still
 /// loading) so the grid below owns the loading/error/empty state exclusively.
+///
+/// GROUP 3b fix (Fold cover-screen device round: "three stacked chip rows... look wonky"): the parent
+/// [DiscoverScreen] `Column` has no `verticalArrangement`, so up to three independently-emitted
+/// [ChipScrollRow]s (type / catalog / genre) previously sat back-to-back with only each row's own tiny
+/// `xs` vertical padding between them (2x `xs` total) -- on a wide phone that gap reads as "tight but
+/// fine"; on the Fold's ~344dp-wide cover screen, where every row ALSO wraps its chips onto a horizontal
+/// scroll almost immediately, the rows visually collide into a dense, hard-to-parse block. Wrapping the
+/// (at most three) rows in their own [Column] with explicit `sm` spacing keeps every row scrollable
+/// and unchanged in content, just legibly separated -- a minimal, cosmetic-only fix, not a redesign.
 @Composable
 private fun DiscoverFilterChips(filters: DiscoverFilters?, onSelect: (String) -> Unit) {
     if (filters == null) return
-    if (filters.types.isNotEmpty()) {
-        ChipScrollRow {
-            filters.types.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        if (filters.types.isNotEmpty()) {
+            ChipScrollRow {
+                filters.types.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
-    }
-    if (filters.catalogs.size > 1) {
-        ChipScrollRow {
-            filters.catalogs.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+        if (filters.catalogs.size > 1) {
+            ChipScrollRow {
+                filters.catalogs.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
-    }
-    if (filters.genres.isNotEmpty()) {
-        ChipScrollRow {
-            filters.genres.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+        if (filters.genres.isNotEmpty()) {
+            ChipScrollRow {
+                filters.genres.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
     }
@@ -121,7 +133,7 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
     val filters = (state as? UiState.Success<LibraryResult>)?.data?.filters
 
     Column(modifier = modifier.fillMaxSize()) {
-        LibraryFilterChips(filters = filters, onSelect = viewModel::load)
+        LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
@@ -279,6 +291,13 @@ private fun PosterGrid(
         EmptyState(emptyHint, modifier)
         return
     }
+    // Defense-in-depth against the "Load more" crash (GROUP 2a): `LazyVerticalGrid`'s `key = { it.id }`
+    // throws `IllegalArgumentException: Key ... was already used` on a duplicate id. The real fix dedupes
+    // at the source ([com.stremiox.android.engine.EngineState.parseCatalogWithFilters], where pages get
+    // flattened/appended), but this grid is shared by Discover/Library/Search, so a belt-and-suspenders
+    // dedupe HERE means no future caller can reintroduce this crash class either. distinctBy is a no-op
+    // allocation-wise when there are no duplicates (the common case).
+    val deduped = remember(items) { items.distinctBy { it.id } }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = modifier.fillMaxSize(),
@@ -286,7 +305,7 @@ private fun PosterGrid(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        items(items, key = { it.id }) { item ->
+        items(deduped, key = { it.id }) { item ->
             Box {
                 PosterCard(
                     title = item.name,
