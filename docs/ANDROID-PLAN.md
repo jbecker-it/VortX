@@ -319,7 +319,7 @@ S01), kids mode, channel guide + M3U import — pull from `ROADMAP.md` as the Ap
 
 | Session | Title | State | Branch | Notes |
 |---|---|---|---|---|
-| S01 | Rebrand + hygiene + A16 baseline | in progress | `claude/android-s01-rebrand-baseline` | worker dispatched 2026-07-12 |
+| S01 | Rebrand + hygiene + A16 baseline | **merged** | `claude/android-s01-rebrand-baseline` | merged 2026-07-12; both flavors built + linted clean (real SDK/NDK verified locally); GPL isolation confirmed by APK inspection. Deferred: animated splash sequence (S02/S10), TV banner (S13, lint check disabled until then), predictive-back stack (lands with real navigation), DebridKeys migration off deprecated security-crypto (future session). S02 first target: `ui/theme/Theme.kt` still carries the old palette. |
 | S02 | Design system in Compose | not started | — | |
 | S03 | Engine bring-up | not started | — | |
 | S04 | Add-ons/Search/Discover/Library | not started | — | ∥ S05 |

@@ -21,15 +21,14 @@
 #     the first full-month release after that line settled, and both predate Kotlin 2.3.0 (released
 #     2025-12-16), so a 2.2.10 compiler can consume it without a metadata-version mismatch. This is a
 #     deliberate margin choice over chasing the newest BOM on the day of this commit -- the newest BOM
-#     as of authoring is already several Kotlin minors ahead and unverifiable in this sandbox (no
-#     Android SDK to build against; see the S01 report). Bump alongside a coordinated Kotlin bump
-#     later, don't bump one without the other.
+#     as of authoring is already several Kotlin minors ahead of the pinned 2.2.10 compiler, while
+#     2025.09.01 built + linted clean in the verified S01 build (SDK provisioned in-sandbox; see the
+#     S01 report). Bump alongside a coordinated Kotlin bump later, don't bump one without the other.
 #   - Everything else pinned here (activity-compose, core-ktx, core-splashscreen, lifecycle,
 #     security-crypto) is chosen the same way: a genuinely current stable release that predates
 #     Kotlin 2.3.0, not the latest-as-of-today release, for the same forward-metadata-compat reason.
 #   - media3 and kotlinx-coroutines-android are carried over UNCHANGED from the pre-S01 pins; nothing
-#     in this session's scope required moving them, and not moving them is less risk surface for a
-#     session that can't build locally to verify.
+#     in this session's scope required moving them.
 
 [versions]
 agp = "8.10.0"
