@@ -110,6 +110,19 @@ class EngineStremioRepository(
     @Volatile
     private var started = false
 
+    /// Set on [signOut], cleared on the next [signIn]. Works around a stremio-core engine quirk: on
+    /// `Logout` the engine clears `ctx.library` but emits `Internal::LibraryChanged(false)` (the
+    /// "don't persist" variant), and `ContinueWatchingPreview`'s `update` only recomputes on
+    /// `LibraryChanged(true)` -- so the engine's `continue_watching_preview` field keeps serving the
+    /// PREVIOUS (signed-in) user's stale items forever, until the process restarts and the model is
+    /// rebuilt from the (now-empty, persisted) library bucket from scratch. That's exactly the device
+    /// finding: "Continue Watching posters persist after Logout" until relaunch. Board rails do NOT
+    /// have this problem (Logout's `ProfileChanged` correctly drives `catalogs_update`), but we clear
+    /// both defensively in [homeSnapshot] so a signed-out Home is never rendered from ANY leftover
+    /// per-account state while this flag is set.
+    @Volatile
+    private var suppressHomeUntilFreshLoad = false
+
     init {
         start()
     }
@@ -274,9 +287,18 @@ class EngineStremioRepository(
     private fun homeSnapshot(): List<Catalog> {
         val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
         val boardRows = EngineState.parseCatalogs(StremioXCore.getState(EngineActions.boardField()), titleMap)
-        val continueWatching = runCatching {
-            EngineState.parseContinueWatching(StremioXCore.getState(EngineActions.continueWatchingPreviewField()))
-        }.getOrDefault(emptyList())
+        // Suppressed right after sign-out: see [suppressHomeUntilFreshLoad]'s doc comment. The engine's
+        // continue_watching_preview field keeps serving the PREVIOUS account's items indefinitely (an
+        // engine quirk, not a race), so trusting it here would render a signed-out Home with another
+        // account's "Continue Watching" posters. Board rows are unaffected (Logout correctly drives a
+        // real reload) so they still render live.
+        val continueWatching = if (suppressHomeUntilFreshLoad) {
+            emptyList()
+        } else {
+            runCatching {
+                EngineState.parseContinueWatching(StremioXCore.getState(EngineActions.continueWatchingPreviewField()))
+            }.getOrDefault(emptyList())
+        }
         return if (continueWatching.isEmpty()) {
             boardRows
         } else {
@@ -391,6 +413,10 @@ class EngineStremioRepository(
         if (email.isBlank() || password.isBlank()) {
             throw IllegalArgumentException("Enter your email and password.")
         }
+        // A fresh sign-in always resolves the truth: the engine syncs the account's real library from
+        // the server (a genuine `LibraryChanged(true)`), which correctly repopulates
+        // continue_watching_preview -- so it's safe to stop overriding it with empty from here on.
+        suppressHomeUntilFreshLoad = false
         // Race a `ctx` NewState (success: profile.auth now set) against a CoreEvent sign-in error (bad
         // password, no network, ...) by merging both into one flow and taking whichever lands first --
         // mirrors how Apple `StremioAccount.signIn` surfaces `res.error?.message` instead of a generic
@@ -429,6 +455,13 @@ class EngineStremioRepository(
         runCatching { StremioXCore.dispatch(EngineActions.logout()) }
         _authState.value = AuthState.SignedOut
         identityStore.forget()
+        // See [suppressHomeUntilFreshLoad]'s doc comment: the engine's Continue Watching field will
+        // NOT clear itself on Logout, so from this point on homeSnapshot() must not trust it until the
+        // next real sign-in. Also re-dispatch the board load directly (not just relying on homeUpdates'
+        // uid-change reload, which only fires while something is actively collecting the flow) so the
+        // board rails deterministically swap to the signed-out defaults too.
+        suppressHomeUntilFreshLoad = true
+        runCatching { dispatchHomeLoad() }
     }
 
     private companion object {
