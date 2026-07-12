@@ -1,9 +1,13 @@
 package com.stremiox.android.engine
 
 import android.content.Context
+import android.util.Log
+import com.stremiox.android.auth.AuthIdentityStore
+import com.stremiox.android.data.AuthRepository
 import com.stremiox.android.data.CatalogRepository
 import com.stremiox.android.debrid.DebridKeys
 import com.stremiox.android.debrid.DebridResolver
+import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
@@ -11,33 +15,55 @@ import com.stremiox.android.model.MetaItem
 import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
 import com.stremiox.android.model.StreamSource
-import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import kotlin.time.Duration.Companion.seconds
 
-/// The real engine implementation of the UI seam. Drop-in replacement for `PreviewCatalogRepository`:
-/// it satisfies the SAME [CatalogRepository] (alias `StremioRepository`) contract the Compose screens
-/// were built against, so wiring it in is a one-line change at the injection site (the ViewModelFactory)
-/// with zero UI churn.
+/// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
+/// AND `PreviewAuthRepository`: it satisfies the SAME [CatalogRepository] (alias `StremioRepository`)
+/// and [AuthRepository] contracts the Compose screens were built against, so wiring it in is a
+/// one-line change at the injection site (see `VortXApplication`) with zero UI churn.
 ///
 /// How it bridges the request/response gap: stremio-core is event-driven, not request/response. Each
-/// repository call (a) dispatches the matching Load action, (b) suspends until the engine emits a
-/// `NewState` event naming the field it drives, then (c) pulls + parses that field's JSON. A timeout
-/// guards against a field that never re-emits (e.g. the engine had it cached and ActionLoad was a
-/// no-op), in which case we read whatever state is currently present.
+/// catalog repository call (a) dispatches the matching Load action, (b) suspends until the engine
+/// emits a `NewState` event naming the field it drives, then (c) pulls + parses that field's JSON. A
+/// timeout guards against a field that never re-emits (e.g. the engine had it cached and ActionLoad
+/// was a no-op), in which case we read whatever state is currently present. `signIn`/`signOut` follow
+/// the same shape but dispatch a whole-model broadcast (see [EngineActions.authenticateLogin]) instead
+/// of a single field's Load, and additionally race a `CoreEvent` sign-in error so a bad password
+/// surfaces the engine's own message instead of just timing out.
 ///
-/// Threading: [StremioXCore.EventListener.onEvent] fires on a native worker thread; we forward the
-/// changed field names into a [MutableSharedFlow] that suspend functions await. Parsing runs on the
-/// caller's coroutine.
+/// Threading (hardened, S03): [StremioXCore.EventListener.onEvent] fires on a native worker thread
+/// (a stremio-core tokio worker attached to the JVM, see `android_jni.rs`). [onEngineEvent] does the
+/// minimum JSON parse there and publishes into two `MutableSharedFlow`s via `tryEmit`, which NEVER
+/// suspends -- a slow/absent collector can never block the native callback, satisfying the engine's
+/// "return promptly" contract on [StremioXCore.EventListener.onEvent]. Both flows use
+/// `BufferOverflow.DROP_OLDEST`: if a burst of events outruns every collector (bounded buffer full),
+/// we drop the STALEST entry, not the callback -- the next field pull always sees the latest state
+/// regardless of which individual "it changed" notifications were conflated away. [authState] is
+/// additionally re-published (off the native thread, via [engineScope]) so every subscriber gets a
+/// live, conflated `StateFlow` rather than having to replay the shared-flow history themselves.
 class EngineStremioRepository(
     context: Context,
     /// How long to wait for a field's NewState before falling back to the current state. The engine is
     /// local except for add-on HTTP, so a few seconds covers a cold add-on fan-out.
     private val loadTimeoutSeconds: Long = 12,
-) : CatalogRepository {
+) : CatalogRepository, AuthRepository {
 
     private val appContext = context.applicationContext
 
@@ -47,9 +73,34 @@ class EngineStremioRepository(
     /// and torrents keep today's behavior (a clear error the player layer surfaces).
     private val debridResolver by lazy { DebridResolver(DebridKeys(appContext)) }
 
-    /// Field names that changed in the most recent engine event. extraBufferCapacity keeps fast
-    /// back-to-back events from being dropped while a collector is between emissions.
-    private val changedFields = MutableSharedFlow<Set<String>>(extraBufferCapacity = 16)
+    /// The Keystore-backed "who was last signed in" display cache (ANDROID-PLAN.md §0 invariant #5);
+    /// the engine's own persisted `ctx.profile.auth` remains the actual source of truth, see
+    /// [AuthIdentityStore]'s doc comment.
+    private val identityStore by lazy { AuthIdentityStore(appContext) }
+
+    /// Field names that changed in the most recent engine event. extraBufferCapacity + DROP_OLDEST
+    /// keeps a burst of back-to-back events from ever suspending (blocking) the native callback thread
+    /// that publishes them -- see the class doc.
+    private val changedFields = MutableSharedFlow<Set<String>>(
+        extraBufferCapacity = 16,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /// Sign-in failure messages, published only for `CoreEvent` `Error`s whose `source` is
+    /// `UserAuthenticated` (see [EngineState.parseAuthErrorMessage]) so an unrelated background error
+    /// (a library sync hiccup, say) can never masquerade as a sign-in failure.
+    private val authErrors = MutableSharedFlow<String>(
+        extraBufferCapacity = 4,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+
+    /// A small supervisor-scoped coroutine scope this repository owns for work that must outlive any
+    /// single caller's coroutine (republishing [authState] off engine events). `SupervisorJob` so one
+    /// failure (e.g. a malformed ctx JSON on a single event) can't cancel the whole scope.
+    private val engineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    private val _authState = MutableStateFlow<AuthState>(AuthState.SignedOut)
+    override val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
     @Volatile
     private var started = false
@@ -76,21 +127,52 @@ class EngineStremioRepository(
             Log.e(TAG, "stremio-core init failed; UI will render empty until the engine is available", error)
             false
         }
+        // The engine hydrates `ctx.profile` (including a persisted sign-in) from its own storage
+        // DURING init, before this call returns -- so a restored sign-in is visible immediately, no
+        // extra dispatch/round-trip needed ("kill and relaunch restores state from engine
+        // persistence", ANDROID-PLAN.md S03 DoD). Runs on whatever thread constructed this repository
+        // (the engine's own lock, not the native callback thread), matching every other getState call.
+        if (started) refreshAuthState()
     }
 
-    /// Decode a `RuntimeEvent` and, if it is a NewState, publish the changed field names. NewState's
-    /// args are the field names that changed, e.g. `{"name":"NewState","args":["board","ctx"]}`.
+    /// Decode a `RuntimeEvent`: publish changed field names on a NewState, or a sign-in failure
+    /// message on a matching CoreEvent (see [EngineState.parseAuthErrorMessage]). Called on a native
+    /// worker thread (see the class doc) -- every branch here is a cheap parse + a non-suspending
+    /// `tryEmit`, so this always returns promptly regardless of collector speed.
     private fun onEngineEvent(json: ByteArray) {
         val event = runCatching { JSONObject(String(json, Charsets.UTF_8)) }.getOrNull() ?: return
-        if (event.optString("name") != "NewState") return
-        val args = event.optJSONArray("args") ?: return
-        val fields = buildSet {
-            for (i in 0 until args.length()) {
-                val field = args.optString(i)
-                if (field.isNotEmpty()) add(field)
+        when (event.optString("name")) {
+            "NewState" -> {
+                val args = event.optJSONArray("args") ?: return
+                val fields = buildSet {
+                    for (i in 0 until args.length()) {
+                        val field = args.optString(i)
+                        if (field.isNotEmpty()) add(field)
+                    }
+                }
+                if (fields.isEmpty()) return
+                changedFields.tryEmit(fields)
+                // ctx changed (a sign-in, sign-out, or a persisted-profile hydration racing this
+                // listener registration): refresh the published AuthState off this thread so
+                // subscribers see it without polling. Cheap to check on every event; ctx changes are
+                // infrequent (account actions), not per-frame.
+                if (EngineActions.FIELD_CTX in fields) engineScope.launch { refreshAuthState() }
+            }
+            "CoreEvent" -> {
+                EngineState.parseAuthErrorMessage(json.toString(Charsets.UTF_8))?.let { authErrors.tryEmit(it) }
             }
         }
-        if (fields.isNotEmpty()) changedFields.tryEmit(fields)
+    }
+
+    /// Pull `ctx`, parse it into [AuthState], publish it, and keep [identityStore] in sync (a display
+    /// cache only -- see its doc comment; the engine's own `ctx.profile.auth` stays authoritative).
+    private fun refreshAuthState() {
+        val state = EngineState.parseAuthState(StremioXCore.getState(EngineActions.ctxField()))
+        _authState.value = state
+        when (state) {
+            is AuthState.SignedIn -> identityStore.rememberSignedIn(state.email)
+            AuthState.SignedOut -> identityStore.forget()
+        }
     }
 
     /// Dispatch [actionJson], then await a NewState naming [field] (up to [loadTimeoutSeconds]), then
@@ -113,7 +195,11 @@ class EngineStremioRepository(
     override suspend fun home(): Result<List<Catalog>> = runCatching {
         StremioXCore.dispatch(EngineActions.loadBoard())
         val state = loadField(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
-        val boardRows = EngineState.parseCatalogs(state)
+        // Real rail titles ("<add-on> · <catalog>"), not the bare `path.id`/`path.type` fallback: look
+        // up every row against the installed add-ons' own manifests (ctx is already hydrated by now,
+        // see `start()`/`refreshAuthState`).
+        val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
+        val boardRows = EngineState.parseCatalogs(state, titleMap)
         // Prepend Continue Watching, the leading Home rail on iOS/tvOS. It is DERIVED state the engine
         // hydrated from the library at construction (it emits no NewState of its own, mirroring Apple
         // CoreBridge.seedInitialState), so we read the field straight rather than dispatching a load.
@@ -137,7 +223,8 @@ class EngineStremioRepository(
         // flat pages, not the board's list-of-rails). parseCatalogWithFilters decodes that single rail
         // into a one-row catalog list so the UI's row-based Discover screen renders without special-
         // casing. Fail-soft: any miss (engine unavailable, still-loading, empty) yields an empty list.
-        EngineState.parseCatalogWithFilters(state)
+        val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
+        EngineState.parseCatalogWithFilters(state, titleMap)
     }
 
     override suspend fun library(): Result<List<MetaItem>> = runCatching {
@@ -210,6 +297,52 @@ class EngineStremioRepository(
                 "This source type is not playable on Android yet.",
             )
         }
+    }
+
+    // ---- AuthRepository ----
+
+    override suspend fun signIn(email: String, password: String): Result<Unit> = runCatching {
+        if (email.isBlank() || password.isBlank()) {
+            throw IllegalArgumentException("Enter your email and password.")
+        }
+        // Race a `ctx` NewState (success: profile.auth now set) against a CoreEvent sign-in error (bad
+        // password, no network, ...) by merging both into one flow and taking whichever lands first --
+        // mirrors how Apple `StremioAccount.signIn` surfaces `res.error?.message` instead of a generic
+        // failure. The await is launched before the dispatch (and login is a full network round-trip,
+        // so the subscription is up long before the engine can answer); if an event is somehow still
+        // missed, the post-timeout ctx re-read below resolves the true outcome -- the race exists to
+        // make the common path fast and the error message specific, not for correctness.
+        val ctxChanged: Flow<AuthWait> = changedFields.filter { EngineActions.FIELD_CTX in it }.map { AuthWait.CtxChanged }
+        val failed: Flow<AuthWait> = authErrors.map { AuthWait.Failed(it) }
+        val awaitOutcome = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
+            val outcome = async { merge(ctxChanged, failed).first() }
+            StremioXCore.dispatch(EngineActions.authenticateLogin(email, password))
+            outcome.await()
+        }
+        if (awaitOutcome is AuthWait.Failed) throw IllegalStateException(awaitOutcome.message)
+        // Whether we won the race on ctx, timed out (a dropped/coalesced event -- current state is
+        // best, the same fallback [loadField] uses), the actual signed-in-ness is the real check.
+        refreshAuthState()
+        if (_authState.value !is AuthState.SignedIn) {
+            throw IllegalStateException("Sign-in failed. Check your connection and try again.")
+        }
+    }
+
+    /// The two outcomes [signIn] races: a `ctx` change (assume success; the real check afterward is
+    /// `authState is SignedIn`) or an explicit failure message from the engine.
+    private sealed interface AuthWait {
+        data object CtxChanged : AuthWait
+        data class Failed(val message: String) : AuthWait
+    }
+
+    override suspend fun signOut() {
+        // Broadcast dispatch (field = null): mirrors Apple's plain Logout, an explicit user sign-out.
+        // Fail-soft by design -- if the engine is unavailable the dispatch is a no-op, but we still
+        // clear the LOCAL published state + identity cache so the UI never shows a stale signed-in
+        // account it can't actually act on.
+        runCatching { StremioXCore.dispatch(EngineActions.logout()) }
+        _authState.value = AuthState.SignedOut
+        identityStore.forget()
     }
 
     private companion object {

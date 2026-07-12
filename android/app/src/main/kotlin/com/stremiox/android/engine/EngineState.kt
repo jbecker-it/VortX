@@ -1,5 +1,6 @@
 package com.stremiox.android.engine
 
+import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.Episode
 import com.stremiox.android.model.MediaType
@@ -21,8 +22,10 @@ internal object EngineState {
 
     /// Parse the `board`/`search` field (a `CatalogsWithExtra`) into UI [Catalog] rows. Each catalog
     /// is `{ request, content: Loadable<[meta]> }`; the engine nests them as `catalogs: [[page]]`
-    /// (outer = catalog, inner = pages). We flatten pages and title each row from its request.
-    fun parseCatalogs(json: String): List<Catalog> {
+    /// (outer = catalog, inner = pages). We flatten pages and title each row from [titleMap] (the
+    /// installed add-ons' real manifest + catalog names, see [parseAddonCatalogTitles]) when a match
+    /// exists, falling back to the bare request path otherwise (a still-loading/unofficial catalog).
+    fun parseCatalogs(json: String, titleMap: Map<String, String> = emptyMap()): List<Catalog> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
         val catalogs = root.optJSONArray("catalogs") ?: return emptyList()
         val rows = mutableListOf<Catalog>()
@@ -36,7 +39,7 @@ internal object EngineState {
                 if (title == null) {
                     val request = page.optJSONObject("request")
                     rowId = catalogRowId(request, catalogIdx)
-                    title = catalogTitle(request)
+                    title = titleMap[rowId] ?: catalogTitle(request)
                 }
                 val content = page.readyArray("content") ?: continue
                 for (metaIdx in 0 until content.length()) {
@@ -60,19 +63,22 @@ internal object EngineState {
     /// option's name when present (else the request path, matching the board titling). The row id is the
     /// selected catalog's stable id so the UI can key it. Fail-soft: a missing/`Loading`/empty catalog
     /// yields no row (empty list), never a throw, so Discover degrades to empty rather than crashing.
-    fun parseCatalogWithFilters(json: String): List<Catalog> {
+    fun parseCatalogWithFilters(json: String, titleMap: Map<String, String> = emptyMap()): List<Catalog> {
         val root = json.toJsonObjectOrNull() ?: return emptyList()
         val pages = root.optJSONArray("catalog") ?: return emptyList()
         val selected = selectedCatalog(root.optJSONObject("selectable"))
         val items = mutableListOf<MetaItem>()
-        var title: String? = selected?.first
+        var title: String? = null
         var rowId: String? = selected?.second
         for (pageIdx in 0 until pages.length()) {
             val page = pages.optJSONObject(pageIdx) ?: continue
             if (title == null) {
                 val request = page.optJSONObject("request")
                 rowId = rowId ?: catalogRowId(request, pageIdx)
-                title = catalogTitle(request)
+                // titleMap is keyed by catalogRowId's "base|type|id" format, NOT selectableCatalogId's
+                // "catalog|id|type" -- look it up separately from the UI-facing [rowId] so a selected
+                // Discover catalog still resolves its real manifest title.
+                title = titleMap[catalogRowId(request, pageIdx)] ?: selected?.first ?: catalogTitle(request)
             }
             val content = page.readyArray("content") ?: continue
             for (metaIdx in 0 until content.length()) {
@@ -130,6 +136,67 @@ internal object EngineState {
             )
         }
         return out
+    }
+
+    /// Parse the `ctx` field's `profile.addons` into a `"<base>|<type>|<id>"` -> `"<add-on> · <catalog>"`
+    /// title map, the real (non-placeholder) rail names [parseCatalogs]/[parseCatalogWithFilters] key
+    /// against. Mirrors Apple `CoreBridge.catalogTitleMap`: every installed add-on's manifest carries
+    /// its own display name plus a name per declared catalog, and the key format matches
+    /// [catalogRowId] exactly so a board/discover row looks itself up by the same id it's rendered
+    /// under. Falls back silently to an empty map (never throws) so a still-loading/malformed ctx just
+    /// means rows keep their bare-path fallback title.
+    fun parseAddonCatalogTitles(ctxJson: String): Map<String, String> {
+        val root = ctxJson.toJsonObjectOrNull() ?: return emptyMap()
+        val addons = root.optJSONObject("profile")?.optJSONArray("addons") ?: return emptyMap()
+        val map = mutableMapOf<String, String>()
+        for (i in 0 until addons.length()) {
+            val addon = addons.optJSONObject(i) ?: continue
+            val transportUrl = addon.optStringOrNull("transportUrl") ?: continue
+            val manifest = addon.optJSONObject("manifest") ?: continue
+            val addonName = manifest.optStringOrNull("name") ?: continue
+            val catalogs = manifest.optJSONArray("catalogs") ?: continue
+            for (c in 0 until catalogs.length()) {
+                val catalog = catalogs.optJSONObject(c) ?: continue
+                val type = catalog.optString("type")
+                val id = catalog.optString("id")
+                val catalogName = catalog.optStringOrNull("name") ?: id
+                val key = listOf(transportUrl, type, id).filter { it.isNotBlank() }.joinToString("|")
+                if (key.isNotBlank()) map[key] = "$addonName · $catalogName"
+            }
+        }
+        return map
+    }
+
+    /// Parse the `ctx` field into the signed-in/out [AuthState] the account screen and Settings
+    /// display. `ctx.profile.auth` serializes as an object (`{ key, user }`) when signed in, absent
+    /// (or JSON null) when signed out -- the same test Apple `CoreBridge.isLoggedIn` uses. Because the
+    /// engine hydrates `profile` from its own persisted storage at construction (mirrors
+    /// `stremio-core-web::initialize_runtime`), this reflects a RESTORED sign-in immediately after
+    /// [StremioXCore.init] returns, with no extra action needed.
+    fun parseAuthState(ctxJson: String): AuthState {
+        val profile = ctxJson.toJsonObjectOrNull()?.optJSONObject("profile") ?: return AuthState.SignedOut
+        val user = profile.optJSONObject("auth")?.optJSONObject("user") ?: return AuthState.SignedOut
+        return AuthState.SignedIn(
+            email = user.optStringOrNull("email"),
+            uid = user.optStringOrNull("_id"),
+        )
+    }
+
+    /// Parse a `RuntimeEvent` for a sign-in failure: `{"name":"CoreEvent","args":{"event":"Error",
+    /// "args":{"error":{..., "message": "..."},"source":{"event":"UserAuthenticated",...}}}}`. Every
+    /// `CtxError` variant (API/Env/Other) serializes with a `message` field (see stremio-core's
+    /// `impl Serialize for OtherError`/`APIError`), so reading it uniformly covers all three. Returns
+    /// null for any other event (including a successful `UserAuthenticated`, which is just the ctx
+    /// NewState the repository already awaits) or malformed JSON, so callers can `?:` past a miss.
+    fun parseAuthErrorMessage(json: String): String? {
+        val event = json.toJsonObjectOrNull() ?: return null
+        if (event.optString("name") != "CoreEvent") return null
+        val coreEvent = event.optJSONObject("args") ?: return null
+        if (coreEvent.optString("event") != "Error") return null
+        val args = coreEvent.optJSONObject("args") ?: return null
+        val source = args.optJSONObject("source")
+        if (source?.optString("event") != "UserAuthenticated") return null
+        return args.optJSONObject("error")?.optStringOrNull("message")
     }
 
     /// Parse a `LibraryWithFilters` (`catalog: [libraryItem]`) into UI [MetaItem]s.

@@ -93,6 +93,32 @@ object EngineActions {
     /// the repository reads this field straight, after the board load has already pumped the event loop.
     fun continueWatchingPreviewField(): String = "\"$FIELD_CONTINUE_WATCHING_PREVIEW\""
 
+    /// The state field-selector for `ctx`, ready for [StremioXCore.getState]. `ctx` needs no Load
+    /// action either: the engine hydrates `profile` (incl. a persisted sign-in) at construction, and
+    /// every `ActionCtx` mutation below re-emits it via the whole-model dispatch path.
+    fun ctxField(): String = "\"$FIELD_CTX\""
+
+    /// Email/password sign-in, mirroring Apple `CoreBridge`'s `Authenticate`/`LoginWithToken` dispatch
+    /// (here the `Login` variant of the engine's `AuthRequest`, the same request the account API
+    /// login form makes on every Stremio client). Broadcasts to the whole model (field = null, like
+    /// `dispatchCtx` on Apple): a successful login changes `ctx` (and, once addons/library pull in,
+    /// several other fields), so no single field name is the right target.
+    fun authenticateLogin(email: String, password: String): String =
+        ctxEnvelope(
+            action(
+                "Authenticate",
+                JSONObject()
+                    .put("type", "Login")
+                    .put("email", email)
+                    .put("password", password)
+                    .put("facebook", false),
+            ),
+        )
+
+    /// Sign out. Destroys the engine's server-side session (mirrors Apple's plain `Logout`, used only
+    /// for an explicit user sign-out, never for a profile switch) and clears `ctx.profile.auth`.
+    fun logout(): String = ctxEnvelope(action("Logout", null))
+
     // ---- low-level builders ----
 
     /// `{ "action": <tag>, "args": <args> }`. `args == null` omits the key (for arg-less actions).
@@ -105,4 +131,12 @@ object EngineActions {
     /// `{ "field": <field>, "action": <action> }` serialized to a string.
     private fun envelope(field: String, action: JSONObject): String =
         JSONObject().put("field", field).put("action", action).toString()
+
+    /// `{ "field": null, "action": { "action": "Ctx", "args": <ctxAction> } }` -- an `Action::Ctx(...)`
+    /// dispatched with a null field, i.e. broadcast to the WHOLE model rather than one field. Mirrors
+    /// Apple `CoreBridge.dispatchCtx`, which does the same for every `ActionCtx` (auth, library
+    /// mutations, add-on install/remove): those actions can touch more than one model field, so there
+    /// is no single field name to scope them to.
+    private fun ctxEnvelope(ctxAction: JSONObject): String =
+        JSONObject().put("field", JSONObject.NULL).put("action", action("Ctx", ctxAction)).toString()
 }
