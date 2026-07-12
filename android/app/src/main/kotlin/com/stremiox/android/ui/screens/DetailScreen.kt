@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -148,6 +149,16 @@ private fun Backdrop(m: MetaDetail) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            // Cap the backdrop's height BEFORE applying the aspect ratio -- the landscape mirror of
+            // HomeScreen's HeroHeader clamp (see its doc comment). In landscape the WIDTH driving this
+            // aspect ratio is the long side of the screen: on a short landscape viewport (e.g. a
+            // folding phone's outer cover display rotated, ~820dp wide but only ~380dp tall available
+            // below the app bar) an unclamped 16:9-of-full-width backdrop is ~460dp tall -- taller than
+            // the entire viewport -- so the first frame the user sees is 100% gradient with the title,
+            // Watch button, and (for a series) the episode list all scrolled below the fold. That read
+            // as "the detail screen shows nothing" on the device round. Phones/tablets in portrait stay
+            // under the cap, so their ratio is untouched.
+            .heightIn(max = 260.dp)
             .aspectRatio(16f / 9f)
             .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
     ) {
