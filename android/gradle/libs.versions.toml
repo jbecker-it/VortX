@@ -1,0 +1,74 @@
+# Gradle version catalog (S01 gradle hygiene). Single source of truth for every dependency +
+# plugin coordinate the android/ build uses; module build.gradle.kts files reference `libs.*`
+# instead of hardcoded strings so a version lives in exactly one place.
+#
+# Version choices (documented here, not just in code review history, per the house rule that
+# comments carry contracts):
+#   - agp: 8.10.0 is the FLOOR that officially supports compileSdk/targetSdk 36 (Android 16) --
+#     AGP's own release notes list API 35 as the max for 8.9.x and API 36 as the max starting
+#     8.10.0. The prior pin (8.5.2) only worked at compileSdk 36 via the
+#     android.suppressUnsupportedCompileSdk escape hatch in gradle.properties (removed in this same
+#     commit). AGP 8.10.0 requires Gradle >= 8.11.1 (its documented minimum/default), hence the
+#     wrapper pin below.
+#   - kotlin: left at 2.2.10, UNCHANGED. Nothing about the targetSdk 36 / AGP bump requires a newer
+#     Kotlin, and 2.2.10 is already the floor dev.jdtech.mpv:libmpv needs to read its 2.2.0-versioned
+#     .kotlin_module metadata (see app/build.gradle.kts). The Compose BOM below was picked to stay
+#     inside Kotlin 2.2.x's compiler window (see composeBom note) specifically so this pin could stay
+#     put -- bumping Kotlin further is left to a session that actually needs it (Kotlin's metadata
+#     reader is forward-only: an older compiler cannot read a library built by a newer one, the same
+#     failure class the libmpv comment describes).
+#   - composeBom: 2025.09.01. Compose 1.9 went stable with the August 2025 BOM; September's BOM is
+#     the first full-month release after that line settled, and both predate Kotlin 2.3.0 (released
+#     2025-12-16), so a 2.2.10 compiler can consume it without a metadata-version mismatch. This is a
+#     deliberate margin choice over chasing the newest BOM on the day of this commit -- the newest BOM
+#     as of authoring is already several Kotlin minors ahead and unverifiable in this sandbox (no
+#     Android SDK to build against; see the S01 report). Bump alongside a coordinated Kotlin bump
+#     later, don't bump one without the other.
+#   - Everything else pinned here (activity-compose, core-ktx, core-splashscreen, lifecycle,
+#     security-crypto) is chosen the same way: a genuinely current stable release that predates
+#     Kotlin 2.3.0, not the latest-as-of-today release, for the same forward-metadata-compat reason.
+#   - media3 and kotlinx-coroutines-android are carried over UNCHANGED from the pre-S01 pins; nothing
+#     in this session's scope required moving them, and not moving them is less risk surface for a
+#     session that can't build locally to verify.
+
+[versions]
+agp = "8.10.0"
+kotlin = "2.2.10"
+composeBom = "2025.09.01"
+activityCompose = "1.12.0"
+coreKtx = "1.17.0"
+coreSplashscreen = "1.0.1"
+lifecycle = "2.9.4"
+coroutines = "1.8.1"
+media3 = "1.9.4"
+securityCrypto = "1.1.0"
+mpvLibmpv = "1.0.0"
+
+[libraries]
+compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
+compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+
+activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+core-splashscreen = { group = "androidx.core", name = "core-splashscreen", version.ref = "coreSplashscreen" }
+security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
+
+lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycle" }
+lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycle" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
+media3-exoplayer-hls = { group = "androidx.media3", name = "media3-exoplayer-hls", version.ref = "media3" }
+media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
+media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
+
+mpv-libmpv = { group = "dev.jdtech.mpv", name = "libmpv", version.ref = "mpvLibmpv" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }

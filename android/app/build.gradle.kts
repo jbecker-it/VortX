@@ -1,20 +1,20 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("org.jetbrains.kotlin.plugin.compose")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.compose)
 }
 
 android {
     namespace = "com.stremiox.android"
-    // Media3 1.7+ must be built against SDK 35, so compileSdk moves 34 -> 35. AGP 8.5.2 supports it.
-    // targetSdk stays at 34: bumping the runtime target is a separate behavioral change, not needed
-    // to adopt the player. minSdk stays 26 (already above Media3 1.9's floor of 23).
+    // compileSdk 36 (Android 16) requires AGP >= 8.10.0 (root build.gradle.kts / the version catalog
+    // carry that pin). targetSdk now tracks compileSdk (S01: Android-16-baseline session) -- both at
+    // 36. minSdk stays 26 (already above Media3 1.9's floor of 23; covers phones and Android TV).
     compileSdk = 36
 
     defaultConfig {
         applicationId = "com.stremiox.android"
         minSdk = 26          // Android 8.0; covers phones and Android TV (Fire TV / Google TV)
-        targetSdk = 34
+        targetSdk = 36
         versionCode = 1
         versionName = "0.3.0"
     }
@@ -56,6 +56,23 @@ android {
     buildFeatures {
         compose = true
     }
+
+    // Baseline lint config (S01 gradle hygiene): keep real errors failing CI, but silence checks that
+    // are structurally noisy for this skeleton rather than actual bugs. Extend this list as new
+    // spurious checks show up; don't reach for abortOnError = false, that would hide real problems too.
+    lint {
+        disable += setOf(
+            "MissingTranslation", // localeConfig ships English only for now (S01); see res/xml/locales_config.xml
+            "ExtraTranslation",
+            // The LEANBACK_LAUNCHER intent-filter (AndroidManifest.xml, pre-S01) makes lint want a TV
+            // banner now. ANDROID-PLAN.md §0 "Form factors & packaging" explicitly schedules the TV
+            // banner + the rest of the TV manifest work for S13, not S01 -- don't fail every PR in the
+            // meantime for a deferred, already-planned requirement. Re-enable when S13 adds the banner.
+            "MissingTvBanner",
+        )
+        checkReleaseBuilds = false // CI builds debug only today; release lint gating is an S15 concern.
+        abortOnError = true
+    }
 }
 
 kotlin {
@@ -65,40 +82,49 @@ kotlin {
 }
 
 dependencies {
-    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
-    implementation("androidx.compose.ui:ui")
-    implementation("androidx.compose.ui:ui-tooling-preview")
-    implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
-    implementation("androidx.activity:activity-compose:1.9.2")
-    implementation("androidx.core:core-ktx:1.13.1")
+    // Every version below is pinned once, in gradle/libs.versions.toml (S01: version catalog
+    // migration) -- see that file's header for why each was chosen. compose-bom pins the whole
+    // androidx.compose.* family, so ui/material3/material-icons-extended below take no version.
+    implementation(platform(libs.compose.bom))
+    implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
+    implementation(libs.compose.material3)
+    implementation(libs.compose.material.icons.extended)
+    implementation(libs.activity.compose)
+    implementation(libs.core.ktx)
+
+    // AndroidX SplashScreen API (S01): backs Theme.VortX.Splash (res/values/themes.xml) so the cold
+    // start shows the brand gold mark on warm obsidian instead of a blank window, uniformly from
+    // minSdk 26 up (framework-owned on 31+, compat-drawn identically below it). See MainActivity.
+    implementation(libs.core.splashscreen)
 
     // EncryptedSharedPreferences, so debrid API keys (credentials) are stored AES-encrypted at rest,
     // never in plain SharedPreferences. This is the Android analogue of the Apple Keychain the debrid
-    // keys live in (app/SourcesShared/DebridKeys.swift). security-crypto 1.1.0-alpha06 is the last
-    // published line of the artifact; it resolves from mavenCentral() (already in settings.gradle.kts)
-    // and pulls Tink transitively. DebridKeys reads it reflectively and falls back to plain prefs if
-    // the artifact is ever absent, so the boundary never hard-fails the build.
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+    // keys live in (app/SourcesShared/DebridKeys.swift). It resolves from mavenCentral() (already in
+    // settings.gradle.kts) and pulls Tink transitively. DebridKeys reads it reflectively and falls
+    // back to plain prefs if the artifact is ever absent, so the boundary never hard-fails the build.
+    // NOTE: Google deprecated this artifact's APIs in 1.1.0 in favor of using Android Keystore
+    // directly; we're staying on it for S01 (out of scope to migrate DebridKeys here), flagged for a
+    // future session.
+    implementation(libs.security.crypto)
 
     // ViewModel + collectAsStateWithLifecycle, so screens consume one-way state instead of calling
     // the repository inline. The real engine plugs in behind the repository with no ViewModel churn.
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
-    implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation(libs.lifecycle.viewmodel.compose)
+    implementation(libs.lifecycle.runtime.compose)
+    implementation(libs.kotlinx.coroutines.android)
 
-    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version.
-    // 1.9.4 is the current stable line (released after 1.8.x); minSdk 23, built against compileSdk 35.
+    // AndroidX Media3 (ExoPlayer): the player core. All media3 modules MUST share one version
+    // (libs.versions.toml's single `media3` version, unchanged in S01).
     //   - exoplayer:      the player + DefaultRenderersFactory (its built-in DV -> HEVC/AVC/AV1
     //                     fallback is what we rely on; no hand-rolled codec selection).
     //   - exoplayer-hls:  HLS support, the format the in-process streaming server emits for torrents.
     //   - ui:             PlayerView (we drive it as a SurfaceView, never TextureView).
     //   - session:        MediaSession so background/notification/remote transport controls work.
-    val media3 = "1.9.4"
-    implementation("androidx.media3:media3-exoplayer:$media3")
-    implementation("androidx.media3:media3-exoplayer-hls:$media3")
-    implementation("androidx.media3:media3-ui:$media3")
-    implementation("androidx.media3:media3-session:$media3")
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.exoplayer.hls)
+    implementation(libs.media3.ui)
+    implementation(libs.media3.session)
 
     // libmpv (PRIMARY player, sideloaded `full` flavor ONLY). The maven artifact ships the libmpv +
     // ffmpeg + player native .so set built from the mpv-android buildscripts: mpv 0.41.0 (the SAME
@@ -112,9 +138,9 @@ dependencies {
     // so this dependency is confined to the `full` (sideload) flavor via `fullImplementation` and is
     // NEVER pulled into the `play` (Play-Store) flavor. This mirrors the Apple sideloaded MPVKit-GPL
     // distribution model. Coordinate resolves from mavenCentral() (already in settings.gradle.kts).
-    "fullImplementation"("dev.jdtech.mpv:libmpv:1.0.0")
+    "fullImplementation"(libs.mpv.libmpv)
 
-    debugImplementation("androidx.compose.ui:ui-tooling")
+    debugImplementation(libs.compose.ui.tooling)
 
     // kotlinx-coroutines-android (already pulled above for ViewModel/Flow) backs the engine seam's
     // event->coroutine bridge in com.stremiox.android.engine. org.json (the engine JSON parser used
