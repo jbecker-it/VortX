@@ -1,8 +1,11 @@
 name: Build Android APK
 
 # CI-first Android build. Android cannot be built on the macOS dev machine (no SDK/JDK), so this
-# workflow is the build feedback loop: it builds the debug APK and uploads it as an artifact.
-# The shared engine (stremio-core-kotlin), the libmpv player, and the Compose UI matching tvOS/iOS
+# workflow is the build feedback loop: it builds both product flavors' debug APKs and uploads them
+# as artifacts, failing loud (not silently) if either is missing. Runs on push to main AND on every
+# PR touching android/ or core/ (S01: the engine's Rust side feeds the same APKs via cargoNdkBuild),
+# so a PR gets the same signal before it merges instead of only after.
+# The shared engine (stremio-core via JNI), the libmpv player, and the Compose UI matching tvOS/iOS
 # are added incrementally on top of this verified skeleton.
 
 on:
@@ -10,6 +13,12 @@ on:
     branches: [main]
     paths:
       - "android/**"
+      - "core/**"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "core/**"
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
@@ -31,10 +40,12 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
+      # No `gradle-version:` pin here: android/gradle/wrapper/gradle-wrapper.properties (S01 version
+      # catalog + wrapper) is the single source of truth for the Gradle version (8.11.1, the floor
+      # AGP 8.10.0 requires for compileSdk/targetSdk 36). This step only wires up dependency caching
+      # and build-scan capture around the `./gradlew` invocations below.
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
-        with:
-          gradle-version: "8.9"
 
       # The Compose app links libstremiox_core.so, cross-compiled from core/ by the gradle
       # cargoNdkBuild task (`cargo ndk -t arm64-v8a -t x86_64 -p 26 ... build --release`). That
@@ -60,14 +71,27 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version "^3" --locked
 
-      - name: Build debug APK
+      # Build each flavor's debug APK explicitly (not the blanket `assembleDebug`) so a task name typo
+      # or a flavor-scoped failure is attributable in the log, and so the "did both flavors actually
+      # produce an APK" check below has an unambiguous pair of paths to look for.
+      - name: Build full + play debug APKs
         working-directory: android
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleFullDebug assemblePlayDebug --no-daemon --stacktrace
 
-      # assembleDebug builds every flavor, and the full/play flavor split moved the outputs from
-      # apk/debug/ to apk/<flavor>/debug/ -- glob both so the artifact carries the sideload `full`
-      # APK and the `play` APK. error (not warn) so a path drift fails the job instead of silently
-      # uploading nothing.
+      # Fail loud (not "upload whatever exists") if either flavor's APK didn't come out the other end
+      # -- a silent gap here previously let a broken flavor pass CI. Checked before the upload step so
+      # the job fails with a clear, flavor-attributed message instead of upload-artifact's generic
+      # "no files matched" error.
+      - name: Verify both flavor APKs were produced
+        working-directory: android
+        run: |
+          for flavor in full play; do
+            if ! compgen -G "app/build/outputs/apk/$flavor/debug/*.apk" > /dev/null; then
+              echo "::error::No debug APK found for the '$flavor' flavor (expected app/build/outputs/apk/$flavor/debug/*.apk)"
+              exit 1
+            fi
+          done
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
