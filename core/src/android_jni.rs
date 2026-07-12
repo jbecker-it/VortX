@@ -87,6 +87,16 @@ pub extern "system" fn Java_com_stremiox_android_engine_StremioXCore_nativeInit<
     cache_dir: JString<'local>,
     listener: JObject<'local>,
 ) -> jboolean {
+    // Install the logcat backend once, under the same "StremioXEngine" tag the Kotlin side already
+    // logs under (`EngineStremioRepository.TAG`), so `adb logcat -s StremioXEngine` captures both
+    // sides of the FFI boundary. `nativeInit` is idempotent (see the doc comment above); re-running
+    // `init` on a second call is harmless (android_logger no-ops if already installed).
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Debug)
+            .with_tag("StremioXEngine"),
+    );
+
     let storage_dir: String = match env.get_string(&storage_dir) {
         Ok(value) => value.into(),
         Err(_) => return JNI_FALSE,
