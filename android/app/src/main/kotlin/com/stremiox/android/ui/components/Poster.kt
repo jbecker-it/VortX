@@ -72,6 +72,9 @@ fun PosterRail(
                     title = item.name,
                     subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
                     onClick = { onItem(item) },
+                    // Continue Watching items carry a watched fraction; the card draws its accent
+                    // progress track for them (null on plain catalog items = no track).
+                    progress = item.progress,
                     art = { PosterArt(item.poster, item.name) },
                     modifier = Modifier.width(124.dp).padding(end = VortXTheme.spacing.sm),
                 )

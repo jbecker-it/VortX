@@ -20,15 +20,20 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.conflate
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -39,14 +44,14 @@ import kotlin.time.Duration.Companion.seconds
 /// and [AuthRepository] contracts the Compose screens were built against, so wiring it in is a
 /// one-line change at the injection site (see `VortXApplication`) with zero UI churn.
 ///
-/// How it bridges the request/response gap: stremio-core is event-driven, not request/response. Each
-/// catalog repository call (a) dispatches the matching Load action, (b) suspends until the engine
-/// emits a `NewState` event naming the field it drives, then (c) pulls + parses that field's JSON. A
-/// timeout guards against a field that never re-emits (e.g. the engine had it cached and ActionLoad
-/// was a no-op), in which case we read whatever state is currently present. `signIn`/`signOut` follow
-/// the same shape but dispatch a whole-model broadcast (see [EngineActions.authenticateLogin]) instead
-/// of a single field's Load, and additionally race a `CoreEvent` sign-in error so a bad password
-/// surfaces the engine's own message instead of just timing out.
+/// How it bridges the request/response gap: stremio-core is event-driven, not request/response -- a
+/// Load is not one response but a STREAM of partial settlements (an immediate Loading flip, then one
+/// NewState per add-on answer). One-shot calls use [loadFieldUntil]: dispatch, then re-pull the field
+/// on every NewState naming it until a ready-predicate accepts the JSON (timeout falls back to the
+/// current state). The Home screen goes further and collects [homeUpdates], a continuous snapshot
+/// stream, so rails render incrementally and react to sign-in/sign-out live. `signIn`/`signOut`
+/// dispatch whole-model broadcasts (see [EngineActions.authenticateLogin]) and additionally race a
+/// `CoreEvent` sign-in error so a bad password surfaces the engine's own message.
 ///
 /// Threading (hardened, S03): [StremioXCore.EventListener.onEvent] fires on a native worker thread
 /// (a stremio-core tokio worker attached to the JVM, see `android_jni.rs`). [onEngineEvent] does the
@@ -132,7 +137,10 @@ class EngineStremioRepository(
         // extra dispatch/round-trip needed ("kill and relaunch restores state from engine
         // persistence", ANDROID-PLAN.md S03 DoD). Runs on whatever thread constructed this repository
         // (the engine's own lock, not the native callback thread), matching every other getState call.
-        if (started) refreshAuthState()
+        if (started) {
+            Log.i(TAG, "engine initialized (schemaVersion=${runCatching { StremioXCore.schemaVersion() }.getOrDefault(-1)})")
+            refreshAuthState()
+        }
     }
 
     /// Decode a `RuntimeEvent`: publish changed field names on a NewState, or a sign-in failure
@@ -151,6 +159,10 @@ class EngineStremioRepository(
                     }
                 }
                 if (fields.isEmpty()) return
+                // Diagnostic contract with the on-device test script: `adb logcat -s StremioXEngine`
+                // MUST show these lines while Home loads -- their absence proves the native event
+                // path is broken (vs. a parsing/reactivity bug on this side).
+                Log.d(TAG, "engine event NewState fields=$fields")
                 changedFields.tryEmit(fields)
                 // ctx changed (a sign-in, sign-out, or a persisted-profile hydration racing this
                 // listener registration): refresh the published AuthState off this thread so
@@ -159,6 +171,7 @@ class EngineStremioRepository(
                 if (EngineActions.FIELD_CTX in fields) engineScope.launch { refreshAuthState() }
             }
             "CoreEvent" -> {
+                Log.d(TAG, "engine event CoreEvent ${event.optJSONObject("args")?.optString("event")}")
                 EngineState.parseAuthErrorMessage(json.toString(Charsets.UTF_8))?.let { authErrors.tryEmit(it) }
             }
         }
@@ -175,75 +188,144 @@ class EngineStremioRepository(
         }
     }
 
-    /// Dispatch [actionJson], then await a NewState naming [field] (up to [loadTimeoutSeconds]), then
-    /// return the field's current JSON. If no event arrives in time, returns the current state anyway
-    /// (covers the cached no-op-load case). Returns [field]'s JSON, never null ("null" on error).
-    private suspend fun loadField(field: String, actionJson: String): String {
-        val awaited = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
-            // Subscribe first conceptually: dispatch then await. A buffered SharedFlow plus the small
-            // network latency of add-on calls means the emission lands after our await begins.
+    /// Dispatch [actionJson], then keep re-pulling [field] on every NewState that names it until
+    /// [ready] accepts the JSON or [loadTimeoutSeconds] elapses; on timeout, return the current state
+    /// anyway (best effort -- covers a cached no-op load AND lost/undelivered events). Returns
+    /// [field]'s JSON, never null ("null" on engine error).
+    ///
+    /// WHY a predicate and not "first event wins" (the S03 device-round bug): `Runtime::dispatch`
+    /// runs the model update SYNCHRONOUSLY -- a Load action flips the field to `Loading` and emits a
+    /// NewState immediately, long before any add-on HTTP answers. Awaiting a single event therefore
+    /// either (a) catches that immediate all-Loading emission and parses an empty result, or (b)
+    /// loses the subscribe race to it and rides the full timeout. The predicate loop instead treats
+    /// NewState as what it is -- "something changed, look again" -- and only returns when the state
+    /// actually has what the caller needs.
+    private suspend fun loadFieldUntil(field: String, actionJson: String, ready: (String) -> Boolean): String {
+        val settled = withTimeoutOrNull(loadTimeoutSeconds.seconds) {
             StremioXCore.dispatch(actionJson)
-            changedFields.first { field in it }
+            // The state may already satisfy the caller (engine had it cached; Load was a no-op that
+            // emits nothing) -- check before waiting on events at all.
+            val immediate = StremioXCore.getState("\"$field\"")
+            if (ready(immediate)) return@withTimeoutOrNull immediate
+            changedFields
+                .filter { field in it }
+                .map { StremioXCore.getState("\"$field\"") }
+                .first { ready(it) }
         }
-        // Whether the event arrived or we timed out, pull the latest state for the field.
-        if (awaited == null) {
-            // No event: the engine likely had it cached (ActionLoad was a no-op). Current state is best.
-        }
-        return StremioXCore.getState("\"$field\"")
+        return settled ?: StremioXCore.getState("\"$field\"")
     }
 
+    /// One-shot Home (kept for the [CatalogRepository] contract; the Home screen itself collects
+    /// [homeUpdates]): waits until at least one board row has content, then snapshots.
     override suspend fun home(): Result<List<Catalog>> = runCatching {
         StremioXCore.dispatch(EngineActions.loadBoard())
-        val state = loadField(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
-        // Real rail titles ("<add-on> · <catalog>"), not the bare `path.id`/`path.type` fallback: look
-        // up every row against the installed add-ons' own manifests (ctx is already hydrated by now,
-        // see `start()`/`refreshAuthState`).
+        loadFieldUntil(EngineActions.FIELD_BOARD, EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS)) {
+            EngineState.parseCatalogs(it).isNotEmpty()
+        }
+        homeSnapshot()
+    }
+
+    /// The continuous Home stream (see [CatalogRepository.homeUpdates]). Emits a snapshot immediately,
+    /// then again on every board/ctx/Continue-Watching NewState -- rails appear incrementally as each
+    /// add-on answers -- and re-dispatches the board load whenever the signed-in identity changes, so
+    /// sign-in swaps in the account's catalogs and sign-out swaps back to the defaults with no app
+    /// restart (S03 device-round finding #3).
+    ///
+    /// A slow poll (every [HOME_POLL_MS]) is merged in as a safety net: if engine events are ever
+    /// lost/undelivered on some device, Home still converges on the real state within a few seconds
+    /// instead of hanging forever -- and the `onEvent` logcat lines (see [onEngineEvent]) tell us
+    /// whether the events actually flowed. distinctUntilChanged suppresses the no-change poll spam;
+    /// conflate keeps a slow collector from ever queueing stale snapshots.
+    override fun homeUpdates(): Flow<List<Catalog>> = channelFlow {
+        var lastUid = (EngineState.parseAuthState(StremioXCore.getState(EngineActions.ctxField())) as? AuthState.SignedIn)?.uid
+        dispatchHomeLoad()
+        send(homeSnapshot())
+        launch {
+            changedFields.collect { fields ->
+                if (fields.none { it in HOME_FIELDS }) return@collect
+                if (EngineActions.FIELD_CTX in fields) {
+                    val uid = (EngineState.parseAuthState(StremioXCore.getState(EngineActions.ctxField())) as? AuthState.SignedIn)?.uid
+                    if (uid != lastUid) {
+                        lastUid = uid
+                        Log.i(TAG, "auth identity changed (uid=${uid != null}) -> reloading board")
+                        dispatchHomeLoad()
+                    }
+                }
+                send(homeSnapshot())
+            }
+        }
+        launch {
+            while (isActive) {
+                delay(HOME_POLL_MS)
+                send(homeSnapshot())
+            }
+        }
+    }.distinctUntilChanged().conflate()
+
+    private fun dispatchHomeLoad() {
+        StremioXCore.dispatch(EngineActions.loadBoard())
+        StremioXCore.dispatch(EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
+    }
+
+    /// Parse the CURRENT engine state into Home rails: titled board rows (real "<add-on> · <catalog>"
+    /// names from the installed manifests) with Continue Watching prepended (id = "continue" is the
+    /// contract HomeScreen keys its editorial eyebrow off of). Pure read -- no dispatch, no await --
+    /// so [homeUpdates] can call it on every event/poll tick cheaply.
+    private fun homeSnapshot(): List<Catalog> {
         val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
-        val boardRows = EngineState.parseCatalogs(state, titleMap)
-        // Prepend Continue Watching, the leading Home rail on iOS/tvOS. It is DERIVED state the engine
-        // hydrated from the library at construction (it emits no NewState of its own, mirroring Apple
-        // CoreBridge.seedInitialState), so we read the field straight rather than dispatching a load.
-        // The board load above has already pumped the event loop, so the field is populated by now.
-        // Fail-soft: an empty CW list simply yields no row, never an error, so Home still renders the
-        // add-on rails on a fresh (never-watched) account.
+        val boardRows = EngineState.parseCatalogs(StremioXCore.getState(EngineActions.boardField()), titleMap)
         val continueWatching = runCatching {
             EngineState.parseContinueWatching(StremioXCore.getState(EngineActions.continueWatchingPreviewField()))
         }.getOrDefault(emptyList())
-        if (continueWatching.isEmpty()) {
+        return if (continueWatching.isEmpty()) {
             boardRows
         } else {
-            // id = "continue" is the contract HomeScreen keys its editorial eyebrow off of.
             listOf(Catalog(id = "continue", title = "Continue Watching", items = continueWatching)) + boardRows
         }
     }
 
     override suspend fun discover(type: MediaType): Result<List<Catalog>> = runCatching {
-        val state = loadField(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscover())
         // Discover is one selectable rail in the engine (a CatalogWithFilters: the selected catalog's
         // flat pages, not the board's list-of-rails). parseCatalogWithFilters decodes that single rail
         // into a one-row catalog list so the UI's row-based Discover screen renders without special-
-        // casing. Fail-soft: any miss (engine unavailable, still-loading, empty) yields an empty list.
+        // casing. Wait until the selected catalog actually has content (the immediate post-Load state
+        // is Loading); on timeout fall through to whatever is there (fail-soft empty).
+        val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscover()) {
+            EngineState.parseCatalogWithFilters(it).isNotEmpty()
+        }
         val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
         EngineState.parseCatalogWithFilters(state, titleMap)
     }
 
     override suspend fun library(): Result<List<MetaItem>> = runCatching {
-        val state = loadField(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary())
+        // Library is DERIVED from the persisted ctx.library bucket (no add-on HTTP), so the immediate
+        // post-dispatch snapshot is already the real answer -- ready = always, no event wait. A
+        // genuinely empty library must return [] instantly, not ride a timeout.
+        val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
         EngineState.parseLibrary(state)
     }
 
     override suspend fun search(query: String): Result<List<MetaItem>> = runCatching {
         if (query.isBlank()) return@runCatching emptyList()
         StremioXCore.dispatch(EngineActions.searchLoad(query))
-        val state = loadField(EngineActions.FIELD_SEARCH, EngineActions.searchRange(DEFAULT_SEARCH_ROWS))
         // search is a CatalogsWithExtra (rails); flatten the rails to a flat result list for the UI.
+        // Ready = first add-on answered with rows; a genuinely zero-hit query rides the timeout and
+        // returns [] (acceptable until S04 makes Search reactive like Home).
+        val state = loadFieldUntil(EngineActions.FIELD_SEARCH, EngineActions.searchRange(DEFAULT_SEARCH_ROWS)) {
+            EngineState.parseCatalogs(it).any { row -> row.items.isNotEmpty() }
+        }
         EngineState.parseCatalogs(state).flatMap { it.items }
     }
 
     override suspend fun meta(type: MediaType, id: String): Result<MetaDetail> = runCatching {
-        val state = loadField(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id))
+        // Ready = the meta actually parsed (first Ready Loadable in metaItems). The immediate
+        // post-Load state is Loading, so a single-event await would leak a not-ready miss to the UI
+        // (the "meta_details not ready" string the S03 device round saw rendered raw).
+        val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, EngineActions.loadMeta(type.id, id)) {
+            EngineState.parseMetaDetail(it) != null
+        }
         EngineState.parseMetaDetail(state)
-            ?: throw IllegalStateException("meta_details not ready for $id")
+            ?: throw IllegalStateException("Couldn't load this title's details. Check your connection and try again.")
     }
 
     override suspend fun streams(type: MediaType, id: String, episodeId: String?): Result<List<StreamGroup>> = runCatching {
@@ -258,7 +340,11 @@ class EngineStremioRepository(
         } else {
             EngineActions.loadMeta(type.id, id)
         }
-        val state = loadField(EngineActions.FIELD_META_DETAILS, action)
+        // Ready = at least one add-on's stream group settled; later groups keep landing in engine
+        // state and S05's reactive detail work will surface them incrementally.
+        val state = loadFieldUntil(EngineActions.FIELD_META_DETAILS, action) {
+            EngineState.parseStreamGroups(it).isNotEmpty()
+        }
         EngineState.parseStreamGroups(state)
     }
 
@@ -350,5 +436,17 @@ class EngineStremioRepository(
         const val DEFAULT_BOARD_ROWS = 12
         const val DEFAULT_SEARCH_ROWS = 30
         const val TAG = "StremioXEngine"
+
+        /// The NewState fields that affect the Home composition (board rails, add-on titles + auth
+        /// from ctx, the Continue Watching rail).
+        val HOME_FIELDS = setOf(
+            EngineActions.FIELD_BOARD,
+            EngineActions.FIELD_CTX,
+            EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW,
+        )
+
+        /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
+        /// distinctUntilChanged means an unchanged snapshot never reaches the UI.
+        const val HOME_POLL_MS = 3_000L
     }
 }

@@ -133,9 +133,21 @@ internal object EngineState {
                 type = MediaType.fromId(obj.optString("type", "movie")),
                 name = obj.optString("name"),
                 poster = obj.optStringOrNull("poster"),
+                progress = cwProgress(obj.optJSONObject("state")),
             )
         }
         return out
+    }
+
+    /// Watched fraction (0..1) from a library item's `state` block (`timeOffset`/`duration`, both in
+    /// milliseconds -- the same math as Apple `LibraryItem.progress`), or null when unknown/zero so
+    /// the PosterCard progress track only draws for genuinely in-progress items.
+    private fun cwProgress(state: JSONObject?): Float? {
+        if (state == null) return null
+        val timeOffset = state.optDouble("timeOffset", 0.0)
+        val duration = state.optDouble("duration", 0.0)
+        if (duration <= 0.0 || timeOffset <= 0.0) return null
+        return (timeOffset / duration).toFloat().coerceIn(0f, 1f)
     }
 
     /// Parse the `ctx` field's `profile.addons` into a `"<base>|<type>|<id>"` -> `"<add-on> · <catalog>"`
