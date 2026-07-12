@@ -155,6 +155,59 @@ object EngineActions {
     /// for an explicit user sign-out, never for a profile switch) and clears `ctx.profile.auth`.
     fun logout(): String = ctxEnvelope(action("Logout", null))
 
+    // ---- S05: Detail watched-state + library mutations ----
+    //
+    // Mirrors Apple `CoreBridge`'s `dispatchMetaDetails`/`dispatchCtx` exactly (verified against the
+    // vendored stremio-core crate's `ActionMetaDetails`/`ActionCtx` enums, `runtime/msg/action.rs`):
+    // whole-title and per-video/season watched toggles are `Action::MetaDetails(ActionMetaDetails::…)`,
+    // dispatched with field = "meta_details" (NOT a Ctx broadcast -- only library add/remove is). Every
+    // stremio-core `dispatch` runs the model update SYNCHRONOUSLY (see [EngineStremioRepository]'s class
+    // doc), and `MetaDetails::update` recomputes `library_item` from `ctx.library` on EVERY dispatched
+    // message (not just its own field's actions), so a `meta_details` field re-read immediately after any
+    // of these -- including the Ctx-scoped library ones below -- already reflects the mutation with no
+    // event wait required.
+
+    /// The state field-selector for `meta_details`, for direct snapshot reads after a mutation below.
+    fun metaDetailsField(): String = "\"$FIELD_META_DETAILS\""
+
+    /// Mark the whole title watched/unwatched: a movie's only watched flag, or (for a series) the
+    /// engine's own "every video" aggregate. Mirrors Apple `CoreBridge.markWatched`'s `true` branch;
+    /// the false (unwatch-every-video) branch is [markVideoAsWatched] called per video by the caller,
+    /// since `MarkAsWatched(false)` alone does not clear the per-video ticks (same engine quirk Apple's
+    /// comment documents).
+    fun markAsWatched(isWatched: Boolean): String =
+        envelope(FIELD_META_DETAILS, action("MetaDetails", action("MarkAsWatched", isWatched)))
+
+    /// Mark one episode watched/unwatched. `Video` only strictly needs `id`; season/episode are included
+    /// when known (harmless extras, and match what Apple sends) but are not required by the engine's
+    /// `Video` struct.
+    fun markVideoAsWatched(videoId: String, season: Int?, episode: Int?, isWatched: Boolean): String {
+        val video = JSONObject().put("id", videoId)
+        if (season != null) video.put("season", season)
+        if (episode != null) video.put("episode", episode)
+        val args = JSONArray().put(video).put(isWatched)
+        return envelope(FIELD_META_DETAILS, action("MetaDetails", action("MarkVideoAsWatched", args)))
+    }
+
+    /// Mark every video of one season watched/unwatched.
+    fun markSeasonAsWatched(season: Int, isWatched: Boolean): String {
+        val args = JSONArray().put(season).put(isWatched)
+        return envelope(FIELD_META_DETAILS, action("MetaDetails", action("MarkSeasonAsWatched", args)))
+    }
+
+    /// Add the open detail title to the library, as a minimal `MetaItemPreview` (only `id`/`type`/`name`
+    /// are required by the engine's struct -- see stremio-core's `MetaItemPreview`/`MetaItemPreviewLegacy`
+    /// conversion; every other field defaults). Mirrors Apple `CoreBridge.addDetailToLibrary`.
+    fun addToLibrary(id: String, type: String, name: String, poster: String?): String {
+        val preview = JSONObject().put("id", id).put("type", type).put("name", name)
+        if (poster != null) preview.put("poster", poster)
+        return ctxEnvelope(action("AddToLibrary", preview))
+    }
+
+    /// Remove the open detail title from the library (the engine sets `removed = true`; the entry is
+    /// tombstoned, not deleted). Mirrors Apple `CoreBridge.removeFromLibrary`.
+    fun removeFromLibrary(id: String): String = ctxEnvelope(action("RemoveFromLibrary", id))
+
     // ---- low-level builders ----
 
     /// `{ "action": <tag>, "args": <args> }`. `args == null` omits the key (for arg-less actions).
