@@ -88,27 +88,38 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
 
 /// The type/catalog/genre chip rows above Discover's grid. No-ops while [filters] is null (still
 /// loading) so the grid below owns the loading/error/empty state exclusively.
+///
+/// GROUP 3b fix (Fold cover-screen device round: "three stacked chip rows... look wonky"): the parent
+/// [DiscoverScreen] `Column` has no `verticalArrangement`, so up to three independently-emitted
+/// [ChipScrollRow]s (type / catalog / genre) previously sat back-to-back with only each row's own tiny
+/// `xs` vertical padding between them (2x `xs` total) -- on a wide phone that gap reads as "tight but
+/// fine"; on the Fold's ~344dp-wide cover screen, where every row ALSO wraps its chips onto a horizontal
+/// scroll almost immediately, the rows visually collide into a dense, hard-to-parse block. Wrapping the
+/// (at most three) rows in their own [Column] with explicit `sm` spacing keeps every row scrollable
+/// and unchanged in content, just legibly separated -- a minimal, cosmetic-only fix, not a redesign.
 @Composable
 private fun DiscoverFilterChips(filters: DiscoverFilters?, onSelect: (String) -> Unit) {
     if (filters == null) return
-    if (filters.types.isNotEmpty()) {
-        ChipScrollRow {
-            filters.types.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+    Column(verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
+        if (filters.types.isNotEmpty()) {
+            ChipScrollRow {
+                filters.types.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
-    }
-    if (filters.catalogs.size > 1) {
-        ChipScrollRow {
-            filters.catalogs.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+        if (filters.catalogs.size > 1) {
+            ChipScrollRow {
+                filters.catalogs.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
-    }
-    if (filters.genres.isNotEmpty()) {
-        ChipScrollRow {
-            filters.genres.forEach { option ->
-                Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+        if (filters.genres.isNotEmpty()) {
+            ChipScrollRow {
+                filters.genres.forEach { option ->
+                    Chip(label = option.label, selected = option.selected, onClick = { onSelect(option.requestJson) })
+                }
             }
         }
     }
