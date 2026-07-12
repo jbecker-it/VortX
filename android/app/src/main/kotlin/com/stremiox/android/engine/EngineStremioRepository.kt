@@ -407,6 +407,52 @@ class EngineStremioRepository(
         }
     }
 
+    // ---- S05: Detail watched-state + library mutations ----
+    //
+    // Every dispatch below is followed by an IMMEDIATE re-read of `meta_details` (no loadFieldUntil
+    // wait): stremio-core's `Runtime::dispatch` runs synchronously and `MetaDetails::update` recomputes
+    // `library_item` from `ctx.library` on every dispatched message, so the post-dispatch snapshot
+    // already carries the mutation -- see [EngineActions]'s "S05" doc comment for the full reasoning.
+    // Returning the refreshed [MetaDetail] lets the ViewModel swap its state in one step instead of a
+    // separate re-load, so ticks/progress/library-chip state flip live the instant the action returns.
+
+    private fun currentMetaDetail(): MetaDetail? =
+        EngineState.parseMetaDetail(StremioXCore.getState(EngineActions.metaDetailsField()))
+
+    override suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = runCatching {
+        StremioXCore.dispatch(EngineActions.markAsWatched(isWatched))
+        currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+    }
+
+    override suspend fun setVideoWatched(
+        type: MediaType,
+        id: String,
+        videoId: String,
+        season: Int?,
+        episode: Int?,
+        isWatched: Boolean,
+    ): Result<MetaDetail> = runCatching {
+        StremioXCore.dispatch(EngineActions.markVideoAsWatched(videoId, season, episode, isWatched))
+        currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+    }
+
+    override suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
+        runCatching {
+            StremioXCore.dispatch(EngineActions.markSeasonAsWatched(season, isWatched))
+            currentMetaDetail() ?: throw IllegalStateException("Couldn't update watched state.")
+        }
+
+    override suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
+        runCatching {
+            StremioXCore.dispatch(EngineActions.addToLibrary(id, type.id, name, poster))
+            currentMetaDetail() ?: throw IllegalStateException("Couldn't add this title to your library.")
+        }
+
+    override suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = runCatching {
+        StremioXCore.dispatch(EngineActions.removeFromLibrary(id))
+        currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
+    }
+
     // ---- AuthRepository ----
 
     override suspend fun signIn(email: String, password: String): Result<Unit> = runCatching {

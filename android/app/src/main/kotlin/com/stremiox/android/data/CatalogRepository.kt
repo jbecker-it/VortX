@@ -62,6 +62,39 @@ interface CatalogRepository {
     /// its local HLS URL, unlock a debrid link, or pass an HTTP link straight through. It also folds in
     /// the per-profile resume position. The player only ever receives a concrete URL.
     suspend fun resolve(source: StreamSource): Result<Playable>
+
+    // ---- S05: Detail watched-state + library mutations ----
+    //
+    // Every mutation returns the freshly re-pulled [MetaDetail] so the caller can swap its state in one
+    // step (ticks/progress/library-chip flip live) instead of a separate reload. Default bodies just
+    // re-fetch [meta] unchanged, so an implementation that predates this session (the offline preview,
+    // any future repository that doesn't model mutation) still satisfies the contract with a benign
+    // no-op rather than a compile break; [EngineStremioRepository] overrides every one of these for the
+    // real engine dispatch.
+
+    /// Mark the whole title (movie, or every episode of a series) watched/unwatched.
+    suspend fun setWatched(type: MediaType, id: String, isWatched: Boolean): Result<MetaDetail> = meta(type, id)
+
+    /// Mark one series episode watched/unwatched. [videoId] is the engine `CoreVideo.id`.
+    suspend fun setVideoWatched(
+        type: MediaType,
+        id: String,
+        videoId: String,
+        season: Int?,
+        episode: Int?,
+        isWatched: Boolean,
+    ): Result<MetaDetail> = meta(type, id)
+
+    /// Mark every episode of one season watched/unwatched.
+    suspend fun setSeasonWatched(type: MediaType, id: String, season: Int, isWatched: Boolean): Result<MetaDetail> =
+        meta(type, id)
+
+    /// Save the open title to the library.
+    suspend fun addToLibrary(type: MediaType, id: String, name: String, poster: String?): Result<MetaDetail> =
+        meta(type, id)
+
+    /// Remove the open title from the library.
+    suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = meta(type, id)
 }
 
 /// The canonical name for the engine seam. The screens were built against [CatalogRepository]; the

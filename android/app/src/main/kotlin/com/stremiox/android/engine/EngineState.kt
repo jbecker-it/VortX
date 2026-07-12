@@ -3,6 +3,7 @@ package com.stremiox.android.engine
 import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.Episode
+import com.stremiox.android.model.LibraryItemInfo
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.MetaItem
@@ -244,13 +245,55 @@ internal object EngineState {
             name = metaObj.optString("name"),
             poster = metaObj.optStringOrNull("poster"),
             background = metaObj.optStringOrNull("background"),
+            logo = metaObj.optStringOrNull("logo"),
             description = metaObj.optStringOrNull("description"),
             releaseInfo = metaObj.optStringOrNull("releaseInfo"),
             runtime = metaObj.optStringOrNull("runtime"),
             imdbRating = metaObj.optStringOrNull("imdbRating"),
             genres = parseGenres(metaObj),
+            cast = parseCredits(metaObj, "cast", "actors", "actor"),
+            directors = parseCredits(metaObj, "director", "directors"),
+            writers = parseCredits(metaObj, "writer", "writers"),
             videos = parseVideos(metaObj),
+            libraryItem = parseLibraryItemInfo(root.optJSONObject("libraryItem")),
+            watchedVideoIds = parseWatchedVideoIds(root),
         )
+    }
+
+    /// Parse `meta_details.libraryItem` (the engine's saved library entry for the OPEN title, a
+    /// `LibraryItem` -- see `core/src/model.rs`'s `TvosModel::meta_details_json`) into
+    /// [LibraryItemInfo]. Null when the title has never been added/watched (the field is absent, not
+    /// an empty object) -- the caller reads that as "not in library, no resume position".
+    private fun parseLibraryItemInfo(obj: JSONObject?): LibraryItemInfo? {
+        if (obj == null) return null
+        val state = obj.optJSONObject("state")
+        return LibraryItemInfo(
+            id = obj.optStringOrNull("_id"),
+            removed = obj.optBoolean("removed", false),
+            temp = obj.optBoolean("temp", false),
+            // LibraryItemState.video_id keeps its Rust snake_case name in JSON (an explicit
+            // `#[serde(rename = "video_id")]` overrides the struct's camelCase default) -- every
+            // other field below follows the normal camelCase rule. See stremio-core's
+            // `types::library::library_item::LibraryItemState`.
+            videoId = state?.optStringOrNull("video_id"),
+            timeOffsetMs = state?.optLong("timeOffset", 0L) ?: 0L,
+            durationMs = state?.optLong("duration", 0L) ?: 0L,
+            timesWatched = state?.optInt("timesWatched", 0) ?: 0,
+        )
+    }
+
+    /// Parse `meta_details.watchedVideoIds` -- the per-episode watched set `TvosModel::meta_details_json`
+    /// computes from the engine's WatchedBitField and injects into the JSON (the bitfield itself is
+    /// `#[serde(skip_serializing)]`, unreadable directly). Absent (an unloaded/movie meta_details) parses
+    /// to an empty set, never a throw.
+    private fun parseWatchedVideoIds(root: JSONObject): Set<String> {
+        val array = root.optJSONArray("watchedVideoIds") ?: return emptySet()
+        val out = mutableSetOf<String>()
+        for (i in 0 until array.length()) {
+            val id = array.optString(i)
+            if (id.isNotBlank()) out += id
+        }
+        return out
     }
 
     /// Parse the stream source groups from `meta_details.streams`. One [StreamGroup] per source add-on
@@ -321,6 +364,24 @@ internal object EngineState {
             }
         }
         return genres
+    }
+
+    /// Credits (cast/director/writer) come from the same `links` array as [parseGenres] -- each named
+    /// person is one categorized link, the engine's own convention (mirrors Apple `CoreMetaItem.cast`/
+    /// `.directors`/`.writers`). [categories] accepts singular and plural spellings since add-ons
+    /// differ; no extra network call (TMDB headshot enrichment is a later, separate addition -- see
+    /// this session's report).
+    private fun parseCredits(meta: JSONObject, vararg categories: String): List<String> {
+        val links = meta.optJSONArray("links") ?: return emptyList()
+        val wanted = categories.toSet()
+        val out = mutableListOf<String>()
+        for (i in 0 until links.length()) {
+            val link = links.optJSONObject(i) ?: continue
+            if (link.optString("category").lowercase() in wanted) {
+                link.optStringOrNull("name")?.let { out += it }
+            }
+        }
+        return out
     }
 
     private fun parseStream(obj: JSONObject, addon: String): StreamSource {
