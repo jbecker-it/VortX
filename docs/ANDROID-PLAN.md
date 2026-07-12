@@ -58,6 +58,39 @@ interaction, VortX idiom for look).
 5. **Secrets in Keystore-backed storage** (EncryptedSharedPreferences / Android Keystore), never
    plain prefs — account token, debrid keys, profile PIN hashes.
 6. **minSdk 26, edge-to-edge, target current SDK** (targetSdk bump is its own reviewed change, S1).
+7. **One binary per flavor covers phone, tablet, and TV.** There is no third flavor and no
+   dedicated TV APK; see "Form factors & packaging" below.
+
+### Form factors & packaging: no dedicated TV APK
+**Decision:** phone and Android TV ship in the **same APK/AAB per flavor**. TV is a **runtime UI
+variant** (form-factor detection → TV navigation shell), not a build variant. The flavor dimension
+stays `distribution` (full/play) only — a TV split would double the matrix to four artifacts and,
+worse, a separate TV applicationId would break invariant #1 and split accounts/settings between a
+user's own devices.
+
+Why one binary works and is the right call:
+- **Sideload (full flavor):** one `VortX-android-x.y.z.apk` installs on phones, tablets, Google TV,
+  and Fire TV alike — the Apple-style "grab the release asset" story stays simple, and an update is
+  one artifact. The TV UI code (androidx.tv / Compose for TV) is pure Kotlin/DEX, adds ~no native
+  weight; the heavy payload (libmpv `.so`s) is identical on both form factors anyway. Per-ABI split
+  APKs (arm64-v8a primary, armeabi-v7a for older Fire TV sticks) are a size optimization in S15,
+  orthogonal to form factor.
+- **Play (play flavor):** Google explicitly supports one app bundle serving mobile + TV; the TV
+  form factor is enabled in the Play Console (TV track + TV quality review), same package name,
+  same AAB. Play then delivers the right slices per device.
+- **Manifest requirements** (land in S13): a `LEANBACK_LAUNCHER` intent-filter entry point + TV
+  banner (320×180 `xhdpi`), `<uses-feature android:name="android.software.leanback"
+  android:required="false"/>` and `android.hardware.touchscreen` `required="false"` so one manifest
+  is installable everywhere, full D-pad operability, and no TV-blocking requirements (camera,
+  telephony, portrait-only) marked required.
+- **Runtime routing:** on launch, detect TV (`UiModeManager.currentModeType ==
+  UI_MODE_TYPE_TELEVISION` / leanback feature) and enter the TV shell (D-pad focus navigation,
+  10-ft layouts per `SourcesTV/`); otherwise the touch shell. Shared: theme/tokens (S02), engine +
+  repositories (S03+), ranking (S06), player engines and chrome logic (S07/S08), settings/profiles
+  stores (S09). TV-only composables live in their own source folder/module so the boundary stays
+  reviewable, but compile into the same artifact.
+- **Fire TV:** the same sideloaded full-flavor APK covers it (Amazon Appstore, if ever pursued,
+  takes the same binary under its own listing; armeabi-v7a via the S15 split for old sticks).
 
 ### Android-native translation table (Apple idiom → Android idiom)
 | Apple apps | Android |
@@ -217,14 +250,21 @@ test on ar locale.
 
 ### Phase D — Every screen (TV) and shipping
 
-**S13 — Android TV app (tvOS parity).**
-Scope: `tv` source set or `:tv` module decision (worker proposes, governor approves before
-implementing), Compose for TV (androidx.tv), leanback launcher entry + banner, D-pad focus
+**S13 — Android TV app (tvOS parity, same APK — invariant #7).**
+Scope: implement the TV runtime variant inside the existing artifact per "Form factors &
+packaging" in §0: manifest work (LEANBACK_LAUNCHER entry, TV banner, leanback + touchscreen
+`required="false"`, D-pad operability, no TV-blocking required features), runtime form-factor
+routing into a TV shell, TV composables isolated in their own source folder or library module
+(worker proposes the structure, governor approves before implementing — but it compiles into the
+same APK/AAB, never a separate applicationId or flavor). Compose for TV (androidx.tv), D-pad focus
 treatment = the DESIGN-SYSTEM focus glow, 10-ft Home/Detail/Discover/Library/Live per
 `SourcesTV/`, QR sign-in (port `OrigamiSpace` LoginView flow), player chrome for remote
-(hold-to-seek acceleration), profiles picker. Same two flavors apply.
-DoD: runs on a Google TV / Fire TV device or emulator with full D-pad navigation, no touch-only
-dead ends; side-by-side with Apple TV screenshots.
+(hold-to-seek acceleration), profiles picker. Everything below the UI (engine, ranking, players,
+settings/profiles stores, theme tokens) is reused, not duplicated. Same two flavors apply
+unchanged.
+DoD: the **same APK** installs and runs correctly on a phone and on a Google TV / Fire TV device
+or emulator; on TV, full D-pad navigation with no touch-only dead ends and the leanback launcher
+shows the VortX banner; on phone, zero regression; side-by-side with Apple TV screenshots.
 
 **S14 — Torrent path (full flavor): embedded streaming server.**
 Scope: decide + implement the torrent story for `full` (options, worker evaluates: nodejs-mobile +
@@ -237,8 +277,11 @@ DoD: a well-seeded public-domain torrent streams in full flavor; play flavor sho
 server-required state instead.
 
 **S15 — Release engineering + hardening.**
-Scope: R8/minify + baseline profiles + startup metrics, ABI splits / app bundle for play,
-signing + versioning scheme aligned with the Apple release train, SHA-256 checksums + verified
+Scope: R8/minify + baseline profiles + startup metrics, per-ABI split APKs for the sideloaded
+full flavor (arm64-v8a primary + armeabi-v7a for older Fire TV sticks, plus the universal APK) and
+the single AAB for play (serving mobile + TV from one bundle; enable the TV form factor in the
+Play Console when that listing happens), signing + versioning scheme aligned with the Apple
+release train, SHA-256 checksums + verified
 `-ci` build parity in releases, Play pre-launch checklist (data safety, no GPL), accessibility
 pass (TalkBack on every screen, touch targets, contrast — tokens already pass 4.5:1), performance
 pass (jank on rails, image cache tuning), THIRD-PARTY-NOTICES update, README/ROADMAP update to
@@ -288,7 +331,7 @@ S01), kids mode, channel guide + M3U import — pull from `ROADMAP.md` as the Ap
 | S10 | Hero + backdrop + Collections | not started | — | |
 | S11 | Playback intelligence + Live TV | not started | — | |
 | S12 | Backup/import/updates/i18n | not started | — | |
-| S13 | Android TV | not started | — | |
+| S13 | Android TV (same APK, invariant #7) | not started | — | |
 | S14 | Torrents (full flavor server) | not started | — | |
 | S15 | Release engineering | not started | — | |
 
