@@ -24,7 +24,9 @@ enum class MediaType(val label: String, val id: String) {
 }
 
 /// A single catalog entry (movie, series, etc.). [poster] is a URL once the engine is wired; until
-/// then it is null and the UI renders a deterministic brand-tinted placeholder card.
+/// then it is null and the UI renders a deterministic brand-tinted placeholder card. [progress]
+/// (0f..1f, null = not in progress) comes from the library's timeOffset/duration on Continue
+/// Watching items and drives PosterCard's accent progress track.
 data class MetaItem(
     val id: String,
     val type: MediaType,
@@ -32,6 +34,7 @@ data class MetaItem(
     val poster: String? = null,
     val year: String? = null,
     val description: String? = null,
+    val progress: Float? = null,
 )
 
 /// A named row of items, e.g. "Continue Watching" or an add-on catalog like "Cinemeta - Popular".

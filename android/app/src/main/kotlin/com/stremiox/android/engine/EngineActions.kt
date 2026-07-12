@@ -98,6 +98,10 @@ object EngineActions {
     /// every `ActionCtx` mutation below re-emits it via the whole-model dispatch path.
     fun ctxField(): String = "\"$FIELD_CTX\""
 
+    /// The state field-selector for `board`, for direct snapshot reads (the continuous Home stream
+    /// re-reads the board on every relevant NewState rather than one-shot loading it).
+    fun boardField(): String = "\"$FIELD_BOARD\""
+
     /// Email/password sign-in, mirroring Apple `CoreBridge`'s `Authenticate`/`LoginWithToken` dispatch
     /// (here the `Login` variant of the engine's `AuthRequest`, the same request the account API
     /// login form makes on every Stremio client). Broadcasts to the whole model (field = null, like

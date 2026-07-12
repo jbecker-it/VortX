@@ -9,6 +9,8 @@ import com.stremiox.android.model.Playable
 import com.stremiox.android.model.StreamGroup
 import com.stremiox.android.model.StreamSource
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 
 /// The seam between the UI and the engine. The Compose screens depend only on this interface, so the
 /// real stremio-core-kotlin engine (Rust core over JNI, the same engine the iOS/tvOS apps use) lands
@@ -20,6 +22,18 @@ import kotlinx.coroutines.delay
 interface CatalogRepository {
     /// Home rows: Continue Watching first, then the user's add-on catalogs as poster rails.
     suspend fun home(): Result<List<Catalog>>
+
+    /// CONTINUOUS Home rows: emits the current rail set immediately and again every time the engine's
+    /// underlying state changes (each add-on catalog answering, Continue Watching updating, a
+    /// sign-in/sign-out swapping the whole catalog set). The engine is event-driven -- a board load is
+    /// not one response but a stream of partial settlements, one per add-on -- so Home must collect
+    /// this for the screen's lifetime and render incrementally; a one-shot [home] call can only ever
+    /// see whichever instant it sampled (the S03 device round proved that renders empty rails).
+    /// Emissions are conflated + deduplicated; the flow never completes (cancel via scope).
+    ///
+    /// Default = a single [home] emission, so the offline preview impl (and any other one-shot
+    /// implementation) satisfies the contract without change.
+    fun homeUpdates(): Flow<List<Catalog>> = flow { emit(home().getOrThrow()) }
 
     /// Discover rows filtered by type (Movie/Series/...), drawn from the installed add-ons.
     suspend fun discover(type: MediaType): Result<List<Catalog>>

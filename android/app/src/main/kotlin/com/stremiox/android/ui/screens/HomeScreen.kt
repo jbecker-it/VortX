@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,6 +23,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MetaItem
 import com.stremiox.android.ui.UiState
+import com.stremiox.android.ui.components.EmptyState
 import com.stremiox.android.ui.components.ErrorState
 import com.stremiox.android.ui.components.LoadingRail
 import com.stremiox.android.ui.components.PosterRail
@@ -38,7 +40,20 @@ fun HomeScreen(viewModel: HomeViewModel, onItem: (MetaItem) -> Unit, modifier: M
     when (val s = state) {
         is UiState.Loading -> LoadingColumn(modifier)
         is UiState.Error -> ErrorState(s.message, onRetry = viewModel::load, modifier = modifier)
-        is UiState.Success -> HomeContent(s.data, onItem, modifier)
+        is UiState.Success ->
+            // Belt-and-braces: the ViewModel never publishes an empty Success today, but if that
+            // contract ever regresses, render the composed empty state -- a bare black Home screen
+            // (the S03 device-round symptom) must be unrepresentable here.
+            if (s.data.isEmpty()) {
+                EmptyState(
+                    "No catalogs yet. Check your connection, or sign in from Settings.",
+                    modifier,
+                    actionLabel = "Retry",
+                    onAction = viewModel::load,
+                )
+            } else {
+                HomeContent(s.data, onItem, modifier)
+            }
     }
 }
 
@@ -82,6 +97,13 @@ private fun HeroHeader(item: MetaItem) {
     Box(
         modifier = Modifier
             .fillMaxWidth()
+            // Cap the hero's height BEFORE applying the aspect ratio: on a large-screen portrait
+            // window (tablet / unfolded foldable, width 800-1000dp) an unclamped 16:10 of full width
+            // is a 500-640dp near-black gradient block that swallows the viewport and reads as a
+            // blank screen (S03 device-round finding on the Tab S11 Ultra). Phones stay under the
+            // cap, so their ratio is untouched; when the cap binds, the box goes full-width at
+            // 420dp tall instead (fine for a gradient; S10's real artwork brings its own sizing).
+            .heightIn(max = 420.dp)
             .aspectRatio(16f / 10f)
             .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
     ) {
