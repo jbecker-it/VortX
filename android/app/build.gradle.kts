@@ -17,6 +17,16 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.3.0"
+
+        // Package ONLY the ABIs the Rust engine is cross-compiled for (the cargoNdkBuild task's
+        // androidAbis list below). Without this, the libmpv AAR's extra armeabi-v7a/x86 slices made
+        // AGP emit those ABIs too (verified by S03 APK inspection) -- and a 32-bit device would then
+        // install a slice that has mpv but NO libstremiox_core.so, silently degrading the whole app
+        // to preview data. One list, one truth: extend androidAbis + this together if 32-bit support
+        // lands (S15 schedules armeabi-v7a via per-ABI splits for old Fire TV sticks).
+        ndk {
+            abiFilters += listOf("arm64-v8a", "x86_64")
+        }
     }
 
     buildTypes {
@@ -148,6 +158,13 @@ dependencies {
     // kotlinx-coroutines-android (already pulled above for ViewModel/Flow) backs the engine seam's
     // event->coroutine bridge in com.stremiox.android.engine. org.json (the engine JSON parser used
     // by EngineState/EngineActions) ships with the Android platform, so no extra JSON dependency.
+
+    // Coil (S03): real poster/backdrop art in PosterCard's `art` slot. coil-compose ships the
+    // AsyncImage composable + a default ImageLoader; coil-network-okhttp is Coil3's separated HTTP
+    // engine (required since 3.0 split fetching out of coil-compose). Both flavors need it (posters
+    // aren't GPL-licensed), so this is a plain `implementation`, not flavor-scoped.
+    implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
 }
 
 // =====================================================================================================

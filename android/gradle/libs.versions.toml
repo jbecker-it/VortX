@@ -29,6 +29,13 @@
 #     Kotlin 2.3.0, not the latest-as-of-today release, for the same forward-metadata-compat reason.
 #   - media3 and kotlinx-coroutines-android are carried over UNCHANGED from the pre-S01 pins; nothing
 #     in this session's scope required moving them.
+#   - coil: 3.3.0 (S03 engine bring-up, image loading for the real catalog posters). Picked for the
+#     SAME forward-metadata-compat reason as composeBom above: Coil's changelog records 3.3.0 as
+#     "Update Kotlin to 2.2.0" (released 2025-07-22), the last Coil3 line built against the 2.2.x
+#     compiler family before 3.4.0 jumped to Kotlin 2.3.10 -- a 2.2.10 compiler cannot read that
+#     newer metadata (the same failure class documented for composeBom/kotlin above), so 3.3.0 is the
+#     newest Coil that stays inside our pinned window. `coil-compose` + `coil-network-okhttp` (Coil3
+#     split HTTP fetching out of core; okhttp is the documented default engine) are both this version.
 
 [versions]
 agp = "8.10.0"
@@ -42,6 +49,7 @@ coroutines = "1.8.1"
 media3 = "1.9.4"
 securityCrypto = "1.1.0"
 mpvLibmpv = "1.0.0"
+coil = "3.3.0"
 
 [libraries]
 compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
@@ -66,6 +74,9 @@ media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "medi
 media3-session = { group = "androidx.media3", name = "media3-session", version.ref = "media3" }
 
 mpv-libmpv = { group = "dev.jdtech.mpv", name = "libmpv", version.ref = "mpvLibmpv" }
+
+coil-compose = { group = "io.coil-kt.coil3", name = "coil-compose", version.ref = "coil" }
+coil-network-okhttp = { group = "io.coil-kt.coil3", name = "coil-network-okhttp", version.ref = "coil" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
