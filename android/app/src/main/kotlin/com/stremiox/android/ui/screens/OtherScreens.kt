@@ -1,5 +1,7 @@
 package com.stremiox.android.ui.screens
 
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -13,16 +15,9 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.horizontalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.Person
-import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Subtitles
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -30,20 +25,25 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.stremiox.android.BuildConfig
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaItem
 import com.stremiox.android.ui.UiState
+import com.stremiox.android.ui.components.Chip
 import com.stremiox.android.ui.components.EmptyState
 import com.stremiox.android.ui.components.ErrorState
 import com.stremiox.android.ui.components.LoadingRail
 import com.stremiox.android.ui.components.PosterCard
 import com.stremiox.android.ui.components.PosterRail
+import com.stremiox.android.ui.theme.VortXIcons
+import com.stremiox.android.ui.theme.VortXTheme
 import com.stremiox.android.ui.viewmodel.DiscoverViewModel
 import com.stremiox.android.ui.viewmodel.LibraryViewModel
 import com.stremiox.android.ui.viewmodel.SearchViewModel
 
-/// Discover: a type filter (Movie/Series/...) over add-on catalog rails for that type.
+/// Discover: a [Chip] type filter (Movie/Series/...) over add-on catalog rails for that type
+/// (DESIGN-SYSTEM.md §4 "Discover / Search").
 @Composable
 fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val type by viewModel.type.collectAsStateWithLifecycle()
@@ -53,26 +53,22 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
         Row(
             modifier = Modifier
                 .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                .padding(horizontal = VortXTheme.spacing.edge, vertical = VortXTheme.spacing.sm),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
         ) {
             MediaType.entries.forEach { t ->
-                FilterChip(
-                    selected = t == type,
-                    onClick = { viewModel.selectType(t) },
-                    label = { Text(t.label) },
-                )
+                Chip(label = t.label, selected = t == type, onClick = { viewModel.selectType(t) })
             }
         }
         when (val s = state) {
             is UiState.Loading -> LazyColumn(
-                contentPadding = PaddingValues(top = 8.dp, bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp),
+                contentPadding = PaddingValues(top = VortXTheme.spacing.sm, bottom = VortXTheme.spacing.xl),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
             ) { items(List(2) { it }) { LoadingRail() } }
             is UiState.Error -> ErrorState(s.message)
             is UiState.Success -> LazyColumn(
-                contentPadding = PaddingValues(bottom = 24.dp),
-                verticalArrangement = Arrangement.spacedBy(24.dp),
+                contentPadding = PaddingValues(bottom = VortXTheme.spacing.xl),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xl),
             ) {
                 items(s.data, key = { it.id }) { catalog: Catalog ->
                     PosterRail(catalog = catalog, onItem = onItem)
@@ -82,7 +78,7 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
     }
 }
 
-/// Library: the user's saved titles in a poster grid.
+/// Library: the user's saved titles in a poster grid (DESIGN-SYSTEM.md §4 "Library").
 @Composable
 fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -103,15 +99,21 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
 fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifier: Modifier = Modifier) {
     val query by viewModel.query.collectAsStateWithLifecycle()
     val state by viewModel.state.collectAsStateWithLifecycle()
+    val colors = VortXTheme.colors
 
     Column(modifier = modifier.fillMaxSize()) {
         OutlinedTextField(
             value = query,
             onValueChange = viewModel::onQueryChange,
-            leadingIcon = { Icon(Icons.Filled.Search, contentDescription = null) },
-            placeholder = { Text("Search movies, series, channels") },
+            leadingIcon = { Icon(VortXIcons.search, contentDescription = null) },
+            placeholder = { Text("Search movies, series, channels", style = VortXTheme.type.body) },
             singleLine = true,
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            colors = OutlinedTextFieldDefaults.colors(
+                focusedBorderColor = colors.accent,
+                unfocusedBorderColor = colors.hairline,
+                cursorColor = colors.accent,
+            ),
+            modifier = Modifier.fillMaxWidth().padding(VortXTheme.spacing.edge),
         )
         when (val s = state) {
             is UiState.Loading -> EmptyState("Searching your add-ons…")
@@ -125,29 +127,38 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
     }
 }
 
-/// Settings: the same controls the iOS app exposes. Values are placeholders until the engine and
-/// preferences are wired; the structure is final.
+/// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). Values
+/// are placeholders until the engine and preferences are wired (S09); the structure is final. In debug
+/// builds only, one extra row opens the S02 design-system gallery for visual review — the boundary is
+/// [BuildConfig.DEBUG], not a build variant, so it never ships in a release build of either flavor.
 @Composable
-fun SettingsScreen(modifier: Modifier = Modifier) {
+fun SettingsScreen(modifier: Modifier = Modifier, onOpenGallery: (() -> Unit)? = null) {
     Column(
-        modifier = modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
-        SettingRow(Icons.Filled.Person, "Account", "Not signed in")
-        SettingRow(Icons.Filled.GraphicEq, "Audio output", "Auto")
-        SettingRow(Icons.Filled.Subtitles, "Subtitle size", "Medium")
+        SettingRow(VortXIcons.account, "Account", "Not signed in")
+        SettingRow(VortXIcons.audioOutput, "Audio output", "Auto")
+        SettingRow(VortXIcons.subtitles, "Subtitle size", "Medium")
+        if (BuildConfig.DEBUG && onOpenGallery != null) {
+            SettingRow(VortXIcons.checkmarkCircle, "Design gallery", "Debug", onClick = onOpenGallery)
+        }
     }
 }
 
 @Composable
-private fun SettingRow(icon: ImageVector, title: String, value: String) {
+private fun SettingRow(icon: ImageVector, title: String, value: String, onClick: (() -> Unit)? = null) {
+    val colors = VortXTheme.colors
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
-        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+            .padding(vertical = VortXTheme.spacing.sm),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-        Text(title, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onBackground, modifier = Modifier.fillMaxWidth(0.6f))
-        Text(value, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Icon(icon, contentDescription = null, tint = colors.accent)
+        Text(title, style = VortXTheme.type.cardTitle, modifier = Modifier.fillMaxWidth(0.6f))
+        Text(value, style = VortXTheme.type.label.copy(color = colors.textSecondary))
     }
 }
 
@@ -160,10 +171,16 @@ private fun PosterGrid(items: List<MetaItem>, onItem: (MetaItem) -> Unit, modifi
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+        contentPadding = PaddingValues(VortXTheme.spacing.edge),
+        horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        items(items, key = { it.id }) { item -> PosterCard(item = item, onClick = { onItem(item) }) }
+        items(items, key = { it.id }) { item ->
+            PosterCard(
+                title = item.name,
+                subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
+                onClick = { onItem(item) },
+            )
+        }
     }
 }
