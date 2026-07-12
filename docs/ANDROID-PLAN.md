@@ -319,7 +319,7 @@ S01), kids mode, channel guide + M3U import — pull from `ROADMAP.md` as the Ap
 
 | Session | Title | State | Branch | Notes |
 |---|---|---|---|---|
-| S01 | Rebrand + hygiene + A16 baseline | not started | — | |
+| S01 | Rebrand + hygiene + A16 baseline | in progress | `claude/android-s01-rebrand-baseline` | worker dispatched 2026-07-12 |
 | S02 | Design system in Compose | not started | — | |
 | S03 | Engine bring-up | not started | — | |
 | S04 | Add-ons/Search/Discover/Library | not started | — | ∥ S05 |
