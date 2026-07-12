@@ -5,6 +5,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
@@ -37,6 +38,10 @@ import com.stremiox.android.ui.theme.VortXTheme
 /// - [selected]: accentSoft fill + accentBright text + inset 1px accent ring.
 /// [accent]/[accentText] let a destructive chip (e.g. "Remove") override the ring/text color while
 /// keeping the same shape and fill logic — still never a second visual language.
+///
+/// [onLongClick] (S05 addition, opt-in/additive: null preserves every existing call site unchanged) is
+/// the discoverable-by-long-press bulk menu on a season chip (mark season/series watched/unwatched),
+/// mirroring the tvOS season chip's `.contextMenu`.
 @Composable
 fun Chip(
     label: String,
@@ -47,6 +52,7 @@ fun Chip(
     leadingIcon: ImageVector? = null,
     accent: Color = VortXTheme.colors.accent,
     accentText: Color = VortXTheme.colors.accentBright,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val colors = VortXTheme.colors
     val interactionSource = remember { MutableInteractionSource() }
@@ -75,12 +81,25 @@ fun Chip(
             .then(
                 if (selected) Modifier.border(BorderStroke(1.dp, accent), VortXShapes.chip) else Modifier,
             )
-            .clickable(
-                enabled = enabled,
-                interactionSource = interactionSource,
-                indication = null,
-                role = Role.Button,
-                onClick = onClick,
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(
+                        enabled = enabled,
+                        interactionSource = interactionSource,
+                        indication = null,
+                        role = Role.Button,
+                        onLongClick = onLongClick,
+                        onClick = onClick,
+                    )
+                } else {
+                    Modifier.clickable(
+                        enabled = enabled,
+                        interactionSource = interactionSource,
+                        indication = null,
+                        role = Role.Button,
+                        onClick = onClick,
+                    )
+                },
             )
             .semantics { this.selected = selected }
             .padding(horizontal = 16.dp, vertical = 10.dp),

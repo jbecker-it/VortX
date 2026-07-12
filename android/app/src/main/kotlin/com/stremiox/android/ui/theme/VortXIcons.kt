@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PlayCircle
@@ -74,4 +75,7 @@ object VortXIcons {
     val audioOutput: ImageVector = Icons.Filled.GraphicEq
     val subtitles: ImageVector = Icons.Filled.Subtitles
     val download: ImageVector = Icons.Filled.Download
+
+    /// SF `ellipsis` — the visible face of a bulk/overflow menu (S05: the season "…" mark-watched menu).
+    val moreHoriz: ImageVector = Icons.Filled.MoreHoriz
 }

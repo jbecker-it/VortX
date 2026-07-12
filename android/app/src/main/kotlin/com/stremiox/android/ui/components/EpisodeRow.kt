@@ -2,6 +2,7 @@ package com.stremiox.android.ui.components
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +32,10 @@ import com.stremiox.android.ui.theme.vortxShadow
 /// stripe, `code` (S/E) + [title], [airDate], and a 2-line [overview]. Dims when [watched]. [thumb] is
 /// a placeholder-friendly slot mirroring [PosterCard]'s `art` — a real thumbnail image drops in behind
 /// it with no call-site change once Coil lands (S03).
+///
+/// [onLongClick] (S05 addition, opt-in/additive: null preserves every existing call site unchanged) is
+/// the per-episode "mark watched/unwatched" menu trigger, mirroring the tvOS episode row's
+/// `.contextMenu`.
 @Composable
 fun EpisodeRow(
     code: String,
@@ -41,6 +46,7 @@ fun EpisodeRow(
     airDate: String? = null,
     watched: Boolean = false,
     progress: Float? = null,
+    onLongClick: (() -> Unit)? = null,
     thumb: @Composable () -> Unit = { DefaultEpisodeThumb() },
 ) {
     val colors = VortXTheme.colors
@@ -50,7 +56,13 @@ fun EpisodeRow(
             .vortxShadow(VortXTheme.elevation.rest, VortXShapes.card)
             .clip(VortXShapes.card)
             .background(colors.surface1, VortXShapes.card)
-            .clickable(onClick = onClick)
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(onLongClick = onLongClick, onClick = onClick)
+                } else {
+                    Modifier.clickable(onClick = onClick)
+                },
+            )
             .padding(VortXTheme.spacing.sm),
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
