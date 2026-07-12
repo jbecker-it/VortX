@@ -77,6 +77,18 @@ internal object EngineState {
         val pages = root.optJSONArray("catalog") ?: return emptyList()
         val selected = selectedCatalog(root.optJSONObject("selectable"))
         val items = mutableListOf<MetaItem>()
+        // GROUP 2a fix (device-verified crash: "Discover Load more"): "Load more" appends the NEXT
+        // page's `catalog` entry onto this same flattened array (see [EngineActions.loadDiscoverNextPage]
+        // / [EngineStremioRepository.discoverNextPage]'s doc comment -- the engine returns every page
+        // loaded so far, not just the new one). Some add-ons legitimately repeat an item across a page
+        // boundary (a short catalog padded to the requested page size, or two pages racing on the same
+        // underlying skip), which handed [PosterGrid]'s `LazyVerticalGrid` a DUPLICATE `key = { it.id }`
+        // -- Compose's lazy list/grid throws `IllegalArgumentException: Key ... was already used` the
+        // instant a repeated key is laid out, crashing the app on the very next scroll/recomposition
+        // after "Load more" appended the offending page. Dedupe by id HERE, at the single place every
+        // page gets flattened into one list, so no caller (Discover today, any future consumer) can ever
+        // see a repeated id regardless of which page the duplicate came from.
+        val seenIds = mutableSetOf<String>()
         var title: String? = null
         var rowId: String? = selected?.second
         for (pageIdx in 0 until pages.length()) {
@@ -91,7 +103,8 @@ internal object EngineState {
             }
             val content = page.readyArray("content") ?: continue
             for (metaIdx in 0 until content.length()) {
-                content.optJSONObject(metaIdx)?.let { items += parseMetaPreview(it) }
+                val meta = content.optJSONObject(metaIdx)?.let { parseMetaPreview(it) } ?: continue
+                if (seenIds.add(meta.id)) items += meta
             }
         }
         if (items.isEmpty()) return emptyList()

@@ -27,6 +27,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -279,6 +280,13 @@ private fun PosterGrid(
         EmptyState(emptyHint, modifier)
         return
     }
+    // Defense-in-depth against the "Load more" crash (GROUP 2a): `LazyVerticalGrid`'s `key = { it.id }`
+    // throws `IllegalArgumentException: Key ... was already used` on a duplicate id. The real fix dedupes
+    // at the source ([com.stremiox.android.engine.EngineState.parseCatalogWithFilters], where pages get
+    // flattened/appended), but this grid is shared by Discover/Library/Search, so a belt-and-suspenders
+    // dedupe HERE means no future caller can reintroduce this crash class either. distinctBy is a no-op
+    // allocation-wise when there are no duplicates (the common case).
+    val deduped = remember(items) { items.distinctBy { it.id } }
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = 112.dp),
         modifier = modifier.fillMaxSize(),
@@ -286,7 +294,7 @@ private fun PosterGrid(
         horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        items(items, key = { it.id }) { item ->
+        items(deduped, key = { it.id }) { item ->
             Box {
                 PosterCard(
                     title = item.name,

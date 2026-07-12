@@ -1,5 +1,6 @@
 package com.stremiox.android.ui.viewmodel
 
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.stremiox.android.data.CatalogRepository
@@ -134,14 +135,28 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// "Load more" (DESIGN-SYSTEM.md §4 "Discover / Search": "'Load more' (per-catalog skip)"). The
     /// engine APPENDS the next page to the already-loaded catalog, so the returned items already
     /// contain everything loaded so far -- no manual merge needed here.
+    ///
+    /// GROUP 2a (device-verified crash): root-caused to a duplicate poster id across a page boundary
+    /// hitting `LazyVerticalGrid`'s `key = { it.id }` in [com.stremiox.android.ui.screens.PosterGrid] --
+    /// fixed at the source in [com.stremiox.android.engine.EngineState.parseCatalogWithFilters] (dedupe
+    /// while flattening pages) plus a defense-in-depth dedupe in the grid itself. `runCatching` + a
+    /// logged failure here is additional hardening so a genuinely NEW crash mode surfaces as a caught,
+    /// logged error (visible via `adb logcat -s StremioXDiscover`) instead of taking the app down again,
+    /// and captures the next device round's logcat if this was not the only failure mode.
     fun loadMore() {
         val filters = (_state.value as? UiState.Success)?.data?.filters ?: return
         if (!filters.hasNextPage || _loadingMore.value) return
         viewModelScope.launch {
             _loadingMore.value = true
-            repo.discoverNextPage().onSuccess { _state.value = UiState.Success(it) }
+            runCatching { repo.discoverNextPage() }
+                .onSuccess { result -> result.onSuccess { _state.value = UiState.Success(it) } }
+                .onFailure { Log.e(TAG, "loadMore: discoverNextPage threw", it) }
             _loadingMore.value = false
         }
+    }
+
+    private companion object {
+        const val TAG = "StremioXDiscover"
     }
 }
 
