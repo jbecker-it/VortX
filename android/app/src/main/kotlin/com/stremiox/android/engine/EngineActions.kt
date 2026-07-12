@@ -22,8 +22,24 @@ object EngineActions {
     const val FIELD_CONTINUE_WATCHING_PREVIEW = "continue_watching_preview"
 
     /// Load the Home board (every catalog of every installed add-on). Mirrors CoreBridge.loadBoard.
+    ///
+    /// stremio-core's `ActionLoad::CatalogsWithExtra` carries a REQUIRED `Selected { type, extra }`
+    /// struct (unlike `ActionLoad::CatalogWithFilters`, which wraps an `Option<..>` and tolerates
+    /// `args: null` for "use the default"). Sending `args: null` here fails to deserialize the whole
+    /// action envelope -- serde rejects it before dispatch ever sees a field/action pair, so the
+    /// engine silently drops it: no NewState, no error, nothing. That was the entire bug: the board
+    /// Load was never reaching a handler. Mirror Apple's `["type": NSNull(), "extra": []]` exactly.
     fun loadBoard(): String =
-        envelope(FIELD_BOARD, action("Load", JSONObject().put("model", "CatalogsWithExtra").put("args", JSONObject.NULL)))
+        envelope(
+            FIELD_BOARD,
+            action(
+                "Load",
+                JSONObject().put("model", "CatalogsWithExtra").put(
+                    "args",
+                    JSONObject().put("type", JSONObject.NULL).put("extra", JSONArray()),
+                ),
+            ),
+        )
 
     /// Load the first [rows] rows of the board (the engine paginates rows via LoadRange).
     fun loadBoardRange(rows: Int): String =
@@ -40,15 +56,31 @@ object EngineActions {
     fun loadDiscover(): String =
         envelope(FIELD_DISCOVER, action("Load", JSONObject().put("model", "CatalogWithFilters").put("args", JSONObject.NULL)))
 
-    /// Load the user's Library (NotRemoved filter).
+    /// Load the user's Library (NotRemoved filter). `LibraryWithFilters`'s `Selected` (like the board's)
+    /// is a REQUIRED struct (`{ request: { type, sort, page } }`), not an `Option`; mirrors Apple's
+    /// `loadLibrary` exactly rather than the `args: null` shorthand that only ActionLoad variants
+    /// wrapping an `Option<..>` (e.g. CatalogWithFilters/discover) tolerate.
     fun loadLibrary(): String =
-        envelope(FIELD_LIBRARY, action("Load", JSONObject().put("model", "LibraryWithFilters").put("args", JSONObject.NULL)))
+        envelope(
+            FIELD_LIBRARY,
+            action(
+                "Load",
+                JSONObject().put("model", "LibraryWithFilters").put(
+                    "args",
+                    JSONObject().put(
+                        "request",
+                        JSONObject().put("type", JSONObject.NULL).put("sort", "lastwatched").put("page", 1),
+                    ),
+                ),
+            ),
+        )
 
     /// Search across installed add-ons. Two-step like CoreBridge.search: Load the CatalogsWithExtra
-    /// model with a `search` extra, then LoadRange to materialize results.
+    /// model with a `search` extra, then LoadRange to materialize results. `Selected.type` has no
+    /// serde default (see [loadBoard]), so it must be sent explicitly even though it's `Option<String>`.
     fun searchLoad(query: String): String {
         val extra = JSONArray().put(JSONArray().put("search").put(query))
-        val args = JSONObject().put("extra", extra)
+        val args = JSONObject().put("type", JSONObject.NULL).put("extra", extra)
         return envelope(FIELD_SEARCH, action("Load", JSONObject().put("model", "CatalogsWithExtra").put("args", args)))
     }
 
