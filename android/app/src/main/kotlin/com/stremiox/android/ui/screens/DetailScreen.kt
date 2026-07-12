@@ -1,6 +1,8 @@
 package com.stremiox.android.ui.screens
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,18 +17,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.PlayCircle
-import androidx.compose.material.icons.filled.Star
-import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -37,7 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.model.Episode
@@ -48,6 +41,11 @@ import com.stremiox.android.model.StreamSource
 import com.stremiox.android.ui.UiState
 import com.stremiox.android.ui.components.Badge
 import com.stremiox.android.ui.components.ErrorState
+import com.stremiox.android.ui.components.PrimaryButton
+import com.stremiox.android.ui.components.SourceRow
+import com.stremiox.android.ui.theme.VortXIcons
+import com.stremiox.android.ui.theme.VortXShapes
+import com.stremiox.android.ui.theme.VortXTheme
 import com.stremiox.android.ui.viewmodel.DetailViewModel
 import com.stremiox.android.ui.viewmodel.Playback
 
@@ -56,6 +54,9 @@ import com.stremiox.android.ui.viewmodel.Playback
 /// tvOS DetailView leads with. The Watch button and the per-source rows resolve a source through the
 /// repository and launch the player via [onPlay]; the resolve round-trip (streaming-server hand-off /
 /// debrid unlock) is reflected as a Resolving state so the UI shows progress, not a freeze.
+///
+/// Re-skinned to the S02 design system: the one [PrimaryButton] Watch CTA, [SourceRow] for every
+/// source, [Chip] for episode selection — no bare `MaterialTheme.colorScheme` colors remain here.
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DetailScreen(
@@ -80,14 +81,15 @@ fun DetailScreen(
     }
 
     val resolving = playback is Playback.Resolving
+    val colors = VortXTheme.colors
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(title, maxLines = 1) },
+                title = { Text(title, maxLines = 1, style = VortXTheme.type.cardTitle) },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(VortXIcons.back, contentDescription = "Back")
                     }
                 },
             )
@@ -97,21 +99,21 @@ fun DetailScreen(
             is UiState.Loading -> Box(modifier.fillMaxSize().padding(padding)) {
                 Text(
                     "Loading…",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = VortXTheme.type.body,
                     modifier = Modifier.align(Alignment.Center),
                 )
             }
             is UiState.Error -> ErrorState(m.message, modifier = modifier.padding(padding))
             is UiState.Success -> LazyColumn(
                 modifier = modifier.fillMaxSize().padding(padding),
-                verticalArrangement = Arrangement.spacedBy(16.dp),
+                verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.lg),
             ) {
                 item { Backdrop(m.data) }
                 item {
                     MetaBlock(
                         m = m.data,
                         watchEnabled = viewModel.bestSource() != null && !resolving,
+                        resolving = resolving,
                         onWatch = { viewModel.bestSource()?.let(viewModel::play) },
                     )
                 }
@@ -137,28 +139,22 @@ fun DetailScreen(
     }
 }
 
-/// Cinematic 16:9 backdrop. With no engine artwork yet it is a brand gradient with the type kicker,
-/// the load-time placeholder the real `background` image will sit on top of.
+/// Cinematic 16:9 backdrop (DESIGN-SYSTEM.md §4 Detail "hero banner"). With no engine artwork yet it is
+/// a brand-tinted gradient with the type kicker; a real `background` image drops in behind it once
+/// Coil lands (S03).
 @Composable
 private fun Backdrop(m: MetaDetail) {
+    val colors = VortXTheme.colors
     Box(
         modifier = Modifier
             .fillMaxWidth()
             .aspectRatio(16f / 9f)
-            .background(
-                Brush.verticalGradient(
-                    listOf(
-                        MaterialTheme.colorScheme.surfaceVariant,
-                        MaterialTheme.colorScheme.background,
-                    )
-                )
-            ),
+            .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
     ) {
         Text(
             text = m.type.label.uppercase(),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.align(Alignment.BottomStart).padding(20.dp),
+            style = VortXTheme.type.eyebrow,
+            modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
         )
     }
 }
@@ -167,27 +163,26 @@ private fun Backdrop(m: MetaDetail) {
 /// the lower title band of the tvOS hero. Watch plays the best source; it is disabled until sources
 /// have resolved (and while a resolve is in flight).
 @Composable
-private fun MetaBlock(m: MetaDetail, watchEnabled: Boolean, onWatch: () -> Unit) {
+private fun MetaBlock(m: MetaDetail, watchEnabled: Boolean, resolving: Boolean, onWatch: () -> Unit) {
     Column(
-        modifier = Modifier.padding(horizontal = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
-        Text(
-            text = m.name,
-            style = MaterialTheme.typography.headlineLarge.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.onBackground,
-        )
+        Text(text = m.name, style = VortXTheme.type.screenTitle)
         MetaRow(m)
-        Button(onClick = onWatch, enabled = watchEnabled, modifier = Modifier.padding(top = 8.dp)) {
-            Icon(Icons.Filled.PlayArrow, contentDescription = null)
-            Text("  Watch", style = MaterialTheme.typography.labelLarge)
-        }
+        PrimaryButton(
+            text = if (resolving) "Starting…" else "Watch",
+            onClick = onWatch,
+            enabled = watchEnabled,
+            loading = resolving,
+            leadingIcon = if (!resolving) VortXIcons.playFill else null,
+            modifier = Modifier.padding(top = VortXTheme.spacing.xs),
+        )
         m.description?.let {
             Text(
                 text = it,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-                modifier = Modifier.padding(top = 4.dp),
+                style = VortXTheme.type.body,
+                modifier = Modifier.padding(top = VortXTheme.spacing.xs),
             )
         }
     }
@@ -196,16 +191,17 @@ private fun MetaBlock(m: MetaDetail, watchEnabled: Boolean, onWatch: () -> Unit)
 /// rating · year · runtime · genres, the same one-line metadata strip as tvOS `metaRow`.
 @Composable
 private fun MetaRow(m: MetaDetail) {
-    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    val colors = VortXTheme.colors
+    Row(horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm)) {
         m.imdbRating?.let { rating ->
             Row(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(
-                    Icons.Filled.Star,
+                    VortXIcons.starFill,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = colors.accentBright,
                     modifier = Modifier.size(14.dp),
                 )
                 MetaText(rating)
@@ -221,16 +217,13 @@ private fun MetaRow(m: MetaDetail) {
 
 @Composable
 private fun MetaText(text: String) {
-    Text(
-        text = text,
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
+    Text(text = text, style = VortXTheme.type.label.copy(color = VortXTheme.colors.textSecondary))
 }
 
-/// The episodes rail (series only): a horizontal strip of episode cards. Tapping one reloads the
-/// sources list scoped to that episode through the engine (mirrors tvOS, where choosing an episode
-/// re-drives `meta_details.streams` for that video id). The selected card carries the ember accent.
+/// The episodes rail (series only): a horizontal strip of [Chip]s, the single selected look everywhere
+/// (DESIGN-SYSTEM.md §3 "Chip"). Tapping one reloads the sources list scoped to that episode through
+/// the engine (mirrors tvOS, where choosing an episode re-drives `meta_details.streams` for that video
+/// id).
 @Composable
 private fun EpisodesSection(
     episodes: List<Episode>,
@@ -239,17 +232,16 @@ private fun EpisodesSection(
 ) {
     Column(
         modifier = Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
         Text(
             text = "Episodes",
-            style = MaterialTheme.typography.titleLarge,
-            color = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.padding(horizontal = 20.dp),
+            style = VortXTheme.type.sectionTitle,
+            modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
         )
         LazyRow(
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 20.dp),
+            horizontalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = VortXTheme.spacing.edge),
         ) {
             items(episodes, key = { it.id }) { episode ->
                 EpisodeCard(
@@ -262,20 +254,22 @@ private fun EpisodesSection(
     }
 }
 
-/// One episode card: the season/episode label, the title, and the overview. Selected cards get the
-/// primary-tinted surface + border so the current episode's sources context is obvious.
+/// One episode chooser card: the season/episode label, the title, and the overview, sharing the
+/// selected [Chip]-ring look (an accent border) so "current episode" reads consistently with every
+/// other selected control in the app.
 @Composable
 private fun EpisodeCard(episode: Episode, selected: Boolean, onClick: () -> Unit) {
+    val colors = VortXTheme.colors
     Column(
         modifier = Modifier
             .width(220.dp)
-            .clip(RoundedCornerShape(12.dp))
-            .background(
-                if (selected) MaterialTheme.colorScheme.primaryContainer
-                else MaterialTheme.colorScheme.surface,
+            .clip(VortXShapes.card)
+            .background(if (selected) colors.accentSoft else colors.surface1)
+            .then(
+                if (selected) Modifier.border(BorderStroke(1.dp, colors.accent), VortXShapes.card) else Modifier,
             )
             .clickable(onClick = onClick)
-            .padding(12.dp),
+            .padding(VortXTheme.spacing.sm),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
         Badge(
@@ -284,26 +278,20 @@ private fun EpisodeCard(episode: Episode, selected: Boolean, onClick: () -> Unit
         )
         Text(
             text = episode.title,
-            style = MaterialTheme.typography.titleMedium,
-            color = MaterialTheme.colorScheme.onBackground,
+            style = VortXTheme.type.cardTitle.copy(color = if (selected) colors.accentBright else colors.textPrimary),
             maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
         )
         episode.overview?.let {
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 3,
-            )
+            Text(text = it, style = VortXTheme.type.body, maxLines = 3, overflow = TextOverflow.Ellipsis)
         }
     }
 }
 
 /// The sources section: the per-add-on, multi-quality source list the engine fans out. Mirrors the
-/// tvOS `CoreStreamList` hierarchy — a header with the source count, then one labeled block per
-/// add-on, each row carrying the add-on name, a quality/torrent badge, and the add-on's own title.
-/// Tapping a row resolves it through the engine and launches the player; [resolving] dims the rows
-/// while a resolve is in flight, and [failure] surfaces a resolve error inline.
+/// tvOS `CoreStreamList` hierarchy — a header with the source count, then the ranked [SourceRow] list.
+/// [resolving] dims the rows while a resolve is in flight, and [failure] surfaces a resolve error
+/// inline.
 @Composable
 private fun SourcesSection(
     state: UiState<List<StreamGroup>>,
@@ -312,85 +300,35 @@ private fun SourcesSection(
     onPlay: (StreamSource) -> Unit,
 ) {
     Column(
-        modifier = Modifier.padding(horizontal = 20.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
+        verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
     ) {
         when (state) {
-            is UiState.Loading -> Text(
-                "Finding sources…",
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            is UiState.Error -> Text(
-                state.message,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            is UiState.Loading -> Text("Finding sources…", style = VortXTheme.type.sectionTitle)
+            is UiState.Error -> Text(state.message, style = VortXTheme.type.body)
             is UiState.Success -> {
                 val total = state.data.sumOf { it.streams.size }
-                Text(
-                    text = "Sources · $total",
-                    style = MaterialTheme.typography.titleLarge,
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
+                Text(text = "Sources · $total", style = VortXTheme.type.sectionTitle)
                 Text(
                     text = if (resolving) "Starting source…" else "Tap a source to play.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = VortXTheme.type.body,
                 )
                 failure?.let {
-                    Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.error,
-                    )
+                    Text(text = it, style = VortXTheme.type.body.copy(color = VortXTheme.colors.danger))
                 }
                 state.data.forEach { group ->
                     group.streams.forEach { source ->
-                        SourceRow(source = source, enabled = !resolving, onPlay = { onPlay(source) })
+                        SourceRow(
+                            addon = source.addon,
+                            title = source.title,
+                            quality = source.quality,
+                            isTorrent = source.isTorrent,
+                            flavorTags = listOfNotNull(source.description),
+                            enabled = !resolving,
+                            onClick = { onPlay(source) },
+                        )
                     }
                 }
-            }
-        }
-    }
-}
-
-/// One source row: a leading state icon (download for torrents, play otherwise), the add-on +
-/// quality/torrent badges, and the add-on's human-written title/description. Tapping resolves the
-/// source and launches the player; disabled while another resolve is in flight.
-@Composable
-private fun SourceRow(source: StreamSource, enabled: Boolean, onPlay: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .background(MaterialTheme.colorScheme.surface)
-            .clickable(enabled = enabled, onClick = onPlay)
-            .padding(12.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        Icon(
-            imageVector = if (source.isTorrent) Icons.Filled.Download else Icons.Filled.PlayCircle,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-        )
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Badge(source.addon)
-                source.quality?.let { Badge(it) }
-                if (source.isTorrent) Badge("Torrent")
-            }
-            Text(
-                text = source.title,
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onBackground,
-            )
-            source.description?.let {
-                Text(
-                    text = it,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
             }
         }
     }
