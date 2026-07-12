@@ -320,7 +320,7 @@ S01), kids mode, channel guide + M3U import — pull from `ROADMAP.md` as the Ap
 | Session | Title | State | Branch | Notes |
 |---|---|---|---|---|
 | S01 | Rebrand + hygiene + A16 baseline | **merged** | `claude/android-s01-rebrand-baseline` | merged 2026-07-12; both flavors built + linted clean (real SDK/NDK verified locally); GPL isolation confirmed by APK inspection. Deferred: animated splash sequence (S02/S10), TV banner (S13, lint check disabled until then), predictive-back stack (lands with real navigation), DebridKeys migration off deprecated security-crypto (future session). S02 first target: `ui/theme/Theme.kt` still carries the old palette. |
-| S02 | Design system in Compose | in progress | `claude/android-s02-design-system` | worker dispatched 2026-07-12, based off main @ f87d4b7 |
+| S02 | Design system in Compose | **merged** | `claude/android-s02-design-system` | merged 2026-07-12; tokens/typography (Lora OFL serif)/components/debug gallery per DESIGN-SYSTEM §2–3, ported value-for-value from ThemeManager.swift; both flavors build + lint clean; GPL isolation reconfirmed. Deferred: theme persistence → S09 (gallery switcher is local-only); on-device gallery screenshot review pending. API notes for later sessions: use `VortXTheme.colors/type/spacing/...` not raw `MaterialTheme.colorScheme`; `PosterCard`/`EpisodeRow` art slots take Coil `AsyncImage` in S03; `VortXIcons` is the only icon source. |
 | S03 | Engine bring-up | not started | — | |
 | S04 | Add-ons/Search/Discover/Library | not started | — | ∥ S05 |
 | S05 | Detail + metadata | not started | — | ∥ S04 |
