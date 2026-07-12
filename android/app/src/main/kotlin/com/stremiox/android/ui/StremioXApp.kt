@@ -15,6 +15,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.stremiox.android.data.AuthRepository
@@ -27,6 +28,7 @@ import com.stremiox.android.player.PlayerScreen
 import com.stremiox.android.ui.components.Wordmark
 import com.stremiox.android.ui.gallery.GalleryScreen
 import com.stremiox.android.ui.screens.AccountScreen
+import com.stremiox.android.ui.screens.AddonsScreen
 import com.stremiox.android.ui.screens.DetailScreen
 import com.stremiox.android.ui.screens.DiscoverScreen
 import com.stremiox.android.ui.screens.HomeScreen
@@ -36,6 +38,7 @@ import com.stremiox.android.ui.screens.SettingsScreen
 import com.stremiox.android.ui.theme.VortXIcons
 import com.stremiox.android.ui.theme.VortXTheme
 import com.stremiox.android.ui.viewmodel.AccountViewModel
+import com.stremiox.android.ui.viewmodel.AddonsViewModel
 import com.stremiox.android.ui.viewmodel.DetailViewModel
 import com.stremiox.android.ui.viewmodel.DiscoverViewModel
 import com.stremiox.android.ui.viewmodel.HomeViewModel
@@ -67,7 +70,9 @@ fun StremioXApp(
         var playing by remember { mutableStateOf<Playable?>(null) }
         var showGallery by remember { mutableStateOf(false) }
         var showAccount by remember { mutableStateOf(false) }
+        var showAddons by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
+        val appContext = LocalContext.current.applicationContext
         // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
         // Settings' Account row summary and the AccountScreen overlay both read the SAME live
         // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
@@ -93,6 +98,12 @@ fun StremioXApp(
             return@VortXTheme
         }
 
+        if (showAddons) {
+            val addonsVm: AddonsViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo))
+            AddonsScreen(viewModel = addonsVm, onBack = { showAddons = false })
+            return@VortXTheme
+        }
+
         val current = detail
         if (current != null) {
             // A ViewModel keyed to this title's id, fed type+id through the factory's DetailArgs.
@@ -112,7 +123,7 @@ fun StremioXApp(
             return@VortXTheme
         }
 
-        val factory = StremioXViewModelFactory(repo = repo, auth = auth)
+        val factory = StremioXViewModelFactory(repo = repo, auth = auth, appContext = appContext)
         val authState by accountVm.authState.collectAsStateWithLifecycle()
         Scaffold(
             topBar = {
@@ -144,6 +155,7 @@ fun StremioXApp(
                 Tab.SETTINGS -> SettingsScreen(
                     authState = authState,
                     onAccountClick = { showAccount = true },
+                    onAddonsClick = { showAddons = true },
                     modifier = content,
                     onOpenGallery = { showGallery = true },
                 )

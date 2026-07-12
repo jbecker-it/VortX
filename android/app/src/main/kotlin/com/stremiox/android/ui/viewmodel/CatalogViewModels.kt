@@ -4,8 +4,10 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.stremiox.android.data.CatalogRepository
 import com.stremiox.android.model.Catalog
-import com.stremiox.android.model.MediaType
+import com.stremiox.android.model.DiscoverResult
+import com.stremiox.android.model.LibraryResult
 import com.stremiox.android.model.MetaItem
+import com.stremiox.android.search.SearchHistoryStore
 import com.stremiox.android.ui.UiState
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
@@ -80,37 +82,99 @@ class HomeViewModel(private val repo: CatalogRepository) : ViewModel() {
     }
 }
 
-/// Discover: add-on catalog rails for the selected [MediaType]. Re-loads when the type changes.
-@OptIn(ExperimentalCoroutinesApi::class)
+/// Discover: the engine-driven type/catalog/genre pivot (S04). REPLACES the old static-[MediaType]
+/// chip switch: that switch dispatched the SAME `args: null` Load regardless of which chip was tapped
+/// (see [com.stremiox.android.engine.EngineActions.loadDiscover]'s old doc), so every type/catalog
+/// selection rendered the exact same rail -- the "Discover chips are inert" bug this session fixes.
+/// Every selection now re-dispatches the chip's own `request` JSON verbatim (never reconstructed), and
+/// filters + items come back from a SINGLE engine round-trip (see
+/// [com.stremiox.android.engine.EngineStremioRepository.discoverResultFrom]).
 class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
-    private val _type = MutableStateFlow(MediaType.MOVIE)
-    val type: StateFlow<MediaType> = _type.asStateFlow()
+    private val _state = MutableStateFlow<UiState<DiscoverResult>>(UiState.Loading)
+    val state: StateFlow<UiState<DiscoverResult>> = _state.asStateFlow()
 
-    val state: StateFlow<UiState<List<Catalog>>> = _type
-        .flatMapLatest { t -> flow { emit(repo.discover(t).toUiState()) } }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UiState.Loading)
+    private val _loadingMore = MutableStateFlow(false)
+    val loadingMore: StateFlow<Boolean> = _loadingMore.asStateFlow()
 
-    fun selectType(type: MediaType) {
-        _type.value = type
+    private var selectJob: Job? = null
+
+    init {
+        select(null)
+    }
+
+    /// Pivot to a specific type/catalog/genre. [requestJson] is null for the engine's own default
+    /// (first load, and the entry point for the whole screen), or a chip's `requestJson` from the
+    /// current [DiscoverResult.filters].
+    fun select(requestJson: String?) {
+        selectJob?.cancel()
+        _state.value = UiState.Loading
+        selectJob = viewModelScope.launch {
+            _state.value = repo.discover(requestJson).toUiState()
+        }
+    }
+
+    fun retry() = select(null)
+
+    /// "Load more" (DESIGN-SYSTEM.md §4 "Discover / Search": "'Load more' (per-catalog skip)"). The
+    /// engine APPENDS the next page to the already-loaded catalog, so the returned items already
+    /// contain everything loaded so far -- no manual merge needed here.
+    fun loadMore() {
+        val filters = (_state.value as? UiState.Success)?.data?.filters ?: return
+        if (!filters.hasNextPage || _loadingMore.value) return
+        viewModelScope.launch {
+            _loadingMore.value = true
+            repo.discoverNextPage().onSuccess { _state.value = UiState.Success(it) }
+            _loadingMore.value = false
+        }
     }
 }
 
-/// Library: the user's saved titles.
+/// Library: the engine-driven type/sort pivot + add/remove (S04). Re-loads on every filter switch and
+/// after a library mutation, keeping the currently applied [requestJson] so a remove doesn't silently
+/// reset the user's filter/sort choice.
 class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
-    private val _state = MutableStateFlow<UiState<List<MetaItem>>>(UiState.Loading)
-    val state: StateFlow<UiState<List<MetaItem>>> = _state.asStateFlow()
+    private val _state = MutableStateFlow<UiState<LibraryResult>>(UiState.Loading)
+    val state: StateFlow<UiState<LibraryResult>> = _state.asStateFlow()
+
+    private var currentRequestJson: String? = null
+    private var loadJob: Job? = null
 
     init {
-        viewModelScope.launch { _state.value = repo.library().toUiState() }
+        load(null)
+    }
+
+    fun load(requestJson: String?) {
+        currentRequestJson = requestJson
+        loadJob?.cancel()
+        _state.value = UiState.Loading
+        loadJob = viewModelScope.launch {
+            _state.value = repo.library(requestJson).toUiState()
+        }
+    }
+
+    fun retry() = load(currentRequestJson)
+
+    /// Remove a title from the Library (the grid's per-poster "x" control), then re-load so the grid
+    /// and the remaining filter/sort selection stay in sync with the engine.
+    fun remove(id: String) {
+        viewModelScope.launch {
+            repo.removeFromLibrary(id)
+            _state.value = repo.library(currentRequestJson).toUiState()
+        }
     }
 }
 
 /// Search: debounced full-text query across every installed add-on. An empty query is a calm idle
-/// state, never an error.
+/// state, never an error. [history] surfaces recent searches (DESIGN-SYSTEM.md §4 "Discover / Search":
+/// "Recent searches as chips when empty"), ported from Apple `SearchHistoryStore` -- see
+/// [SearchHistoryStore]'s doc for the plain-prefs rationale.
 @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
-class SearchViewModel(private val repo: CatalogRepository) : ViewModel() {
+class SearchViewModel(private val repo: CatalogRepository, private val historyStore: SearchHistoryStore) : ViewModel() {
     private val _query = MutableStateFlow("")
     val query: StateFlow<String> = _query.asStateFlow()
+
+    private val _history = MutableStateFlow(historyStore.load())
+    val history: StateFlow<List<String>> = _history.asStateFlow()
 
     val state: StateFlow<UiState<List<MetaItem>>> = _query
         .debounce { if (it.isBlank()) 0L else SEARCH_DEBOUNCE_MS }
@@ -125,6 +189,19 @@ class SearchViewModel(private val repo: CatalogRepository) : ViewModel() {
 
     fun onQueryChange(value: String) {
         _query.value = value
+    }
+
+    /// Record the CURRENT query in history (mirrors Apple: recorded when a result is actually opened,
+    /// not on every keystroke) and refresh the published list. Called by the screen's `onItem`.
+    fun recordHistory() {
+        val q = _query.value
+        historyStore.add(q)
+        _history.value = historyStore.load()
+    }
+
+    fun clearHistory() {
+        historyStore.clear()
+        _history.value = emptyList()
     }
 
     private companion object {

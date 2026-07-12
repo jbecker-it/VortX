@@ -1,7 +1,15 @@
 package com.stremiox.android.data
 
 import com.stremiox.android.model.Catalog
+import com.stremiox.android.model.DiscoverFilters
+import com.stremiox.android.model.DiscoverResult
+import com.stremiox.android.model.DiscoverTypeOption
 import com.stremiox.android.model.Episode
+import com.stremiox.android.model.InstalledAddon
+import com.stremiox.android.model.LibraryFilters
+import com.stremiox.android.model.LibraryResult
+import com.stremiox.android.model.LibrarySortOption
+import com.stremiox.android.model.LibraryTypeOption
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.MetaItem
@@ -35,11 +43,43 @@ interface CatalogRepository {
     /// implementation) satisfies the contract without change.
     fun homeUpdates(): Flow<List<Catalog>> = flow { emit(home().getOrThrow()) }
 
-    /// Discover rows filtered by type (Movie/Series/...), drawn from the installed add-ons.
-    suspend fun discover(type: MediaType): Result<List<Catalog>>
+    /// Discover: the currently selected catalog's items plus the type/catalog/genre pivot chips
+    /// (S04). [requestJson] is null for the engine's own default selection (first load), or the exact
+    /// `request` JSON echoed back from a [DiscoverFilters] type/catalog/genre option the caller tapped
+    /// -- the request must be re-dispatched byte-for-byte, never reconstructed client-side (that
+    /// reconstruction gap was the "type chips are inert" bug this session fixes).
+    suspend fun discover(requestJson: String? = null): Result<DiscoverResult>
 
-    /// The user's saved Library (bookmarked titles).
-    suspend fun library(): Result<List<MetaItem>>
+    /// Load the next page of the CURRENTLY selected Discover catalog (infinite scroll / "Load more").
+    suspend fun discoverNextPage(): Result<DiscoverResult>
+
+    /// The user's saved Library (bookmarked titles) plus the type/sort pivot chips (S04). [requestJson]
+    /// is null for the default (all types, last-watched), or a verbatim echo of a [LibraryFilters]
+    /// type/sort option's `request`.
+    suspend fun library(requestJson: String? = null): Result<LibraryResult>
+
+    /// Add a title to the Library (the "Save"/bookmark action from a poster's long-press menu or the
+    /// detail page).
+    suspend fun addToLibrary(item: MetaItem): Result<Unit>
+
+    /// Remove a title from the Library (the Library grid's per-poster "x" control, DESIGN-SYSTEM.md §4
+    /// "Library").
+    suspend fun removeFromLibrary(id: String): Result<Unit>
+
+    /// Every add-on installed on the signed-in account (S04 "Add-on management"), read live from
+    /// `ctx.profile.addons`.
+    suspend fun installedAddons(): Result<List<InstalledAddon>>
+
+    /// Install (or update-in-place) an add-on from a pasted manifest URL. Fetches + validates the
+    /// manifest first (mirrors Apple `CoreBridge.installAddon`); the [Result.failure] message is
+    /// user-facing.
+    suspend fun installAddon(url: String): Result<Unit>
+
+    /// Remove an installed add-on (the Add-ons screen's per-row "Remove" control). Protected/official
+    /// add-ons are still removable at the repository level; the UI is responsible for hiding the
+    /// control for [InstalledAddon.isProtected] entries, mirroring Apple `AddonsView`'s
+    /// `!addon.isProtected` gate.
+    suspend fun removeAddon(addon: InstalledAddon): Result<Unit>
 
     /// Full-text search across every add-on the user has installed.
     suspend fun search(query: String): Result<List<MetaItem>>
@@ -133,19 +173,94 @@ class PreviewCatalogRepository(
         )
     }
 
-    override suspend fun discover(type: MediaType): Result<List<Catalog>> {
+    /// The type currently "selected" in the preview Discover chips (there is no real engine selectable
+    /// to echo, so this stands in for it across calls in this offline-only implementation).
+    private var previewDiscoverType: MediaType = MediaType.MOVIE
+
+    private fun previewDiscoverFilters(): DiscoverFilters =
+        DiscoverFilters(
+            types = MediaType.entries.map {
+                DiscoverTypeOption(it.label, it == previewDiscoverType, it.id)
+            },
+        )
+
+    override suspend fun discover(requestJson: String?): Result<DiscoverResult> {
         delay(latencyMs)
+        if (requestJson != null) {
+            previewDiscoverType = MediaType.entries.find { it.id == requestJson } ?: previewDiscoverType
+        }
+        val type = previewDiscoverType
         return Result.success(
-            listOf(
-                Catalog("top", "Top ${type.label}", sample(type.label, type, 10)),
-                Catalog("new", "New ${type.label}", sample("New ${type.label}", type, 10)),
-            )
+            DiscoverResult(
+                items = sample("Top ${type.label}", type, 16),
+                filters = previewDiscoverFilters(),
+            ),
         )
     }
 
-    override suspend fun library(): Result<List<MetaItem>> {
+    override suspend fun discoverNextPage(): Result<DiscoverResult> = discover(null)
+
+    private val previewLibrary = mutableListOf<MetaItem>().apply { addAll(sample("Saved", MediaType.MOVIE, 8)) }
+
+    override suspend fun library(requestJson: String?): Result<LibraryResult> {
         delay(latencyMs)
-        return Result.success(sample("Saved", MediaType.MOVIE, 8))
+        return Result.success(
+            LibraryResult(
+                items = previewLibrary.toList(),
+                filters = LibraryFilters(
+                    types = listOf(LibraryTypeOption("All", true, "")),
+                    sorts = listOf(LibrarySortOption("Recent", true, "")),
+                ),
+            ),
+        )
+    }
+
+    override suspend fun addToLibrary(item: MetaItem): Result<Unit> {
+        delay(latencyMs)
+        previewLibrary.removeAll { it.id == item.id }
+        previewLibrary.add(0, item)
+        return Result.success(Unit)
+    }
+
+    override suspend fun removeFromLibrary(id: String): Result<Unit> {
+        delay(latencyMs)
+        previewLibrary.removeAll { it.id == id }
+        return Result.success(Unit)
+    }
+
+    private val previewAddons = mutableListOf(
+        InstalledAddon(
+            transportUrl = "https://v3-cinemeta.strem.io/manifest.json",
+            name = "Cinemeta",
+            isOfficial = true,
+            isProtected = true,
+            providesStreams = false,
+            rawDescriptorJson = "{}",
+        ),
+    )
+
+    override suspend fun installedAddons(): Result<List<InstalledAddon>> {
+        delay(latencyMs)
+        return Result.success(previewAddons.toList())
+    }
+
+    override suspend fun installAddon(url: String): Result<Unit> {
+        delay(latencyMs)
+        if (url.isBlank()) return Result.failure(IllegalArgumentException("Enter a valid add-on URL."))
+        previewAddons.add(
+            InstalledAddon(
+                transportUrl = url,
+                name = url.substringAfterLast('/').ifBlank { url },
+                rawDescriptorJson = "{}",
+            ),
+        )
+        return Result.success(Unit)
+    }
+
+    override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> {
+        delay(latencyMs)
+        previewAddons.removeAll { it.transportUrl == addon.transportUrl }
+        return Result.success(Unit)
     }
 
     override suspend fun search(query: String): Result<List<MetaItem>> {

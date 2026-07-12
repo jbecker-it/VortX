@@ -2,8 +2,16 @@ package com.stremiox.android.engine
 
 import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
+import com.stremiox.android.model.DiscoverCatalogOption
+import com.stremiox.android.model.DiscoverFilters
+import com.stremiox.android.model.DiscoverGenreOption
+import com.stremiox.android.model.DiscoverTypeOption
 import com.stremiox.android.model.Episode
+import com.stremiox.android.model.InstalledAddon
+import com.stremiox.android.model.LibraryFilters
 import com.stremiox.android.model.LibraryItemInfo
+import com.stremiox.android.model.LibrarySortOption
+import com.stremiox.android.model.LibraryTypeOption
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.MetaItem
@@ -313,6 +321,164 @@ internal object EngineState {
             if (sources.isNotEmpty()) groups += StreamGroup(addon = addon, streams = sources)
         }
         return groups
+    }
+
+    // ---- S04: Discover / Library selectable filters, installed add-ons ----
+
+    /// True once every page of the `discover`/`search`-shaped field's `catalog`/`catalogs` array has
+    /// settled (Ready or an engine error -- anything but still `Loading`). Unlike
+    /// [parseCatalogWithFilters]'s callers (which historically used "has any items" as their readiness
+    /// gate, an acceptable fail-soft tradeoff from S03), this also recognizes a GENUINELY empty result
+    /// (a genre filter with zero matches) as settled, so [EngineStremioRepository.discover] does not
+    /// have to ride the full load timeout for a catalog that already answered "nothing here".
+    fun discoverCatalogSettled(json: String): Boolean {
+        val root = json.toJsonObjectOrNull() ?: return false
+        val pages = root.optJSONArray("catalog") ?: return false
+        if (pages.length() == 0) return false
+        for (i in 0 until pages.length()) {
+            val content = pages.optJSONObject(i)?.optJSONObject("content") ?: return false
+            if (content.optString("type") == "Loading") return false
+        }
+        return true
+    }
+
+    /// Parse the `discover` field's `selectable` block into the type/catalog/genre chip rows the
+    /// Discover screen renders. Each option carries the engine's own `request` verbatim (see
+    /// [com.stremiox.android.model.DiscoverTypeOption]'s doc) so tapping it re-dispatches EXACTLY what
+    /// the engine gave us, mirroring Apple `DiscoverView.typeChips`/`catalogChips`/`genreChips`. Missing/
+    /// malformed input degrades to empty lists (never throws): a still-loading discover model has no
+    /// selectable yet.
+    fun parseDiscoverFilters(json: String): DiscoverFilters {
+        val selectable = json.toJsonObjectOrNull()?.optJSONObject("selectable") ?: return DiscoverFilters()
+        val types = mutableListOf<DiscoverTypeOption>()
+        selectable.optJSONArray("types")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val request = o.optJSONObject("request") ?: continue
+                types += DiscoverTypeOption(
+                    label = o.optString("type").replaceFirstChar { it.uppercaseChar() }.ifBlank { "All" },
+                    selected = o.optBoolean("selected", false),
+                    requestJson = request.toString(),
+                )
+            }
+        }
+        val catalogs = mutableListOf<DiscoverCatalogOption>()
+        selectable.optJSONArray("catalogs")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val request = o.optJSONObject("request") ?: continue
+                catalogs += DiscoverCatalogOption(
+                    label = o.optStringOrNull("catalog") ?: catalogTitle(request),
+                    selected = o.optBoolean("selected", false),
+                    requestJson = request.toString(),
+                )
+            }
+        }
+        // Genre is one particular "extra" (an add-on-declared filter dimension); mirrors Apple
+        // `DiscoverView.genreChips`, which surfaces only the extra literally named "genre" and ignores
+        // any other extras the add-on might declare (skip/search are driven elsewhere).
+        val genres = mutableListOf<DiscoverGenreOption>()
+        selectable.optJSONArray("extra")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val extra = arr.optJSONObject(i) ?: continue
+                if (!extra.optString("name").equals("genre", ignoreCase = true)) continue
+                val options = extra.optJSONArray("options") ?: continue
+                for (o in 0 until options.length()) {
+                    val option = options.optJSONObject(o) ?: continue
+                    val request = option.optJSONObject("request") ?: continue
+                    genres += DiscoverGenreOption(
+                        label = option.optStringOrNull("value") ?: "Genre",
+                        selected = option.optBoolean("selected", false),
+                        requestJson = request.toString(),
+                    )
+                }
+            }
+        }
+        val hasNextPage = selectable.has("nextPage") && !selectable.isNull("nextPage")
+        return DiscoverFilters(types = types, catalogs = catalogs, genres = genres, hasNextPage = hasNextPage)
+    }
+
+    /// Parse the `library` field's `selectable` block into the type/sort chip rows the Library screen
+    /// renders, mirroring Apple's (hypothetical touch) Library filter chips built from the same
+    /// `LibraryWithFilters::Selectable`. Fail-soft to empty lists, same contract as
+    /// [parseDiscoverFilters].
+    fun parseLibraryFilters(json: String): LibraryFilters {
+        val selectable = json.toJsonObjectOrNull()?.optJSONObject("selectable") ?: return LibraryFilters()
+        val types = mutableListOf<LibraryTypeOption>()
+        selectable.optJSONArray("types")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val request = o.optJSONObject("request") ?: continue
+                val typeLabel = o.optStringOrNull("type")?.replaceFirstChar { it.uppercaseChar() } ?: "All"
+                types += LibraryTypeOption(label = typeLabel, selected = o.optBoolean("selected", false), requestJson = request.toString())
+            }
+        }
+        val sorts = mutableListOf<LibrarySortOption>()
+        selectable.optJSONArray("sorts")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                val request = o.optJSONObject("request") ?: continue
+                sorts += LibrarySortOption(
+                    label = librarySortLabel(o.optString("sort")),
+                    selected = o.optBoolean("selected", false),
+                    requestJson = request.toString(),
+                )
+            }
+        }
+        return LibraryFilters(types = types, sorts = sorts)
+    }
+
+    /// Human label for the engine's `Sort` enum (`#[serde(rename_all = "lowercase")]`, see
+    /// stremio-core `library_with_filters.rs`).
+    private fun librarySortLabel(sort: String): String = when (sort) {
+        "lastwatched" -> "Recent"
+        "name" -> "A–Z"
+        "namereverse" -> "Z–A"
+        "timeswatched" -> "Most watched"
+        "watched" -> "Watched"
+        "notwatched" -> "Unwatched"
+        else -> sort.replaceFirstChar { it.uppercaseChar() }
+    }
+
+    /// Parse `ctx.profile.addons` (an array of `Descriptor`) into [InstalledAddon]s for the Add-ons
+    /// screen, mirroring Apple `CoreDescriptor`. [InstalledAddon.rawDescriptorJson] keeps the exact
+    /// engine entry so [EngineActions.uninstallAddon] can echo it back verbatim.
+    fun parseInstalledAddons(ctxJson: String): List<InstalledAddon> {
+        val addons = ctxJson.toJsonObjectOrNull()?.optJSONObject("profile")?.optJSONArray("addons") ?: return emptyList()
+        val out = mutableListOf<InstalledAddon>()
+        for (i in 0 until addons.length()) {
+            val addon = addons.optJSONObject(i) ?: continue
+            val transportUrl = addon.optStringOrNull("transportUrl") ?: continue
+            val manifest = addon.optJSONObject("manifest") ?: continue
+            val flags = addon.optJSONObject("flags")
+            out += InstalledAddon(
+                transportUrl = transportUrl,
+                name = manifest.optStringOrNull("name") ?: transportUrl,
+                logo = manifest.optStringOrNull("logo"),
+                description = manifest.optStringOrNull("description"),
+                isOfficial = flags?.optBoolean("official", false) ?: false,
+                isProtected = flags?.optBoolean("protected", false) ?: false,
+                providesStreams = addonProvidesStreams(manifest),
+                rawDescriptorJson = addon.toString(),
+            )
+        }
+        return out
+    }
+
+    /// True when the manifest declares a `stream` resource. `resources` entries can be either a bare
+    /// resource-name string or an object with a `name` field (both are valid Stremio manifest shapes),
+    /// mirrors Apple `CoreDescriptor.providesStreams`.
+    private fun addonProvidesStreams(manifest: JSONObject): Boolean {
+        val resources = manifest.optJSONArray("resources") ?: return false
+        for (i in 0 until resources.length()) {
+            val name = when (val entry = resources.opt(i)) {
+                is String -> entry
+                is JSONObject -> entry.optStringOrNull("name")
+                else -> null
+            }
+            if (name == "stream") return true
+        }
+        return false
     }
 
     // ---- element parsers ----

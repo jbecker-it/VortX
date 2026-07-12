@@ -51,10 +51,34 @@ object EngineActions {
             ),
         )
 
-    /// Load Discover for a media type (movie/series/...). `args.request` is null to take the add-on
-    /// default catalog for the type; the engine selects the first matching catalog.
+    /// Load Discover's default catalog (the engine picks the first selectable type). Mirrors Apple
+    /// `CoreBridge.loadDiscover`: `args.request` is null so the engine falls back to its own default
+    /// selection rather than a client-guessed one.
     fun loadDiscover(): String =
         envelope(FIELD_DISCOVER, action("Load", JSONObject().put("model", "CatalogWithFilters").put("args", JSONObject.NULL)))
+
+    // ---- S04: Discover type/catalog/genre pivots + pagination ----
+
+    /// Pivot Discover to a specific type/catalog/genre selection. [requestJson] MUST be the exact
+    /// `request` object the engine handed back on a `DiscoverTypeOption`/`DiscoverCatalogOption`/
+    /// `DiscoverGenreOption` (see [EngineState.parseDiscoverFilters]) — mirrors Apple
+    /// `CoreBridge.selectDiscover(_ request: CoreRequest)`, which re-dispatches the chip's own request
+    /// verbatim rather than reconstructing one client-side. THIS is the fix for the "type chips are
+    /// inert" bug: [loadDiscover] never carried a type/catalog at all, so tapping a chip never actually
+    /// changed the dispatched request.
+    fun loadDiscoverSelect(requestJson: String): String =
+        envelope(
+            FIELD_DISCOVER,
+            action(
+                "Load",
+                JSONObject().put("model", "CatalogWithFilters").put("args", JSONObject().put("request", JSONObject(requestJson))),
+            ),
+        )
+
+    /// Load the next page of the current Discover catalog (infinite scroll / "Load more"). Mirrors
+    /// Apple `CoreBridge.loadDiscoverNextPage`: a no-op at the engine level when there is no next page.
+    fun loadDiscoverNextPage(): String =
+        envelope(FIELD_DISCOVER, action("CatalogWithFilters", JSONObject().put("action", "LoadNextPage")))
 
     /// Load the user's Library (NotRemoved filter). `LibraryWithFilters`'s `Selected` (like the board's)
     /// is a REQUIRED struct (`{ request: { type, sort, page } }`), not an `Option`; mirrors Apple's
@@ -74,6 +98,57 @@ object EngineActions {
                 ),
             ),
         )
+
+    // ---- S04: Library type/sort pivots + ctx library mutations ----
+
+    /// Pivot the Library to a specific type/sort selection. [requestJson] MUST be the exact `request`
+    /// object the engine handed back on a `LibraryTypeOption`/`LibrarySortOption` (see
+    /// [EngineState.parseLibraryFilters]) — mirrors Apple `CoreBridge.selectLibrary(_
+    /// request: CoreLibraryRequest)`.
+    fun loadLibrarySelect(requestJson: String): String =
+        envelope(
+            FIELD_LIBRARY,
+            action(
+                "Load",
+                JSONObject().put("model", "LibraryWithFilters").put("args", JSONObject().put("request", JSONObject(requestJson))),
+            ),
+        )
+
+    /// Save a title to the Library (`ActionCtx::AddToLibrary(MetaItemPreview)`). Only `id`/`type`/`name`
+    /// are required by the engine's `MetaItemPreview` deserializer (every other field defaults) — see
+    /// stremio-core's own doctest for the identical minimal-fields shape. Broadcasts (field = null): it
+    /// touches `ctx.library`, and `library`/`continue_watching_preview` re-derive from it.
+    fun addToLibrary(id: String, type: String, name: String, poster: String?): String {
+        val preview = JSONObject().put("id", id).put("type", type).put("name", name)
+        if (poster != null) preview.put("poster", poster)
+        return ctxEnvelope(action("AddToLibrary", preview))
+    }
+
+    /// Remove a title from the Library (`ActionCtx::RemoveFromLibrary(String)` — a bare id, not an
+    /// object). Broadcasts for the same reason as [addToLibrary].
+    fun removeFromLibrary(id: String): String = ctxEnvelope(action("RemoveFromLibrary", id))
+
+    // ---- S04: add-on management (ctx.profile.addons) ----
+
+    /// Install (or, for an already-installed `transportUrl`, update-in-place — the engine's
+    /// `InstallAddon` reducer upserts by `transportUrl`, see stremio-core `update_profile.rs`) an
+    /// add-on from its already-fetched manifest. [manifestJson] is the raw `manifest.json` body; the
+    /// caller (repository layer) is responsible for fetching + validating it first (mirrors Apple
+    /// `CoreBridge.installAddon`, which fetches client-side because the engine has no HTTP-fetch action
+    /// for a bare URL). `flags.official`/`flags.protected` are always false for a user-installed add-on.
+    fun installAddon(transportUrl: String, manifestJson: JSONObject): String {
+        val descriptor = JSONObject()
+            .put("transportUrl", transportUrl)
+            .put("manifest", manifestJson)
+            .put("flags", JSONObject().put("official", false).put("protected", false))
+        return ctxEnvelope(action("InstallAddon", descriptor))
+    }
+
+    /// Uninstall an add-on. `UninstallAddon` takes a full `Descriptor`, so [rawDescriptorJson] MUST be
+    /// the exact entry the engine returned in `ctx.profile.addons` (see
+    /// [EngineState.parseInstalledAddons]'s `rawDescriptorJson`), not a reconstruction -- mirrors Apple
+    /// `CoreBridge.uninstallAddon`, which sends back its own cached raw descriptor for the same reason.
+    fun uninstallAddon(rawDescriptorJson: String): String = ctxEnvelope(action("UninstallAddon", JSONObject(rawDescriptorJson)))
 
     /// Search across installed add-ons. Two-step like CoreBridge.search: Load the CatalogsWithExtra
     /// model with a `search` extra, then LoadRange to materialize results. `Selected.type` has no
@@ -133,6 +208,13 @@ object EngineActions {
     /// The state field-selector for `board`, for direct snapshot reads (the continuous Home stream
     /// re-reads the board on every relevant NewState rather than one-shot loading it).
     fun boardField(): String = "\"$FIELD_BOARD\""
+
+    /// The state field-selector for `discover`, for a direct snapshot read (e.g. re-pulling filters
+    /// without re-dispatching a Load).
+    fun discoverField(): String = "\"$FIELD_DISCOVER\""
+
+    /// The state field-selector for `library`, for a direct snapshot read.
+    fun libraryField(): String = "\"$FIELD_LIBRARY\""
 
     /// Email/password sign-in, mirroring Apple `CoreBridge`'s `Authenticate`/`LoginWithToken` dispatch
     /// (here the `Login` variant of the engine's `AuthRequest`, the same request the account API
@@ -194,19 +276,6 @@ object EngineActions {
         val args = JSONArray().put(season).put(isWatched)
         return envelope(FIELD_META_DETAILS, action("MetaDetails", action("MarkSeasonAsWatched", args)))
     }
-
-    /// Add the open detail title to the library, as a minimal `MetaItemPreview` (only `id`/`type`/`name`
-    /// are required by the engine's struct -- see stremio-core's `MetaItemPreview`/`MetaItemPreviewLegacy`
-    /// conversion; every other field defaults). Mirrors Apple `CoreBridge.addDetailToLibrary`.
-    fun addToLibrary(id: String, type: String, name: String, poster: String?): String {
-        val preview = JSONObject().put("id", id).put("type", type).put("name", name)
-        if (poster != null) preview.put("poster", poster)
-        return ctxEnvelope(action("AddToLibrary", preview))
-    }
-
-    /// Remove the open detail title from the library (the engine sets `removed = true`; the entry is
-    /// tombstoned, not deleted). Mirrors Apple `CoreBridge.removeFromLibrary`.
-    fun removeFromLibrary(id: String): String = ctxEnvelope(action("RemoveFromLibrary", id))
 
     // ---- low-level builders ----
 

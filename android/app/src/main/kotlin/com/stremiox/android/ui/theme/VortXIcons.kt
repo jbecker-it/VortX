@@ -4,13 +4,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.List
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDropDownCircle
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.Extension
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -78,4 +81,14 @@ object VortXIcons {
 
     /// SF `ellipsis` — the visible face of a bulk/overflow menu (S05: the season "…" mark-watched menu).
     val moreHoriz: ImageVector = Icons.Filled.MoreHoriz
+
+    // S04 (Add-ons / Library remove control) additions -- same one-object discipline as above.
+    /// SF `trash` — remove/uninstall/delete affordance (Library poster "x", Add-ons "Remove").
+    val delete: ImageVector = Icons.Filled.Delete
+
+    /// SF `plus` — add-to-library / install affordance.
+    val add: ImageVector = Icons.Filled.Add
+
+    /// SF `puzzlepiece.extension.fill` — default add-on icon when it has no manifest logo.
+    val addon: ImageVector = Icons.Filled.Extension
 }

@@ -9,6 +9,9 @@ import com.stremiox.android.debrid.DebridKeys
 import com.stremiox.android.debrid.DebridResolver
 import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
+import com.stremiox.android.model.DiscoverResult
+import com.stremiox.android.model.InstalledAddon
+import com.stremiox.android.model.LibraryResult
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaDetail
 import com.stremiox.android.model.MetaItem
@@ -35,8 +38,12 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URI
 import kotlin.time.Duration.Companion.seconds
 
 /// The real engine implementation of the UI seams. Drop-in replacement for `PreviewCatalogRepository`
@@ -306,25 +313,130 @@ class EngineStremioRepository(
         }
     }
 
-    override suspend fun discover(type: MediaType): Result<List<Catalog>> = runCatching {
+    override suspend fun discover(requestJson: String?): Result<DiscoverResult> = runCatching {
         // Discover is one selectable rail in the engine (a CatalogWithFilters: the selected catalog's
-        // flat pages, not the board's list-of-rails). parseCatalogWithFilters decodes that single rail
-        // into a one-row catalog list so the UI's row-based Discover screen renders without special-
-        // casing. Wait until the selected catalog actually has content (the immediate post-Load state
-        // is Loading); on timeout fall through to whatever is there (fail-soft empty).
-        val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscover()) {
-            EngineState.parseCatalogWithFilters(it).isNotEmpty()
-        }
-        val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
-        EngineState.parseCatalogWithFilters(state, titleMap)
+        // flat pages, not the board's list-of-rails). [requestJson] null = the engine's own default
+        // selection (first load); non-null = a verbatim echo of a chip's own `request` -- see
+        // [EngineActions.loadDiscoverSelect] for why a reconstructed request is wrong. Ready =
+        // [EngineState.discoverCatalogSettled] (every page Ready/errored, not still Loading), which
+        // correctly resolves a GENUINELY empty result (a filter with zero matches) instead of riding
+        // the full timeout the old "has any items" gate would have.
+        val dispatchAction = if (requestJson != null) EngineActions.loadDiscoverSelect(requestJson) else EngineActions.loadDiscover()
+        val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, dispatchAction) { EngineState.discoverCatalogSettled(it) }
+        discoverResultFrom(state)
     }
 
-    override suspend fun library(): Result<List<MetaItem>> = runCatching {
+    override suspend fun discoverNextPage(): Result<DiscoverResult> = runCatching {
+        val state = loadFieldUntil(EngineActions.FIELD_DISCOVER, EngineActions.loadDiscoverNextPage()) {
+            EngineState.discoverCatalogSettled(it)
+        }
+        discoverResultFrom(state)
+    }
+
+    /// Parse a `discover` field snapshot into the [DiscoverResult] the ViewModel renders: the selected
+    /// catalog's items (flattened from [EngineState.parseCatalogWithFilters]'s one-row shape) plus the
+    /// type/catalog/genre pivot chips. One state pull, two parses -- a type/catalog/genre switch is a
+    /// single engine round-trip, not two.
+    private fun discoverResultFrom(discoverStateJson: String): DiscoverResult {
+        val titleMap = EngineState.parseAddonCatalogTitles(StremioXCore.getState(EngineActions.ctxField()))
+        val rows = EngineState.parseCatalogWithFilters(discoverStateJson, titleMap)
+        return DiscoverResult(items = rows.firstOrNull()?.items.orEmpty(), filters = EngineState.parseDiscoverFilters(discoverStateJson))
+    }
+
+    override suspend fun library(requestJson: String?): Result<LibraryResult> = runCatching {
         // Library is DERIVED from the persisted ctx.library bucket (no add-on HTTP), so the immediate
         // post-dispatch snapshot is already the real answer -- ready = always, no event wait. A
-        // genuinely empty library must return [] instantly, not ride a timeout.
-        val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, EngineActions.loadLibrary()) { true }
-        EngineState.parseLibrary(state)
+        // genuinely empty library must return [] instantly, not ride a timeout. [requestJson] null =
+        // the default (all types, last-watched); non-null = a verbatim echo of a
+        // [com.stremiox.android.model.LibraryTypeOption]/[com.stremiox.android.model.LibrarySortOption]'s
+        // `request`, mirroring Discover's selection contract.
+        val dispatchAction = if (requestJson != null) EngineActions.loadLibrarySelect(requestJson) else EngineActions.loadLibrary()
+        val state = loadFieldUntil(EngineActions.FIELD_LIBRARY, dispatchAction) { true }
+        LibraryResult(items = EngineState.parseLibrary(state), filters = EngineState.parseLibraryFilters(state))
+    }
+
+    override suspend fun addToLibrary(item: MetaItem): Result<Unit> = runCatching {
+        // AddToLibrary is a synchronous local ctx mutation (no add-on HTTP), so a dispatch-and-return is
+        // enough; the caller re-pulls [library] afterward to see the change (same pattern [signOut] uses
+        // for its own synchronous ctx mutation).
+        StremioXCore.dispatch(EngineActions.addToLibrary(id = item.id, type = item.type.id, name = item.name, poster = item.poster))
+    }
+
+    override suspend fun removeFromLibrary(id: String): Result<Unit> = runCatching {
+        StremioXCore.dispatch(EngineActions.removeFromLibrary(id))
+    }
+
+    override suspend fun installedAddons(): Result<List<InstalledAddon>> = runCatching {
+        EngineState.parseInstalledAddons(StremioXCore.getState(EngineActions.ctxField()))
+    }
+
+    override suspend fun installAddon(url: String): Result<Unit> = runCatching {
+        val normalized = normalizeAddonUrl(url)
+            ?: throw IllegalArgumentException("Enter a valid add-on URL (https://…/manifest.json).")
+        // Same SSRF-shaped guard Apple's AddonURLGuard applies before ever fetching a pasted URL: never
+        // let an install form turn the app into a private-network prober. Not a full parity port (no
+        // DNS-rebinding / redirect-hop re-validation), but blocks the obvious loopback/RFC1918/link-
+        // local targets a pasted or shared URL could carry.
+        if (isPrivateNetworkHost(normalized)) {
+            throw IllegalArgumentException("That URL points to a private network address and can't be installed.")
+        }
+        // The engine has no HTTP-fetch action for a bare add-on URL (mirrors Apple: CoreBridge.installAddon
+        // fetches client-side too) -- fetch + validate the manifest here, then hand the engine the fully
+        // resolved Descriptor. InstallAddon upserts by transportUrl (stremio-core update_profile.rs), so
+        // re-installing an already-installed URL updates it in place with no separate uninstall step.
+        val manifest = fetchAddonManifest(normalized)
+            ?: throw IllegalStateException("That URL did not return a valid add-on manifest.")
+        StremioXCore.dispatch(EngineActions.installAddon(normalized, manifest))
+    }
+
+    override suspend fun removeAddon(addon: InstalledAddon): Result<Unit> = runCatching {
+        StremioXCore.dispatch(EngineActions.uninstallAddon(addon.rawDescriptorJson))
+    }
+
+    /// Trim + validate scheme + ensure a `/manifest.json` suffix, mirroring Apple
+    /// `CoreBridge.normalizedAddonURL`. Null for anything that isn't a plausible http(s) URL.
+    private fun normalizeAddonUrl(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        val uri = runCatching { URI(trimmed) }.getOrNull() ?: return null
+        val scheme = uri.scheme?.lowercase()
+        if (scheme != "http" && scheme != "https") return null
+        return if (trimmed.lowercase().endsWith("manifest.json")) trimmed else trimmed.trimEnd('/') + "/manifest.json"
+    }
+
+    /// True for loopback / RFC1918 / link-local hosts (see [installAddon]'s doc comment for scope).
+    private fun isPrivateNetworkHost(urlString: String): Boolean {
+        val host = runCatching { URI(urlString).host }.getOrNull()?.lowercase() ?: return true
+        if (host == "localhost" || host == "::1" || host.startsWith("127.")) return true
+        if (host.startsWith("10.") || host.startsWith("192.168.") || host.startsWith("169.254.")) return true
+        val octets = host.split(".")
+        if (octets.size == 4 && octets[0] == "172") {
+            val second = octets[1].toIntOrNull()
+            if (second != null && second in 16..31) return true
+        }
+        return false
+    }
+
+    /// Fetch a manifest.json body and validate it looks like an add-on manifest (`id` + `name` present,
+    /// mirroring Apple `CoreBridge.installAddon`'s validation). Runs on [Dispatchers.IO]; fail-soft to
+    /// null on any network/parse error so [installAddon] can surface one clear user-facing message.
+    private suspend fun fetchAddonManifest(url: String): JSONObject? = withContext(Dispatchers.IO) {
+        runCatching {
+            val connection = URL(url).openConnection() as HttpURLConnection
+            try {
+                connection.requestMethod = "GET"
+                connection.connectTimeout = MANIFEST_FETCH_TIMEOUT_MS
+                connection.readTimeout = MANIFEST_FETCH_TIMEOUT_MS
+                connection.instanceFollowRedirects = true
+                connection.setRequestProperty("User-Agent", "VortX-Android/1.0")
+                if (connection.responseCode !in 200..299) return@runCatching null
+                val body = connection.inputStream.bufferedReader().use { it.readText() }
+                val manifest = JSONObject(body)
+                if (manifest.has("id") && manifest.has("name")) manifest else null
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()
     }
 
     override suspend fun search(query: String): Result<List<MetaItem>> = runCatching {
@@ -515,6 +627,9 @@ class EngineStremioRepository(
         const val DEFAULT_BOARD_ROWS = 12
         const val DEFAULT_SEARCH_ROWS = 30
         const val TAG = "StremioXEngine"
+
+        /// Connect/read timeout for a pasted add-on's manifest.json fetch ([fetchAddonManifest]).
+        const val MANIFEST_FETCH_TIMEOUT_MS = 8_000
 
         /// The NewState fields that affect the Home composition (board rails, add-on titles + auth
         /// from ctx, the Continue Watching rail).
