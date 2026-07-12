@@ -96,20 +96,36 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     private val _loadingMore = MutableStateFlow(false)
     val loadingMore: StateFlow<Boolean> = _loadingMore.asStateFlow()
 
+    private var currentRequestJson: String? = null
+    private var everLoaded = false
     private var selectJob: Job? = null
 
+    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): re-drives the CURRENT selection
+    /// whenever an add-on is installed/removed or the signed-in identity changes, so Discover's
+    /// catalogs/chips pick up the new add-on set live instead of needing a stray chip tap or a restart
+    /// (device finding 1c). Runs for the ViewModel's whole lifetime, independent of [select]/[selectJob]
+    /// (a manual pivot cancels/replaces the in-flight load same as before; this just ALSO fires that
+    /// same load path on an external change). The FIRST tick (fired immediately on collection, see
+    /// [CatalogRepository.ctxUpdates]) is the screen's normal entry-point load, replacing the old
+    /// `init { select(null) }`.
     init {
-        select(null)
+        viewModelScope.launch {
+            repo.ctxUpdates().collect { select(currentRequestJson, showLoading = !everLoaded) }
+        }
     }
 
     /// Pivot to a specific type/catalog/genre. [requestJson] is null for the engine's own default
     /// (first load, and the entry point for the whole screen), or a chip's `requestJson` from the
-    /// current [DiscoverResult.filters].
-    fun select(requestJson: String?) {
+    /// current [DiscoverResult.filters]. [showLoading] is false for a background re-drive (an add-on
+    /// change while the user is already browsing a selection) so the grid doesn't flash back to the
+    /// shimmer underneath them.
+    fun select(requestJson: String?, showLoading: Boolean = true) {
+        currentRequestJson = requestJson
         selectJob?.cancel()
-        _state.value = UiState.Loading
+        if (showLoading) _state.value = UiState.Loading
         selectJob = viewModelScope.launch {
             _state.value = repo.discover(requestJson).toUiState()
+            everLoaded = true
         }
     }
 
@@ -137,25 +153,36 @@ class LibraryViewModel(private val repo: CatalogRepository) : ViewModel() {
     val state: StateFlow<UiState<LibraryResult>> = _state.asStateFlow()
 
     private var currentRequestJson: String? = null
+    private var everLoaded = false
     private var loadJob: Job? = null
 
+    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): Library is DERIVED state
+    /// (`ctx.library`), so an Add-to-Library from Detail/a poster, or a Remove from this screen's OWN
+    /// trash badge, must re-render this grid the instant either happens -- not only on the next screen
+    /// visit or a stray filter-chip tap (device finding 1a). Collected for the ViewModel's whole
+    /// lifetime; the FIRST tick (fired immediately, see [CatalogRepository.ctxUpdates]) is the screen's
+    /// normal entry-point load, replacing the old `init { load(null) }`.
     init {
-        load(null)
+        viewModelScope.launch {
+            repo.ctxUpdates().collect { load(currentRequestJson, showLoading = !everLoaded) }
+        }
     }
 
-    fun load(requestJson: String?) {
+    fun load(requestJson: String?, showLoading: Boolean = true) {
         currentRequestJson = requestJson
         loadJob?.cancel()
-        _state.value = UiState.Loading
+        if (showLoading) _state.value = UiState.Loading
         loadJob = viewModelScope.launch {
             _state.value = repo.library(requestJson).toUiState()
+            everLoaded = true
         }
     }
 
     fun retry() = load(currentRequestJson)
 
-    /// Remove a title from the Library (the grid's per-poster "x" control), then re-load so the grid
-    /// and the remaining filter/sort selection stay in sync with the engine.
+    /// Remove a title from the Library (the grid's per-poster "x" control). [repo.removeFromLibrary] is
+    /// itself a ctx broadcast, so [ctxUpdates] also re-loads independently -- this explicit reload just
+    /// keeps the removal feeling instant rather than waiting on the next event tick.
     fun remove(id: String) {
         viewModelScope.launch {
             repo.removeFromLibrary(id)

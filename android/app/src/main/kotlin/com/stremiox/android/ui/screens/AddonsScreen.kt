@@ -110,7 +110,7 @@ fun AddonsScreen(viewModel: AddonsViewModel, onBack: () -> Unit, modifier: Modif
             }
             when (val s = state) {
                 is UiState.Loading -> item { EmptyState("Loading your add-ons…") }
-                is UiState.Error -> item { ErrorState(s.message, onRetry = viewModel::load) }
+                is UiState.Error -> item { ErrorState(s.message, onRetry = { viewModel.load() }) }
                 is UiState.Success -> {
                     if (s.data.isEmpty()) {
                         item { EmptyState("No add-ons yet. Paste a manifest URL above to install one.") }

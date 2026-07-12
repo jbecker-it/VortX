@@ -265,11 +265,20 @@ class EngineStremioRepository(
                 if (fields.none { it in HOME_FIELDS }) return@collect
                 if (EngineActions.FIELD_CTX in fields) {
                     val uid = (EngineState.parseAuthState(StremioXCore.getState(EngineActions.ctxField())) as? AuthState.SignedIn)?.uid
-                    if (uid != lastUid) {
-                        lastUid = uid
+                    val identityChanged = uid != lastUid
+                    lastUid = uid
+                    // Re-dispatch the board Load on ANY ctx change, not just a sign-in/out identity
+                    // swap: an add-on install/remove is ALSO a ctx broadcast (see
+                    // [EngineActions.ctxEnvelope]), and the board's `CatalogsWithExtra` rows only
+                    // reflect the installed-add-on set as of whichever Load last ran -- without this,
+                    // "install an add-on -> its catalogs appear on Home" needed a restart (Group-1
+                    // device finding 1c). Cheap: a re-Load of already-cached add-on answers is a no-op
+                    // fast path at the engine level (mirrors [dispatchHomeLoad]'s existing use on every
+                    // uid change).
+                    if (identityChanged) {
                         Log.i(TAG, "auth identity changed (uid=${uid != null}) -> reloading board")
-                        dispatchHomeLoad()
                     }
+                    dispatchHomeLoad()
                 }
                 send(homeSnapshot())
             }
@@ -286,6 +295,21 @@ class EngineStremioRepository(
         StremioXCore.dispatch(EngineActions.loadBoard())
         StremioXCore.dispatch(EngineActions.loadBoardRange(DEFAULT_BOARD_ROWS))
     }
+
+    /// The Group-1 reactivity primitive (see [CatalogRepository.ctxUpdates]'s doc comment): a
+    /// continuous tick every time a ctx-shaped broadcast lands -- covers AddToLibrary/RemoveFromLibrary,
+    /// InstallAddon/UninstallAddon, and sign-in/sign-out, all of which dispatch with `field = null` (see
+    /// [EngineActions.ctxEnvelope]) and therefore always report [EngineActions.FIELD_CTX] among the
+    /// NewState's changed fields; [EngineActions.FIELD_LIBRARY] is included too since a library mutation
+    /// re-derives that field independently of whether `ctx` itself is named in the same event.
+    override fun ctxUpdates(): Flow<Unit> = channelFlow {
+        send(Unit)
+        launch {
+            changedFields.collect { fields ->
+                if (fields.any { it in CTX_UPDATE_FIELDS }) send(Unit)
+            }
+        }
+    }.conflate()
 
     /// Parse the CURRENT engine state into Home rails: titled board rows (real "<add-on> · <catalog>"
     /// names from the installed manifests) with Continue Watching prepended (id = "continue" is the
@@ -565,6 +589,13 @@ class EngineStremioRepository(
         currentMetaDetail() ?: throw IllegalStateException("Couldn't remove this title from your library.")
     }
 
+    /// A pure local re-read (see [CatalogRepository.peekMeta]): no dispatch at all, just the same
+    /// synchronous `meta_details` snapshot [currentMetaDetail] already uses after every S05 mutation --
+    /// safe to call on every [ctxUpdates] tick without re-triggering the add-on stream fan-out. Null if
+    /// nothing is currently loaded for [id] (a different title's meta_details, or none yet).
+    override suspend fun peekMeta(type: MediaType, id: String): MetaDetail? =
+        currentMetaDetail()?.takeIf { it.id == id }
+
     // ---- AuthRepository ----
 
     override suspend fun signIn(email: String, password: String): Result<Unit> = runCatching {
@@ -638,6 +669,10 @@ class EngineStremioRepository(
             EngineActions.FIELD_CTX,
             EngineActions.FIELD_CONTINUE_WATCHING_PREVIEW,
         )
+
+        /// The NewState fields [ctxUpdates] treats as "something Library/Detail/Discover/Add-ons should
+        /// re-read" -- see [ctxUpdates]'s doc comment.
+        val CTX_UPDATE_FIELDS = setOf(EngineActions.FIELD_CTX, EngineActions.FIELD_LIBRARY)
 
         /// Safety-net poll cadence for [homeUpdates]. Each tick is a cheap local getState + parse;
         /// distinctUntilChanged means an unchanged snapshot never reaches the UI.

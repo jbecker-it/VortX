@@ -64,7 +64,20 @@ class DetailViewModel(
     private val _mutationError = MutableStateFlow<String?>(null)
     val mutationError: StateFlow<String?> = _mutationError.asStateFlow()
 
+    /// Group-1 reactivity (see [CatalogRepository.ctxUpdates]): the Saved chip and per-episode ticks
+    /// must reflect a library/watched change made ANYWHERE -- the Library grid's trash badge, a poster
+    /// long-press elsewhere, another Detail instance in the backstack -- not only this ViewModel's own
+    /// [toggleLibrary]/[setWatched] calls (device finding 1b: "Detail's Saved chip stays stale until an
+    /// app restart"). [repo.peekMeta] is a pure local snapshot (no re-dispatch), so this is cheap enough
+    /// to run on every tick; it only replaces [_meta] once the initial load (below) has already
+    /// succeeded, so it can never race ahead of or clobber the first load.
     init {
+        viewModelScope.launch {
+            repo.ctxUpdates().collect {
+                if (_meta.value !is UiState.Success) return@collect
+                repo.peekMeta(type, id)?.let { fresh -> _meta.value = UiState.Success(fresh) }
+            }
+        }
         viewModelScope.launch {
             if (type == MediaType.SERIES) {
                 // A series' hero Watch/Resume target depends on which episode + watched state the meta

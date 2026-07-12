@@ -43,6 +43,25 @@ interface CatalogRepository {
     /// implementation) satisfies the contract without change.
     fun homeUpdates(): Flow<List<Catalog>> = flow { emit(home().getOrThrow()) }
 
+    /// CONTINUOUS ctx/library change ticks -- the Group-1 reactivity primitive every other mutable
+    /// surface (Library, Detail's Saved chip, Discover's current selection, the installed-addons list)
+    /// is built on, mirroring [homeUpdates]'s pattern for the same class of bug: Add-to-Library,
+    /// Remove-from-Library, InstallAddon, UninstallAddon, sign-in, and sign-out are all whole-model ctx
+    /// broadcasts (`field = null`) in the engine, so a screen that only reads state ONCE at load time
+    /// (a one-shot suspend call) can never see a change made by a DIFFERENT screen/action -- it renders
+    /// whatever it happened to snapshot at construction time until it is torn down and recreated (an
+    /// app restart) or some UNRELATED interaction (a filter chip tap) happens to force a fresh read.
+    /// That is the exact shape of the device-round bugs: Library not updating after Add-to-Library from
+    /// Detail, Detail's Saved chip not updating after a remove from the Library grid, Discover's
+    /// catalogs not updating after an add-on install/remove or a sign-in. Emits once immediately (so a
+    /// fresh collector always gets an initial tick) and again on every relevant engine change; never
+    /// completes (cancel via the collecting scope).
+    ///
+    /// Default = a single emission, so the offline preview impl (and any future one-shot
+    /// implementation) satisfies the contract without change -- its mutations are already synchronous
+    /// local list edits the caller re-reads directly, so there is nothing to observe.
+    fun ctxUpdates(): Flow<Unit> = flow { emit(Unit) }
+
     /// Discover: the currently selected catalog's items plus the type/catalog/genre pivot chips
     /// (S04). [requestJson] is null for the engine's own default selection (first load), or the exact
     /// `request` JSON echoed back from a [DiscoverFilters] type/catalog/genre option the caller tapped
@@ -135,6 +154,13 @@ interface CatalogRepository {
 
     /// Remove the open title from the library.
     suspend fun removeFromLibrary(type: MediaType, id: String): Result<MetaDetail> = meta(type, id)
+
+    /// A pure LOCAL re-read of the currently-loaded title's meta (no re-dispatch of a Load action),
+    /// for [ctxUpdates] consumers that only want to pick up a library/watched-state change made
+    /// elsewhere without re-triggering the add-on network fan-out every tick. Null when nothing is
+    /// currently loaded for [id], or the implementation has no such local snapshot (default: falls back
+    /// to a full [meta] reload, which is still correct, just not the cheap path).
+    suspend fun peekMeta(type: MediaType, id: String): MetaDetail? = meta(type, id).getOrNull()
 }
 
 /// The canonical name for the engine seam. The screens were built against [CatalogRepository]; the

@@ -67,7 +67,7 @@ fun DiscoverScreen(viewModel: DiscoverViewModel, onItem: (MetaItem) -> Unit, mod
     val filters = (state as? UiState.Success<DiscoverResult>)?.data?.filters
 
     Column(modifier = modifier.fillMaxSize()) {
-        DiscoverFilterChips(filters = filters, onSelect = viewModel::select)
+        DiscoverFilterChips(filters = filters, onSelect = { viewModel.select(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
@@ -121,7 +121,7 @@ fun LibraryScreen(viewModel: LibraryViewModel, onItem: (MetaItem) -> Unit, modif
     val filters = (state as? UiState.Success<LibraryResult>)?.data?.filters
 
     Column(modifier = modifier.fillMaxSize()) {
-        LibraryFilterChips(filters = filters, onSelect = viewModel::load)
+        LibraryFilterChips(filters = filters, onSelect = { viewModel.load(it) })
         when (val s = state) {
             is UiState.Loading -> ShimmerGrid()
             is UiState.Error -> ErrorState(s.message, onRetry = viewModel::retry)
