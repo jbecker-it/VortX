@@ -22,11 +22,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.stremiox.android.R
 import com.stremiox.android.data.CatalogRepository
 import com.stremiox.android.data.PreviewCatalogRepository
 import com.stremiox.android.model.MetaItem
@@ -122,19 +124,24 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
     }
 }
 
-/// The editorial signature on Home: warm-white "Stremio" with an ember "X", the same wordmark the
-/// tvOS app leads with. On other tabs the plain tab label reads as the screen title.
+/// The editorial signature on Home: "Vort" in warm-white with the accent-colored "X" standing in for
+/// the mark (DESIGN-SYSTEM.md §2 "Wordmark"), the same wordmark the tvOS app leads with. On other
+/// tabs the plain tab label reads as the screen title.
 @Composable
 private fun Wordmark(label: String) {
-    if (label != "Home") {
+    if (label != Tab.HOME.label) {
         Text(label)
         return
     }
+    // stringResource() is @Composable, so it's resolved here and only plain strings go into the
+    // (non-composable) AnnotatedString builder lambda below.
+    val prefix = stringResource(R.string.wordmark_prefix)
+    val suffix = stringResource(R.string.wordmark_suffix)
     Text(
         buildAnnotatedString {
-            append("Stremio")
+            append(prefix)
             withStyle(SpanStyle(color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)) {
-                append("X")
+                append(suffix)
             }
         }
     )
