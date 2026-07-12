@@ -26,6 +26,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.stremiox.android.BuildConfig
+import com.stremiox.android.model.AuthState
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MediaType
 import com.stremiox.android.model.MetaItem
@@ -34,6 +35,7 @@ import com.stremiox.android.ui.components.Chip
 import com.stremiox.android.ui.components.EmptyState
 import com.stremiox.android.ui.components.ErrorState
 import com.stremiox.android.ui.components.LoadingRail
+import com.stremiox.android.ui.components.PosterArt
 import com.stremiox.android.ui.components.PosterCard
 import com.stremiox.android.ui.components.PosterRail
 import com.stremiox.android.ui.theme.VortXIcons
@@ -127,17 +129,27 @@ fun SearchScreen(viewModel: SearchViewModel, onItem: (MetaItem) -> Unit, modifie
     }
 }
 
-/// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). Values
-/// are placeholders until the engine and preferences are wired (S09); the structure is final. In debug
-/// builds only, one extra row opens the S02 design-system gallery for visual review — the boundary is
-/// [BuildConfig.DEBUG], not a build variant, so it never ships in a release build of either flavor.
+/// Settings: the same controls the iOS app exposes (DESIGN-SYSTEM.md §4 "Settings / Profiles"). Most
+/// values are placeholders until preferences are wired (S09); the structure is final. The Account row
+/// is real (S03): it reflects the live engine [AuthState] and opens [AccountScreen] via [onAccountClick].
+/// In debug builds only, one extra row opens the S02 design-system gallery for visual review — the
+/// boundary is [BuildConfig.DEBUG], not a build variant, so it never ships in a release build.
 @Composable
-fun SettingsScreen(modifier: Modifier = Modifier, onOpenGallery: (() -> Unit)? = null) {
+fun SettingsScreen(
+    authState: AuthState,
+    onAccountClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onOpenGallery: (() -> Unit)? = null,
+) {
+    val accountValue = when (authState) {
+        is AuthState.SignedIn -> authState.email ?: "Signed in"
+        AuthState.SignedOut -> "Not signed in"
+    }
     Column(
         modifier = modifier.fillMaxSize().padding(VortXTheme.spacing.edge),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.xs),
     ) {
-        SettingRow(VortXIcons.account, "Account", "Not signed in")
+        SettingRow(VortXIcons.account, "Account", accountValue, onClick = onAccountClick)
         SettingRow(VortXIcons.audioOutput, "Audio output", "Auto")
         SettingRow(VortXIcons.subtitles, "Subtitle size", "Medium")
         if (BuildConfig.DEBUG && onOpenGallery != null) {
@@ -180,6 +192,7 @@ private fun PosterGrid(items: List<MetaItem>, onItem: (MetaItem) -> Unit, modifi
                 title = item.name,
                 subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
                 onClick = { onItem(item) },
+                art = { PosterArt(item.poster, item.name) },
             )
         }
     }

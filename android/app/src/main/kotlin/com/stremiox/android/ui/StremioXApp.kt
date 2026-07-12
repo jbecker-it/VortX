@@ -15,14 +15,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.stremiox.android.data.AuthRepository
 import com.stremiox.android.data.CatalogRepository
+import com.stremiox.android.data.PreviewAuthRepository
 import com.stremiox.android.data.PreviewCatalogRepository
 import com.stremiox.android.model.MetaItem
 import com.stremiox.android.model.Playable
 import com.stremiox.android.player.PlayerScreen
 import com.stremiox.android.ui.components.Wordmark
 import com.stremiox.android.ui.gallery.GalleryScreen
+import com.stremiox.android.ui.screens.AccountScreen
 import com.stremiox.android.ui.screens.DetailScreen
 import com.stremiox.android.ui.screens.DiscoverScreen
 import com.stremiox.android.ui.screens.HomeScreen
@@ -31,6 +35,7 @@ import com.stremiox.android.ui.screens.SearchScreen
 import com.stremiox.android.ui.screens.SettingsScreen
 import com.stremiox.android.ui.theme.VortXIcons
 import com.stremiox.android.ui.theme.VortXTheme
+import com.stremiox.android.ui.viewmodel.AccountViewModel
 import com.stremiox.android.ui.viewmodel.DetailViewModel
 import com.stremiox.android.ui.viewmodel.DiscoverViewModel
 import com.stremiox.android.ui.viewmodel.HomeViewModel
@@ -47,18 +52,26 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 }
 
 /// The whole app: a five-tab shell matching the iOS and Apple TV structure, with a detail overlay.
-/// [repo] defaults to the offline preview source; the real stremio-core engine is injected here once
-/// the JNI binding lands, with no change to any screen — every screen consumes a ViewModel, and every
-/// ViewModel depends only on [CatalogRepository].
+/// [repo] defaults to the offline preview source; the real stremio-core engine is injected here (from
+/// `VortXApplication`), with no change to any screen — every screen consumes a ViewModel, and every
+/// ViewModel depends only on [CatalogRepository] (or, for the account screen, [AuthRepository]).
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
+fun StremioXApp(
+    repo: CatalogRepository = PreviewCatalogRepository(),
+    auth: AuthRepository = PreviewAuthRepository(),
+) {
     VortXTheme {
         var tab by remember { mutableStateOf(Tab.HOME) }
         var detail by remember { mutableStateOf<MetaItem?>(null) }
         var playing by remember { mutableStateOf<Playable?>(null) }
         var showGallery by remember { mutableStateOf(false) }
+        var showAccount by remember { mutableStateOf(false) }
         val onItem: (MetaItem) -> Unit = { detail = it }
+        // One AccountViewModel for the whole shell (not per-screen-visit like the catalog ViewModels):
+        // Settings' Account row summary and the AccountScreen overlay both read the SAME live
+        // authState, so a sign-in on one immediately reflects on the other with no extra plumbing.
+        val accountVm: AccountViewModel = viewModel(factory = StremioXViewModelFactory(repo = repo, auth = auth))
 
         // The debug-only design-system gallery (S02) is the topmost overlay when open, above even the
         // detail/player layers below — it is a review tool, not part of the product navigation graph.
@@ -72,6 +85,11 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
         val playable = playing
         if (playable != null) {
             PlayerScreen(playable = playable, onBack = { playing = null })
+            return@VortXTheme
+        }
+
+        if (showAccount) {
+            AccountScreen(viewModel = accountVm, onBack = { showAccount = false })
             return@VortXTheme
         }
 
@@ -94,7 +112,8 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
             return@VortXTheme
         }
 
-        val factory = StremioXViewModelFactory(repo)
+        val factory = StremioXViewModelFactory(repo = repo, auth = auth)
+        val authState by accountVm.authState.collectAsStateWithLifecycle()
         Scaffold(
             topBar = {
                 TopAppBar(
@@ -122,7 +141,12 @@ fun StremioXApp(repo: CatalogRepository = PreviewCatalogRepository()) {
                 Tab.DISCOVER -> DiscoverScreen(viewModel<DiscoverViewModel>(factory = factory), onItem, content)
                 Tab.LIBRARY -> LibraryScreen(viewModel<LibraryViewModel>(factory = factory), onItem, content)
                 Tab.SEARCH -> SearchScreen(viewModel<SearchViewModel>(factory = factory), onItem, content)
-                Tab.SETTINGS -> SettingsScreen(modifier = content, onOpenGallery = { showGallery = true })
+                Tab.SETTINGS -> SettingsScreen(
+                    authState = authState,
+                    onAccountClick = { showAccount = true },
+                    modifier = content,
+                    onOpenGallery = { showGallery = true },
+                )
             }
         }
     }

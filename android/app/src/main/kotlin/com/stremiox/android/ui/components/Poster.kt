@@ -1,9 +1,11 @@
 package com.stremiox.android.ui.components
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
@@ -11,12 +13,34 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import coil3.compose.AsyncImage
 import com.stremiox.android.model.Catalog
 import com.stremiox.android.model.MetaItem
 import com.stremiox.android.ui.theme.VortXShapes
 import com.stremiox.android.ui.theme.VortXTheme
+
+/// [PosterCard]'s `art` slot for a real catalog item: a Coil [AsyncImage] with crossfade when
+/// [posterUrl] is present, falling back to [DefaultPosterArt] (the deterministic brand-tinted
+/// placeholder) when it's null -- an unloaded add-on preview, or a still-hydrating row. This is the
+/// ONE place every poster/backdrop image request in the app goes through, so cache config and
+/// crossfade behavior stay consistent call-site to call-site (see `VortXApplication`'s ImageLoader,
+/// wired app-wide via Coil's `SingletonImageLoader.Factory` install in that class).
+@Composable
+fun BoxScope.PosterArt(posterUrl: String?, title: String) {
+    if (posterUrl.isNullOrBlank()) {
+        DefaultPosterArt(title)
+    } else {
+        AsyncImage(
+            model = posterUrl,
+            contentDescription = title,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+    }
+}
 
 /// Eyebrow kicker + section title, the shared header for every rail (DESIGN-SYSTEM.md §2 typography
 /// "eyebrow"/"section title" roles) — the same two-line editorial header the tvOS `RailHeader` uses,
@@ -48,6 +72,7 @@ fun PosterRail(
                     title = item.name,
                     subtitle = listOfNotNull(item.year, item.type.label).joinToString(" · "),
                     onClick = { onItem(item) },
+                    art = { PosterArt(item.poster, item.name) },
                     modifier = Modifier.width(124.dp).padding(end = VortXTheme.spacing.sm),
                 )
             }
