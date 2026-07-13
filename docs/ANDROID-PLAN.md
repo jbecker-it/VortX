@@ -294,6 +294,11 @@ Downloads/offline (port DownloadManager), Trakt, cast/output switcher, VortX acc
 widgets/glance, Wear remote, foldable/tablet two-pane layouts (NavigationRail groundwork lands in
 S01), kids mode, channel guide + M3U import — pull from `ROADMAP.md` as the Apple side evolves.
 
+**Deferred polish items (device-test feedback, revisit in S10 or a dedicated polish pass):**
+- Discover filter chips render as three stacked rows (type / catalog / genre) which reads cramped,
+  especially on narrow/foldable cover screens — redesign into a cleaner single-line or collapsible
+  filter affordance (device feedback 2026-07-13, deferred by maintainer).
+
 ---
 
 ## 2. How worker sessions run (protocol)
