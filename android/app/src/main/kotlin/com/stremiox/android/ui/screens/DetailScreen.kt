@@ -5,11 +5,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -41,6 +41,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil3.compose.AsyncImage
@@ -235,7 +236,9 @@ private fun DetailSkeleton(title: String) {
         modifier = Modifier.fillMaxSize().padding(top = VortXTheme.spacing.xl),
         verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.md),
     ) {
-        Box(modifier = Modifier.fillMaxWidth().heightIn(max = 260.dp).aspectRatio(16f / 9f).shimmer())
+        BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            Box(modifier = Modifier.fillMaxWidth().height(heroHeight(maxWidth)).shimmer())
+        }
         Column(
             modifier = Modifier.padding(horizontal = VortXTheme.spacing.edge),
             verticalArrangement = Arrangement.spacedBy(VortXTheme.spacing.sm),
@@ -254,70 +257,84 @@ private fun DetailSkeleton(title: String) {
 @Composable
 private fun Backdrop(m: MetaDetail) {
     val colors = VortXTheme.colors
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            // Cap the backdrop's height BEFORE applying the aspect ratio -- the landscape mirror of
-            // HomeScreen's HeroHeader clamp (see its doc comment). In landscape the WIDTH driving this
-            // aspect ratio is the long side of the screen: on a short landscape viewport (e.g. a
-            // folding phone's outer cover display rotated, ~820dp wide but only ~380dp tall available
-            // below the app bar) an unclamped 16:9-of-full-width backdrop is ~460dp tall -- taller than
-            // the entire viewport -- so the first frame the user sees is 100% gradient with the title,
-            // Watch button, and (for a series) the episode list all scrolled below the fold. That read
-            // as "the detail screen shows nothing" on the device round. Phones/tablets in portrait stay
-            // under the cap, so their ratio is untouched.
-            .heightIn(max = 260.dp)
-            .aspectRatio(16f / 9f),
-    ) {
-        val backdropUrl = m.background ?: m.poster
-        if (backdropUrl.isNullOrBlank()) {
+    // BoxWithConstraints + an explicitly computed height, NOT `.heightIn(max = 260.dp).aspectRatio(...)`
+    // -- that combination is the actual bug behind the tablet "synopsis painted over the hero"
+    // report (Tab S11 Ultra, both a movie and a series). `fillMaxWidth()` forces this Box's width
+    // constraints to be FIXED (min == max == the available width). Compose's `aspectRatio` solver can
+    // only honor a fixed width by deriving height = width / ratio; when that derived height exceeds
+    // the `heightIn` cap on any width above ~462dp (i.e. virtually every tablet, in EITHER
+    // orientation, not just a short landscape viewport) none of its four solve attempts (max-width,
+    // max-height, min-width, min-height) satisfy both the fixed width AND the capped height
+    // simultaneously, so it silently falls back to `IntSize(constraints.minWidth, constraints.minHeight)`
+    // -- a width-only, ZERO-HEIGHT box. The LazyColumn item collapses to 0dp, so `ActionsCluster` and
+    // the synopsis start rendering at the very top of the screen while the hero's own (unclipped, per
+    // Compose's no-implicit-clip default) title/backdrop content still draws at its natural size --
+    // the visual overlap. Computing the height ourselves from the ACTUAL measured width sidesteps the
+    // solver entirely: it is always well-defined, always <= the 260dp cap, and the content column
+    // below can never start before the hero's real bottom edge, at any width or orientation.
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(heroHeight(maxWidth)),
+        ) {
+            val backdropUrl = m.background ?: m.poster
+            if (backdropUrl.isNullOrBlank()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
+                )
+            } else {
+                AsyncImage(
+                    model = backdropUrl,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
+            // Dual scrim: a vertical fade to the canvas color (blends the banner into the content
+            // column) layered with a leading (bottom-left) radial-ish darkening so the title block
+            // stays readable over bright artwork -- never a full-page wash (§7 anti-pattern), the
+            // scrim only lives inside this fixed-height banner.
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Brush.verticalGradient(listOf(colors.surface2, colors.canvas))),
-            )
-        } else {
-            AsyncImage(
-                model = backdropUrl,
-                contentDescription = null,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier.fillMaxSize(),
-            )
-        }
-        // Dual scrim: a vertical fade to the canvas color (blends the banner into the content column)
-        // layered with a leading (bottom-left) radial-ish darkening so the title block stays readable
-        // over bright artwork -- never a full-page wash (§7 anti-pattern), the scrim only lives inside
-        // this fixed-height banner.
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.verticalGradient(
-                        0f to Color.Transparent,
-                        0.55f to colors.canvas.copy(alpha = 0.35f),
-                        1f to colors.canvas,
+                    .background(
+                        Brush.verticalGradient(
+                            0f to Color.Transparent,
+                            0.55f to colors.canvas.copy(alpha = 0.35f),
+                            1f to colors.canvas,
+                        ),
                     ),
-                ),
-        )
-        Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(
-                    Brush.horizontalGradient(
-                        0f to Color.Black.copy(alpha = 0.55f),
-                        0.6f to Color.Transparent,
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(
+                        Brush.horizontalGradient(
+                            0f to Color.Black.copy(alpha = 0.55f),
+                            0.6f to Color.Transparent,
+                        ),
                     ),
-                ),
-        )
-        Column(
-            modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            Text(text = m.name, style = VortXTheme.type.hero, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
-            MetaRow(m)
+            )
+            Column(
+                modifier = Modifier.align(Alignment.BottomStart).padding(VortXTheme.spacing.md),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                Text(text = m.name, style = VortXTheme.type.hero, color = Color.White, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                MetaRow(m)
+            }
         }
     }
 }
+
+/// The hero banner's height for a given measured [width]: the true 16:9-of-width height, clamped to
+/// the S03 260dp cap -- computed directly instead of via `.heightIn(max = …).aspectRatio(…)`, whose
+/// constraint solver cannot satisfy a FIXED width (`fillMaxWidth()`) together with a capped height
+/// once the aspect-correct height would exceed that cap (see [Backdrop]'s doc comment for the full
+/// root-cause trace). A plain arithmetic min() has no such failure mode at any width.
+private fun heroHeight(width: Dp): Dp = minOf(width * 9f / 16f, 260.dp)
 
 /// rating · year · runtime · genres, the same one-line metadata strip as tvOS `metaRow`.
 @Composable
