@@ -111,7 +111,43 @@ class DiscoverViewModel(private val repo: CatalogRepository) : ViewModel() {
     /// `init { select(null) }`.
     init {
         viewModelScope.launch {
-            repo.ctxUpdates().collect { select(currentRequestJson, showLoading = !everLoaded) }
+            repo.ctxUpdates().collect { reconcileSelection() }
+        }
+    }
+
+    /// The ctx-change re-drive (see [init]'s doc). Device finding: with the "TV" type chip selected
+    /// showing one add-on's channels, removing that add-on left both the stale channels AND the dead
+    /// type/catalog chip on screen until the user tapped another chip or restarted. A straight
+    /// `select(currentRequestJson, ...)` re-dispatch can't fix this -- [currentRequestJson] is the
+    /// engine's own verbatim `request` for the now-uninstalled add-on's catalog, and re-selecting the
+    /// EXACT SAME request the engine already has selected does not force it to recompute `selectable`
+    /// against the current add-on set, so both the stale grid and the stale chip stick around.
+    ///
+    /// Instead: always ask for the engine's own DEFAULT selection first ([requestJson] = null), which
+    /// always recomputes `selectable` fresh from whatever add-ons are CURRENTLY installed (mirrors a
+    /// first-time entry into Discover, and the engine/Apple's own fallback). If the user's prior pick
+    /// is still offered among that fresh `selectable` (the common case -- an unrelated add-on
+    /// installed/removed, or nothing to do with the current selection), immediately re-select it so
+    /// their place in Discover isn't reset just because *something* changed -- this is what keeps
+    /// "installing an add-on adds its chips/catalogs live" working. If it is NOT offered anymore (its
+    /// add-on was the one removed), the fresh default result IS the reconciled state: the dead
+    /// channels and the dead chip are both gone, with no chip tap or restart needed.
+    private fun reconcileSelection() {
+        val requestJson = currentRequestJson
+        selectJob?.cancel()
+        val showLoading = !everLoaded
+        if (showLoading) _state.value = UiState.Loading
+        selectJob = viewModelScope.launch {
+            val fresh = repo.discover(null)
+            val stillOffered = requestJson != null && fresh.getOrNull()?.filters?.let { f ->
+                f.types.any { it.requestJson == requestJson } ||
+                    f.catalogs.any { it.requestJson == requestJson } ||
+                    f.genres.any { it.requestJson == requestJson }
+            } == true
+            val result = if (stillOffered) repo.discover(requestJson) else fresh
+            currentRequestJson = if (stillOffered) requestJson else null
+            _state.value = result.toUiState()
+            everLoaded = true
         }
     }
 
